@@ -1426,9 +1426,23 @@ async def handle_websocket(
         return
 
     resume_id = (headers.get("x-gsm-call-session") or "").strip()
-    if resume_id and await _park_relink_socket(reader, writer, resume_id, key):
+    park_id = relink_gate.resume_session(resume_id)
+    if park_id and await _park_relink_socket(reader, writer, park_id, key):
+        if not resume_id:
+            LOG.info(
+                "header-less reconnect parked session=%s utc=%s",
+                park_id,
+                _utc_now(),
+            )
         return
-    if live_call.link_gap_since is not None and (live_call.busy or active_bridge is not None):
+    # Reject only while a grace wait is still open and this socket could not
+    # attach. After the waiter ends (expired/cancelled), fall through so the
+    # supersede / force-release paths can free a stale busy slot.
+    if (
+        live_call.link_gap_since is not None
+        and (live_call.busy or active_bridge is not None)
+        and relink_gate.waiting()
+    ):
         LOG.warning(
             "rejecting websocket during link gap session_hdr=%s %s utc=%s",
             resume_id or "-",

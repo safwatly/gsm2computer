@@ -92,6 +92,31 @@ class RelinkGateTests(unittest.IsolatedAsyncioTestCase):
         gate.release_holder()
         self.assertTrue(release.done())
 
+    async def test_headerless_reconnect_during_grace_reattaches(self) -> None:
+        gate = RelinkGate()
+        waiter = gate.begin("hub-abc")
+        self.assertTrue(gate.waiting())
+        self.assertEqual(gate.resume_session(""), "hub-abc")
+        self.assertEqual(gate.resume_session("hub-abc"), "hub-abc")
+        release = gate.deliver(gate.resume_session("") or "", "reader", "writer")
+        self.assertIsNotNone(release)
+        reader, writer, _rel = await waiter
+        self.assertEqual((reader, writer), ("reader", "writer"))
+        assert release is not None
+        gate.release_holder()
+        self.assertTrue(release.done())
+
+    async def test_headerless_without_active_session_is_rejected(self) -> None:
+        gate = RelinkGate()
+        self.assertFalse(gate.waiting())
+        self.assertIsNone(gate.resume_session(""))
+        self.assertIsNone(gate.resume_session("hub-stale"))
+        self.assertIsNone(gate.deliver("", "r", "w"))
+        gate.begin("hub-abc")
+        gate.cancel_wait()
+        self.assertFalse(gate.waiting())
+        self.assertIsNone(gate.resume_session(""))
+
     async def test_close_unblocks_a_parked_socket(self) -> None:
         gate = RelinkGate()
         waiter = gate.begin("hub-abc")

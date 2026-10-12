@@ -2,9 +2,12 @@
 """Same-call websocket relink and close classification.
 
 A Pixel reconnect for the live session must attach to the call that is
-already holding Talk and PipeWire. A different client still gets 409.
-The slot is released when the grace window ends, by the same finally path
-as any other call end, so a stuck holder cannot outlive the grace backstop.
+already holding Talk and PipeWire. Prefer ``X-Gsm-Call-Session``; during an
+open grace wait a header-less reconnect may re-attach to that same waiting
+session only. A different session id still gets 409. Brand-new connects with
+no waiting session follow normal admission. The slot is released when the
+grace window ends, by the same finally path as any other call end, so a
+stuck holder cannot outlive the grace backstop.
 """
 from __future__ import annotations
 
@@ -155,6 +158,27 @@ class RelinkGate:
             return False
         waiter = self._waiter
         return waiter is not None and not waiter.done()
+
+    def waiting(self) -> bool:
+        """True while a grace-window waiter is open for one live session."""
+        sid = self.session_id
+        return bool(sid) and self.matches(sid)
+
+    def resume_session(self, resume_id: str = "") -> Optional[str]:
+        """Session id that may park a reconnecting websocket, or None.
+
+        With ``X-Gsm-Call-Session``: only that exact waiting session.
+        Without: the single in-progress grace-window session, if any.
+        Brand-new calls (no waiter) get None and follow normal admission —
+        header-less connect does not invent a session.
+        """
+        wanted = (resume_id or "").strip()
+        if wanted:
+            return wanted if self.matches(wanted) else None
+        waiting = self.session_id
+        if waiting and self.matches(waiting):
+            return waiting
+        return None
 
     def begin(self, session_id: str) -> "asyncio.Future":
         self.cancel_wait()
