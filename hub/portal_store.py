@@ -2,6 +2,7 @@
 """SQLite persistence for the hub messaging portal (ADR 0006)."""
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
@@ -34,6 +35,18 @@ CREATE TABLE IF NOT EXISTS calls (
 );
 CREATE INDEX IF NOT EXISTS calls_started ON calls (started_at);
 
+CREATE TABLE IF NOT EXISTS call_link_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    session_id TEXT,
+    kind TEXT NOT NULL,
+    close_code INTEGER,
+    close_reason TEXT,
+    initiator TEXT,
+    detail TEXT
+);
+CREATE INDEX IF NOT EXISTS call_link_events_ts ON call_link_events (ts);
+
 CREATE TABLE IF NOT EXISTS outbox (
     id TEXT PRIMARY KEY,
     to_number TEXT NOT NULL,
@@ -43,6 +56,9 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS outbox_status ON outbox (status, created_at);
 """
+
+
+RECORDING_FILENAMES = ("openclaw.mp3", "openclaw-relay.mp3", "gsm.mp3")
 
 
 def utc_now() -> str:
@@ -92,6 +108,108 @@ def _row_call(row: sqlite3.Row) -> dict[str, Any]:
         "session_id": row["session_id"],
         "tap_summary": row["tap_summary"],
     }
+
+
+def _parse_tap_summary(raw: Any) -> Optional[dict[str, Any]]:
+    if isinstance(raw, dict):
+        return raw
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _is_under(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _safe_record_folder(record_dir: Path, name: str) -> Optional[Path]:
+    label = (name or "").strip()
+    if not label or label in {".", ".."} or "/" in label or "\\" in label:
+        return None
+    folder = record_dir / label
+    if not _is_under(folder, record_dir):
+        return None
+    return folder
+
+
+def _recording_in_dir(folder: Path, record_dir: Path) -> Optional[Path]:
+    if not folder.is_dir() or not _is_under(folder, record_dir):
+        return None
+    for filename in RECORDING_FILENAMES:
+        candidate = folder / filename
+        if candidate.is_file() and _is_under(candidate, record_dir):
+            return candidate
+    return None
+
+
+def _started_at_prefixes(started_at: str) -> list[str]:
+    raw = (started_at or "").strip()
+    if not raw:
+        return []
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return []
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return [dt.strftime("%Y%m%dT%H%M%SZ"), dt.strftime("%Y%m%dT%H%M")]
+
+
+def resolve_call_recording(call: dict[str, Any], record_dir: Path) -> Optional[Path]:
+    """Find OpenClaw MP3: session_id → tap_summary.id/dir → started_at prefix."""
+    root = Path(record_dir)
+    if not call or not root.exists():
+        return None
+
+    names: list[str] = []
+    session_id = str(call.get("session_id") or "").strip()
+    if session_id:
+        names.append(session_id)
+
+    tap = _parse_tap_summary(call.get("tap_summary"))
+    tap_dir_raw = ""
+    if tap:
+        tap_id = str(tap.get("id") or "").strip()
+        if tap_id:
+            names.append(tap_id)
+        tap_dir_raw = str(tap.get("dir") or "").strip()
+
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        folder = _safe_record_folder(root, name)
+        if folder:
+            found = _recording_in_dir(folder, root)
+            if found:
+                return found
+
+    if tap_dir_raw:
+        folder = Path(tap_dir_raw)
+        found = _recording_in_dir(folder, root)
+        if found:
+            return found
+
+    if root.is_dir():
+        dirs = [p for p in root.iterdir() if p.is_dir()]
+        dirs.sort(key=lambda p: p.name, reverse=True)
+        for prefix in _started_at_prefixes(str(call.get("started_at") or "")):
+            for folder in dirs:
+                if folder.name.startswith(prefix):
+                    found = _recording_in_dir(folder, root)
+                    if found:
+                        return found
+    return None
 
 
 def _row_outbox(row: sqlite3.Row) -> dict[str, Any]:
@@ -316,6 +434,60 @@ class PortalStore:
         with self._lock:
             rows = self._conn.execute("SELECT * FROM calls ORDER BY started_at DESC").fetchall()
         return [_row_call(r) for r in rows]
+
+    def get_call(self, call_id: str) -> Optional[dict[str, Any]]:
+        if not call_id:
+            return None
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM calls WHERE id = ?", (call_id,)).fetchone()
+        return _row_call(row) if row else None
+
+    def add_link_event(
+        self,
+        kind: str,
+        session_id: Optional[str] = None,
+        close_code: Optional[int] = None,
+        close_reason: Optional[str] = None,
+        initiator: Optional[str] = None,
+        detail: Optional[str] = None,
+        ts: Optional[str] = None,
+    ) -> dict[str, Any]:
+        item = {
+            "ts": ts or utc_now(),
+            "session_id": session_id or None,
+            "kind": (kind or "close").strip() or "close",
+            "close_code": int(close_code) if close_code is not None else None,
+            "close_reason": close_reason or None,
+            "initiator": initiator or None,
+            "detail": detail or None,
+        }
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO call_link_events
+                   (ts, session_id, kind, close_code, close_reason, initiator, detail)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    item["ts"],
+                    item["session_id"],
+                    item["kind"],
+                    item["close_code"],
+                    item["close_reason"],
+                    item["initiator"],
+                    item["detail"],
+                ),
+            )
+            self._conn.commit()
+            item["id"] = cur.lastrowid
+        return item
+
+    def list_link_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        cap = max(1, min(int(limit or 50), 500))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM call_link_events ORDER BY id DESC LIMIT ?",
+                (cap,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_message(self, msg_id: str) -> Optional[dict[str, Any]]:
         with self._lock:

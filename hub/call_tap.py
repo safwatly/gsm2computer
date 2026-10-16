@@ -14,7 +14,7 @@ Internal stem names are unchanged:
   phone μ-law WS  →  gsm-uplink-8k-mono.wav
   hub 8 kHz capture before μ-law  →  gsm-downlink-8k-mono.wav
   phone_uplink.monitor (Chromium mic)  →  openclaw-mic-48k-stereo.wav
-  openclaw_bus.monitor (Chromium speaker)  →  openclaw-spk-48k-stereo.wav
+  openclaw_bus (Chromium speaker, sink capture)  →  openclaw-spk-48k-stereo.wav
 
 relay graph also writes openclaw-append-24k-mono.wav and openclaw-tts-24k-mono.wav.
 
@@ -36,6 +36,7 @@ from pipewire_target import (
     pipewire_stream_env,
     pw_cat_raw_args,
     pw_latency_args,
+    record_uses_sink_capture,
     resolve_pipewire_record_target,
     stdbuf_unbuffered,
 )
@@ -236,9 +237,10 @@ class _Stream:
 
 
 class CallTap:
-    def __init__(self, call_id: str, meta: dict[str, Any]) -> None:
+    def __init__(self, call_id: str, meta: dict[str, Any], record_dir: Optional[Path] = None) -> None:
         self.call_id = call_id
-        self.dir = RECORD_DIR / call_id
+        root = record_dir or RECORD_DIR
+        self.dir = root / call_id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.meta = meta
         self._streams: dict[str, _Stream] = {}
@@ -248,15 +250,38 @@ class CallTap:
         LOG.info("call tap dir %s", self.dir)
 
     @classmethod
-    def maybe_open(cls, *, loopback: bool, mode: str) -> Optional["CallTap"]:
+    def maybe_open(
+        cls,
+        *,
+        loopback: bool,
+        mode: str,
+        e2e: bool = False,
+    ) -> Optional["CallTap"]:
         if not _enabled():
             return None
-        RECORD_DIR.mkdir(parents=True, exist_ok=True)
-        _prune(RECORD_DIR, KEEP_CALLS)
+        record_dir = RECORD_DIR
+        if e2e:
+            record_dir = Path(
+                os.environ.get(
+                    "GSM2COMPUTER_E2E_RECORD_DIR",
+                    str(Path.home() / "gsm2computer-e2e-calls"),
+                )
+            )
+        record_dir.mkdir(parents=True, exist_ok=True)
+        _prune(record_dir, KEEP_CALLS)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        kind = "loopback" if loopback else mode
+        if e2e:
+            kind = "e2e-test"
+        elif loopback:
+            kind = "loopback"
+        else:
+            kind = mode
         call_id = f"{stamp}-{kind}"
-        return cls(call_id, {"loopback": loopback, "mode": mode, "id": call_id})
+        return cls(
+            call_id,
+            {"loopback": loopback, "mode": mode, "id": call_id, "e2e": e2e},
+            record_dir=record_dir,
+        )
 
     def write_s16(self, name: str, pcm: bytes, rate: int, channels: int = 1) -> None:
         if self._closed or not pcm:
@@ -278,10 +303,11 @@ class CallTap:
         if self._closed:
             return
         try:
+            capture_sink = record_uses_sink_capture(source)
             serial = await resolve_pipewire_record_target(source)
             raw = await pw_cat_raw_args()
             latency = pw_latency_args()
-            env = pipewire_stream_env(rate)
+            env = pipewire_stream_env(rate, capture_sink=capture_sink)
             proc = await asyncio.create_subprocess_exec(
                 *stdbuf_unbuffered(),
                 "pw-record",
@@ -308,7 +334,7 @@ class CallTap:
             return
         self._procs.append(proc)
         self._tasks.append(asyncio.create_task(self._pump(proc, name, rate, channels, source)))
-        LOG.info("call tap %s recording %s serial=%s %s/%sch", name, source, serial, rate, channels)
+        LOG.info("call tap %s recording %s serial=%s capture_sink=%s %s/%sch", name, source, serial, capture_sink, rate, channels)
 
     async def _pump(
         self,
@@ -355,8 +381,25 @@ class CallTap:
         }
 
     async def close(self) -> dict[str, Any]:
-        if self._closed:
+        if self._closed and not self._procs and not self._tasks:
             return self.summary()
+        await self.stop_capture()
+        mixes: dict[str, Any] = {}
+        try:
+            mixes = await self._mix_rooms()
+        except Exception as exc:
+            LOG.error("call tap mix failed: %s; leaving WAV stems", exc)
+        summary = self.summary()
+        summary["meta"] = self.meta
+        summary["mixes"] = mixes
+        (self.dir / "levels.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        LOG.info("call tap closed %s mixes=%s", json.dumps(summary["streams"]), json.dumps(mixes))
+        return summary
+
+    async def stop_capture(self) -> None:
+        """Stop pw-record helpers and close WAV stems. Does not mix."""
+        if self._closed and not self._procs and not self._tasks:
+            return
         self._closed = True
         for proc in self._procs:
             if proc.returncode is None:
@@ -384,18 +427,10 @@ class CallTap:
         self._tasks = []
         self._procs = []
         for stream in self._streams.values():
-            stream.close()
-        mixes: dict[str, Any] = {}
-        try:
-            mixes = await self._mix_rooms()
-        except Exception as exc:
-            LOG.error("call tap mix failed: %s; leaving WAV stems", exc)
-        summary = self.summary()
-        summary["meta"] = self.meta
-        summary["mixes"] = mixes
-        (self.dir / "levels.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-        LOG.info("call tap closed %s mixes=%s", json.dumps(summary["streams"]), json.dumps(mixes))
-        return summary
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     async def _mix_rooms(self) -> dict[str, Any]:
         mixes: dict[str, Any] = {}
