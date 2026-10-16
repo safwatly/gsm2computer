@@ -19,6 +19,7 @@ from typing import Any, Optional, Tuple
 
 from call_tap import CallTap
 from portal_http import EventBus, PortalApp
+from alert_webhook import post_system_alert, start_alert_worker
 from portal_sms import ingest_inbound_sms
 from portal_store import PortalStore
 from pipewire_target import (
@@ -1117,6 +1118,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 payload = {"raw": body.decode("utf-8", errors="replace")}
             log_entry, command = ingest_inbound_sms(portal_store, portal_events, payload)
             LOG.info("sms %s", json.dumps(log_entry, ensure_ascii=False))
+            from portal_sms import should_wake_cup, format_ops_sms_alert
+            if should_wake_cup(str(log_entry.get("from") or ""), str(log_entry.get("body") or "")):
+                post_system_alert(format_ops_sms_alert(
+                    str(log_entry.get("from") or ""), str(log_entry.get("body") or ""),
+                    str(log_entry.get("receivedAt") or "")))
             if command:
                 result = await set_switchboard_mode(command)
                 writer.write(json_response(200, {"ok": True, "sms": log_entry, "routing": result}))
@@ -1138,6 +1144,7 @@ async def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    start_alert_worker()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))
