@@ -16,7 +16,8 @@ os.environ.setdefault(
 )
 
 from portal_http import EventBus, PortalApp  # noqa: E402
-from portal_store import PortalStore, normalize_e164  # noqa: E402
+from portal_sms import GSM7_PART_BODY_LIMIT, UCS2_PART_BODY_LIMIT, split_outbound_sms  # noqa: E402
+from portal_store import OUTBOUND_SMS_GAP_SECONDS, PortalStore, normalize_e164  # noqa: E402
 
 
 class FakeWriter:
@@ -94,6 +95,38 @@ class PortalStoreTests(unittest.TestCase):
         again = self.store.ack_outbox(queued["id"], status="sent")
         self.assertEqual(again["status"], "sent")
         self.assertEqual(self.store.get_message(queued["id"])["status"], "sent")
+
+    def test_short_message_is_unchanged(self) -> None:
+        self.assertEqual(split_outbound_sms("on my way"), ["on my way"])
+
+    def test_long_gsm7_message_splits_at_words_and_is_numbered(self) -> None:
+        body = ("word " * 80).strip()
+        parts = split_outbound_sms(body)
+        self.assertGreater(len(parts), 1)
+        self.assertEqual(parts[0][:6], f"(1/{len(parts)}) ")
+        self.assertEqual(parts[-1][:len(f"({len(parts)}/{len(parts)}) ")], f"({len(parts)}/{len(parts)}) ")
+        self.assertTrue(all(len(part.split(" ", 1)[1]) <= GSM7_PART_BODY_LIMIT for part in parts))
+        self.assertEqual(" ".join(part.split(" ", 1)[1] for part in parts), body)
+
+    def test_emoji_uses_smaller_ucs2_limit(self) -> None:
+        body = ("🙂 " * 50).strip()
+        parts = split_outbound_sms(body)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(part.split(" ", 1)[1]) <= UCS2_PART_BODY_LIMIT for part in parts))
+
+    def test_parts_and_consecutive_messages_are_destination_paced_in_order(self) -> None:
+        queued = self.store.enqueue_outbound_many("+15551212", ["(1/2) first", "(2/2) second"])
+        next_message = self.store.enqueue_outbound("+15551212", "third")
+        scheduled = queued + [next_message]
+        times = [item["available_at"] for item in scheduled]
+        self.assertEqual(len(self.store.claim_outbox_for_send()), 1)
+        self.assertEqual(self.store.claim_outbox_for_send(), [])
+        from datetime import datetime
+        parsed = [datetime.fromisoformat(value.replace("Z", "+00:00")) for value in times]
+        self.assertEqual(
+            [(right - left).total_seconds() for left, right in zip(parsed, parsed[1:])],
+            [OUTBOUND_SMS_GAP_SECONDS, OUTBOUND_SMS_GAP_SECONDS],
+        )
 
 
 class PortalHttpTests(unittest.IsolatedAsyncioTestCase):

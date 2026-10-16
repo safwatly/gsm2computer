@@ -5,10 +5,49 @@ from __future__ import annotations
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from portal_http import EventBus
 from portal_store import PortalStore
+
+if TYPE_CHECKING:
+    from portal_http import EventBus
+
+# Payload limits after the ``(k/N) `` label. They leave safe headroom below
+# GSM-7's 160-character and UCS-2's 70-character single-message limits.
+GSM7_PART_BODY_LIMIT = 150
+UCS2_PART_BODY_LIMIT = 62
+_GSM7_CHARS = set(
+    "@£$¥èéùìòÇ\\nØø\\rÅåΔ_ΦΓΛΩΠΨΣΘΞ\\x1bÆæßÉ !\\\"#¤%&'()*+,-./0123456789:;<=>?¡"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà^{}\\[~]|€"
+)
+
+
+def is_gsm7(text: str) -> bool:
+    """Return whether *text* can use the GSM-7 alphabet."""
+    return all(char in _GSM7_CHARS for char in text)
+
+
+def split_outbound_sms(body: str) -> list[str]:
+    """Split oversized text at word boundaries and number every part."""
+    text = str(body)
+    limit = GSM7_PART_BODY_LIMIT if is_gsm7(text) else UCS2_PART_BODY_LIMIT
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        cut = remaining.rfind(" ", 0, limit + 1)
+        if cut <= 0:
+            chunks.append(remaining[:limit])
+            remaining = remaining[limit:]
+        else:
+            chunks.append(remaining[:cut])
+            remaining = remaining[cut + 1:]
+    total = len(chunks)
+    return [f"({index}/{total}) {chunk}" for index, chunk in enumerate(chunks, start=1)]
 
 # Default Safwat ops MSISDN; override/extend via GSM2COMPUTER_OPS_SMS_NUMBERS
 # (comma-separated; any common formatting accepted).

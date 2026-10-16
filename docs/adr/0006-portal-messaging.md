@@ -17,6 +17,7 @@ The Pixel 7 gateway forwards inbound SMS to the hub and keeps a local call log (
 5. **Call log v1**: sync bridge `CallLogStore` entries; system Android `CallLog` backfill is a fast follow-up.
 6. **HTTPS**: portal v1 stays HTTP on `:8787` ([ADR 0007](0007-hub-machine-name-and-https.md)); trusted `.ts.net` HTTPS is for OpenClaw only. Web Push waits on a non-conflicting HTTPS path.
 7. **Outbound SMS**: 10s HTTP poll from `GatewayService`; no separate control WebSocket in v1.
+8. **Outbound pacing and multipart**: the hub splits oversized portal texts at word boundaries and labels parts `(k/N) `. GSM-7 part payloads are capped at 150 characters; texts containing non-GSM-7 characters use a 62-character UCS-2 payload cap. The hub schedules one item per destination at a time with a six-second gap, so a busy recipient cannot cause multipart or back-to-back sends to be handed to the modem together. Other destinations remain independently eligible.
 
 ## Call record fields
 
