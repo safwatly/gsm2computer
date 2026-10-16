@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from portal_sms import split_outbound_sms
 from portal_store import PortalStore, resolve_call_recording, utc_now
 
 LOG = logging.getLogger("gsm2computer-hub")
@@ -253,12 +254,13 @@ class PortalApp:
         to_number = str(payload.get("to") or "")
         text = str(payload.get("body") or "")
         try:
-            queued = self.store.enqueue_outbound(to_number, text)
+            queued_parts = self.store.enqueue_outbound_many(to_number, split_outbound_sms(text))
         except ValueError as exc:
             return json_response(400, {"ok": False, "error": str(exc)})
-        self.events.publish("message", queued["message"])
-        self.events.publish("outbox", {k: v for k, v in queued.items() if k != "message"})
-        return json_response(201, {"ok": True, **queued})
+        for queued in queued_parts:
+            self.events.publish("message", queued["message"])
+            self.events.publish("outbox", {k: v for k, v in queued.items() if k != "message"})
+        return json_response(201, {"ok": True, **queued_parts[0], "parts": queued_parts})
 
     def _ack_outbox(self, item_id: str, body: bytes) -> bytes:
         status = "sent"

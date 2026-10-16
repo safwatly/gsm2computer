@@ -7,7 +7,7 @@ import re
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS outbox (
     to_number TEXT NOT NULL,
     body TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    available_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS outbox_status ON outbox (status, created_at);
 """
@@ -63,6 +64,15 @@ RECORDING_FILENAMES = ("openclaw.mp3", "openclaw-relay.mp3", "gsm.mp3")
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# A conservative modem/carrier settling interval. The Pixel's 10s poll means
+# the actual gap will normally be at least this long.
+OUTBOUND_SMS_GAP_SECONDS = 6
+
+
+def _parse_utc(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def normalize_e164(raw: str) -> str:
@@ -218,6 +228,7 @@ def _row_outbox(row: sqlite3.Row) -> dict[str, Any]:
         "to": row["to_number"],
         "body": row["body"],
         "created_at": row["created_at"],
+        "available_at": row["available_at"],
         "status": row["status"],
     }
 
@@ -233,6 +244,14 @@ class PortalStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock:
             self._conn.executescript(SCHEMA)
+            columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(outbox)")}
+            if "available_at" not in columns:
+                self._conn.execute("ALTER TABLE outbox ADD COLUMN available_at TEXT NOT NULL DEFAULT ''")
+            self._conn.execute("UPDATE outbox SET available_at = created_at WHERE available_at = ''")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS outbox_destination_queue "
+                "ON outbox (to_number, status, available_at, created_at)"
+            )
             self._conn.commit()
 
     def close(self) -> None:
@@ -305,44 +324,70 @@ class PortalStore:
         return [_row_message(r) for r in rows]
 
     def enqueue_outbound(self, to_number: str, body: str) -> dict[str, Any]:
+        """Queue one already-segmented message, pacing this destination."""
+        return self.enqueue_outbound_many(to_number, [body])[0]
+
+    def enqueue_outbound_many(self, to_number: str, bodies: list[str]) -> list[dict[str, Any]]:
+        """Queue ordered parts with a six-second gap for this destination."""
         peer = normalize_e164(to_number) or to_number.strip()
         if not peer:
             raise ValueError("to required")
-        if body is None or not str(body).strip():
+        if not bodies or any(body is None or not str(body).strip() for body in bodies):
             raise ValueError("body required")
         now = utc_now()
-        msg_id = str(uuid.uuid4())
-        msg = self.add_message("out", peer, str(body), ts=now, status="queued", msg_id=msg_id)
         with self._lock:
-            self._conn.execute(
-                "INSERT INTO outbox (id, to_number, body, created_at, status) VALUES (?, ?, ?, ?, ?)",
-                (msg_id, peer, str(body), now, "pending"),
-            )
+            latest = self._conn.execute(
+                "SELECT MAX(available_at) AS latest FROM outbox WHERE to_number = ?", (peer,)
+            ).fetchone()["latest"]
+            available = _parse_utc(now)
+            if latest:
+                available = max(available, _parse_utc(latest) + timedelta(seconds=OUTBOUND_SMS_GAP_SECONDS))
+            queued: list[dict[str, Any]] = []
+            for body in bodies:
+                msg_id = str(uuid.uuid4())
+                available_at = available.isoformat().replace("+00:00", "Z")
+                msg = {
+                    "id": msg_id, "direction": "out", "peer": peer, "body": str(body),
+                    "ts": now, "status": "queued",
+                }
+                self._conn.execute(
+                    "INSERT INTO messages (id, direction, peer, body, ts, status) VALUES (?, ?, ?, ?, ?, ?)",
+                    (msg_id, "out", peer, str(body), now, "queued"),
+                )
+                self._conn.execute(
+                    "INSERT INTO outbox (id, to_number, body, created_at, status, available_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (msg_id, peer, str(body), now, "pending", available_at),
+                )
+                queued.append({
+                    "id": msg_id, "to": peer, "body": str(body), "created_at": now,
+                    "available_at": available_at, "status": "pending", "message": msg,
+                })
+                available += timedelta(seconds=OUTBOUND_SMS_GAP_SECONDS)
             self._conn.commit()
-        return {
-            "id": msg_id,
-            "to": peer,
-            "body": str(body),
-            "created_at": now,
-            "status": "pending",
-            "message": msg,
-        }
+        return queued
 
     def list_outbox_pending(self) -> list[dict[str, Any]]:
         """Rows still in pending (tests / diagnostics only)."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM outbox WHERE status = 'pending' ORDER BY created_at ASC"
+                "SELECT * FROM outbox WHERE status = 'pending' ORDER BY available_at ASC, created_at ASC, id ASC"
             ).fetchall()
         return [_row_outbox(r) for r in rows]
 
     def claim_outbox_for_send(self, limit: int = 20) -> list[dict[str, Any]]:
-        """Atomically lease pending rows as sending so polls cannot double-send."""
+        """Lease at most one due item per destination, in destination order."""
+        now = utc_now()
         with self._lock:
             rows = self._conn.execute(
-                """SELECT id FROM outbox WHERE status = 'pending'
-                   ORDER BY created_at ASC LIMIT ?""",
-                (max(1, int(limit)),),
+                """SELECT o.id FROM outbox AS o
+                   WHERE o.status = 'pending' AND o.available_at <= ?
+                     AND o.id = (
+                         SELECT next.id FROM outbox AS next
+                         WHERE next.to_number = o.to_number AND next.status = 'pending'
+                         ORDER BY next.available_at ASC, next.created_at ASC, next.id ASC LIMIT 1
+                     )
+                   ORDER BY o.available_at ASC, o.created_at ASC, o.id ASC LIMIT ?""",
+                (now, max(1, int(limit))),
             ).fetchall()
             ids = [r["id"] for r in rows]
             if not ids:
@@ -355,7 +400,7 @@ class PortalStore:
             )
             self._conn.commit()
             claimed = self._conn.execute(
-                f"SELECT * FROM outbox WHERE id IN ({placeholders})",
+                f"SELECT * FROM outbox WHERE id IN ({placeholders}) ORDER BY available_at ASC, created_at ASC, id ASC",
                 ids,
             ).fetchall()
         return [_row_outbox(r) for r in claimed]
