@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from alert_webhook import post_system_alert, start_alert_worker
+from alert_webhook import post_inbound_sms_alert, post_system_alert, start_alert_worker
 from ws_backpressure import (
     DownlinkSendGuard,
     reconnect_should_supersede,
@@ -1993,7 +1993,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     str(log_entry.get("from") or ""),
                     str(log_entry.get("body") or ""),
                 ):
-                    post_system_alert(
+                    post_inbound_sms_alert(
                         format_ops_sms_alert(
                             str(log_entry.get("from") or ""),
                             str(log_entry.get("body") or ""),
