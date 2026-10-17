@@ -30,7 +30,12 @@ LOG = logging.getLogger("gsm2computer-hub")
 
 URL_ENV = "GSM2COMPUTER_ALERT_WEBHOOK_URL"
 KEY_ENV = "GSM2COMPUTER_ALERT_WEBHOOK_KEY"
+SMS_URL_ENV = "GSM2COMPUTER_SMS_WEBHOOK_URL"
+SMS_KEY_ENV = "GSM2COMPUTER_SMS_WEBHOOK_KEY"
 TIMEOUT_S = 5.0
+
+DESTINATION_ALERT = "alert"
+DESTINATION_SMS = "sms"
 
 # Match e2e / self-test wording so test cleanup never wakes Cup.
 _TEST_ALERT_RE = re.compile(
@@ -62,7 +67,12 @@ _wake = threading.Event()
 
 def _safe_detail(value: str) -> str:
     # Redact before truncating: a boundary must not reveal part of a credential.
-    for secret in (os.environ.get(URL_ENV, ""), os.environ.get(KEY_ENV, "")):
+    for secret in (
+        os.environ.get(URL_ENV, ""),
+        os.environ.get(KEY_ENV, ""),
+        os.environ.get(SMS_URL_ENV, ""),
+        os.environ.get(SMS_KEY_ENV, ""),
+    ):
         secret = secret.strip()
         if secret:
             value = value.replace(secret, "[REDACTED]")
@@ -90,6 +100,30 @@ def _spool_path() -> Path:
                 str(Path.home() / ".local/state/gsm2computer/alert-webhook/outbox.sqlite3"))
 
 
+def _destination_config(destination: str) -> tuple[str, str]:
+    if destination == DESTINATION_SMS:
+        return (
+            (os.environ.get(SMS_URL_ENV) or "").strip(),
+            (os.environ.get(SMS_KEY_ENV) or "").strip(),
+        )
+    return (
+        (os.environ.get(URL_ENV) or "").strip(),
+        (os.environ.get(KEY_ENV) or "").strip(),
+    )
+
+
+def _destination_is_configured(destination: str) -> bool:
+    return bool(_destination_config(destination)[0])
+
+
+def _configured_destinations() -> tuple[str, ...]:
+    return tuple(
+        destination
+        for destination in (DESTINATION_ALERT, DESTINATION_SMS)
+        if _destination_is_configured(destination)
+    )
+
+
 @contextmanager
 def _connect():
     path = _spool_path()
@@ -104,7 +138,12 @@ def _connect():
     conn.execute("""CREATE TABLE IF NOT EXISTS alerts (
         id TEXT PRIMARY KEY, original_payload TEXT NOT NULL, payload TEXT NOT NULL,
         created REAL NOT NULL, due REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-        status INTEGER, response TEXT, delivered REAL, lease TEXT)""")
+        status INTEGER, response TEXT, delivered REAL, lease TEXT,
+        destination TEXT NOT NULL DEFAULT 'alert')""")
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(alerts)")}
+    if "destination" not in columns:
+        # Pre-split spool rows were all alert-webhook deliveries.
+        conn.execute("ALTER TABLE alerts ADD COLUMN destination TEXT NOT NULL DEFAULT 'alert'")
     conn.commit()
     try:
         with conn:
@@ -113,9 +152,8 @@ def _connect():
         conn.close()
 
 
-def _send(payload: str) -> tuple[int, str]:
-    url = (os.environ.get(URL_ENV) or "").strip()
-    key = (os.environ.get(KEY_ENV) or "").strip()
+def _send(payload: str, destination: str) -> tuple[int, str]:
+    url, key = _destination_config(destination)
     headers = {"Content-Type": "application/json", "User-Agent": "gsm2computer-alert/2"}
     if key:
         headers["Authorization"] = _authorization_value(key)
@@ -132,19 +170,24 @@ def _send(payload: str) -> tuple[int, str]:
 
 
 def _drain_one() -> bool:
-    if not (os.environ.get(URL_ENV) or "").strip():
+    destinations = _configured_destinations()
+    if not destinations:
         return False
     now = time.time()
     lease = uuid.uuid4().hex
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT * FROM alerts WHERE delivered IS NULL AND due <= ? "
-                           "ORDER BY due, created LIMIT 1", (now,)).fetchone()
+        placeholders = ",".join("?" for _ in destinations)
+        row = conn.execute(
+            "SELECT * FROM alerts WHERE delivered IS NULL AND due <= ? "
+            f"AND destination IN ({placeholders}) ORDER BY due, created LIMIT 1",
+            (now, *destinations),
+        ).fetchone()
         if row is None:
             return False
         # Lease expires after a crash; HTTP timeout is only 5 seconds.
         conn.execute("UPDATE alerts SET due=?, lease=? WHERE id=?", (now + 60, lease, row["id"]))
-    status, detail = _send(row["payload"])
+    status, detail = _send(row["payload"], row["destination"])
     attempts = row["attempts"] + 1
     ok = 200 <= status < 300
     delay = min(900, 30 * 2 ** min(attempts - 1, 5)) + random.uniform(0, 5)
@@ -179,7 +222,7 @@ def _run_worker() -> None:
 def start_alert_worker() -> None:
     """Resume persisted alerts on startup, without blocking the hub event loop."""
     global _worker_pid
-    if not (os.environ.get(URL_ENV) or "").strip():
+    if not _configured_destinations():
         return
     with _worker_lock:
         if _worker_pid != os.getpid():
@@ -187,16 +230,19 @@ def start_alert_worker() -> None:
             _worker_pid = os.getpid()
 
 
-def _post_json(payload: Mapping[str, Any]) -> None:
-    if not (os.environ.get(URL_ENV) or "").strip():
+def _post_json(payload: Mapping[str, Any], *, destination: str = DESTINATION_ALERT) -> None:
+    if not _destination_is_configured(destination):
         return
     try:
         original = json.dumps(dict(payload), ensure_ascii=True, allow_nan=False)
         body = json.dumps(_prepare_payload(payload), ensure_ascii=False, allow_nan=False)
         alert_id = uuid.uuid4().hex
         with _connect() as conn:
-            conn.execute("INSERT INTO alerts(id, original_payload, payload, created, due) VALUES(?,?,?,?,?)",
-                         (alert_id, original, body, time.time(), time.time()))
+            conn.execute(
+                "INSERT INTO alerts(id, original_payload, payload, created, due, destination) "
+                "VALUES(?,?,?,?,?,?)",
+                (alert_id, original, body, time.time(), time.time(), destination),
+            )
         start_alert_worker()
         _wake.set()
     except Exception as exc:
@@ -209,6 +255,15 @@ def post_system_alert(text: str, *, e2e: bool = False) -> None:
         LOG.info("alert webhook skipped (e2e/test): %s", (text or "")[:160])
         return
     _post_json({"text": text})
+
+
+def post_inbound_sms_alert(text: str) -> None:
+    """Durably enqueue an inbound-SMS alert at its optional destination.
+
+    With no SMS webhook URL configured, preserve the legacy alert destination.
+    """
+    destination = DESTINATION_SMS if _destination_is_configured(DESTINATION_SMS) else DESTINATION_ALERT
+    _post_json({"text": text}, destination=destination)
 
 
 def post_alert_event(payload: Mapping[str, Any]) -> None:
