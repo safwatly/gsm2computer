@@ -1,0 +1,46 @@
+# deps / build
+.venv/
+venv/
+node_modules/
+portal/dist/
+__pycache__/
+*.pyc
+# backups
+backup-*/
+*.bak
+*.bak*
+*.bak-*
+*.watchdog-main-only
+*.clobber-*
+*.orig
+# runtime state, data, logs (portal.sqlite holds real SMS content)
+*.sqlite
+*.sqlite-*
+*.db
+state/
+var/
+workspace/
+.health-watch/
+.cup-health-*
+.healthwatch-*
+cup-health-checked-calls.json
+*.log
+logs/
+# audio / recordings
+*.wav
+*.mp3
+*.ogg
+*.opus
+*.m4a
+*.flac
+recordings/
+# secrets
+.env
+.env.*
+*.env
+*.pem
+*.key
+id_*
+*secret*
+*token*
+*credentials*
