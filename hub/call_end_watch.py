@@ -38,6 +38,20 @@ HUB_HTTP = os.environ.get("GSM2COMPUTER_E2E_HUB") or os.environ.get(
     "GSM2COMPUTER_HUB_HTTP", "http://:8787"
 )
 POLL_S = float(os.environ.get("GSM2COMPUTER_CALL_END_POLL_S", "2.5"))
+# Poll fast only while a call is active or just ended; slow when idle.
+IDLE_POLL_S = float(os.environ.get("GSM2COMPUTER_CALL_END_IDLE_POLL_S", "10"))
+# Keep fast polling + telecom reads this long after the last in-call snapshot.
+RECENT_CALL_S = float(os.environ.get("GSM2COMPUTER_CALL_END_RECENT_S", "60"))
+# While idle, still read telecom every Nth poll as a safety net.
+IDLE_TELECOM_EVERY = int(os.environ.get("GSM2COMPUTER_CALL_END_IDLE_TELECOM_EVERY", "6"))
+# Filter on the phone so only a few bytes cross the (metered/lossy) link.
+# Full dumpsys output was ~400 KB per poll (~14 GB/day at 2.5 s).
+ADB_TEL_CMD = (
+    'dumpsys telephony.registry | grep -oE "mCallState=[0-9]+|mCallIncomingNumber=[^ ]*" | head -n 16'
+)
+ADB_TELECOM_CMD = (
+    'dumpsys telecom | grep -oE "\\[Call id=TC@[0-9]+, *state=[A-Z_]+|handle=tel:[^,\\] ]+" | head -n 60'
+)
 MIN_DURATION_S = float(os.environ.get("GSM2COMPUTER_CALL_END_MIN_S", "5"))
 IDLE_CONFIRM_POLLS = int(os.environ.get("GSM2COMPUTER_CALL_END_IDLE_POLLS", "2"))
 # dropped_suspected margins. A hub/ws/uplink end within this many seconds of the
@@ -229,13 +243,24 @@ def ensure_adb() -> bool:
     return ok
 
 
-def read_phone_snapshot() -> PhoneSnapshot:
-    """Combine telephony.registry mCallState with dumpsys telecom Call rows."""
+def read_phone_snapshot(want_telecom: bool = True) -> PhoneSnapshot:
+    """Combine telephony.registry mCallState with dumpsys telecom Call rows.
+
+    Both dumps are grepped on the phone; only matching tokens come back.
+    Telecom is read when asked (call active/recent/periodic) or whenever the
+    registry shows a non-idle call state.
+    """
     if not ensure_adb():
         return PhoneSnapshot(in_call=False, call_state=CALL_STATE_IDLE, raw_ok=False)
 
-    rc_t, tel = _adb(["shell", "dumpsys", "telephony.registry"], timeout_s=10.0)
-    rc_c, telecom = _adb(["shell", "dumpsys", "telecom"], timeout_s=10.0)
+    rc_t, tel = _adb(["shell", ADB_TEL_CMD], timeout_s=10.0)
+    if rc_t != 0:
+        tel = ""
+    tel_states = [int(x) for x in _CALL_STATE_RE.findall(tel or "")]
+    if want_telecom or rc_t != 0 or any(x != CALL_STATE_IDLE for x in tel_states):
+        rc_c, telecom = _adb(["shell", ADB_TELECOM_CMD], timeout_s=10.0)
+    else:
+        rc_c, telecom = 0, ""
     if rc_t != 0 and rc_c != 0:
         return PhoneSnapshot(in_call=False, call_state=CALL_STATE_IDLE, raw_ok=False)
 
@@ -249,7 +274,7 @@ def read_phone_snapshot() -> PhoneSnapshot:
     telecom_state = None
     in_call_telecom = False
     for m in _TELECOM_CALL_RE.finditer(telecom or ""):
-        cid, st, handle = m.group(1), m.group(2), m.group(3)
+        cid, st, handle = m.group(1), m.group(2), m.group(3).strip()
         if st in ("ACTIVE", "DIALING", "RINGING", "CONNECTING", "ON_HOLD"):
             in_call_telecom = True
             call_id = cid
@@ -899,19 +924,29 @@ def main(argv: Optional[list[str]] = None) -> int:
     snap = read_phone_snapshot()
     sync_on_startup(st, snap)
     LOG.info(
-        "watching adb=%s poll=%.1fs min_duration=%.0fs hub=%s",
+        "watching adb=%s poll=%.1fs (idle %.1fs) min_duration=%.0fs hub=%s",
         ADB_SERIAL,
         POLL_S,
+        IDLE_POLL_S,
         MIN_DURATION_S,
         HUB_HTTP,
     )
+    last_active = time.monotonic() if (snap.in_call or st.in_call) else 0.0
+    idle_polls = 0
     while True:
+        recent = bool(last_active) and (time.monotonic() - last_active) < RECENT_CALL_S
+        active = st.in_call or recent
         try:
-            snap = read_phone_snapshot()
+            want_telecom = active or (idle_polls % max(1, IDLE_TELECOM_EVERY) == 0)
+            snap = read_phone_snapshot(want_telecom=want_telecom)
             on_snapshot(st, snap)
+            if snap.in_call or st.in_call:
+                last_active = time.monotonic()
+                active = True
         except Exception:
             LOG.exception("poll error")
-        time.sleep(POLL_S)
+        idle_polls = 0 if active else idle_polls + 1
+        time.sleep(POLL_S if active else IDLE_POLL_S)
 
 
 if __name__ == "__main__":
