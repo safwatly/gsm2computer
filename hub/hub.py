@@ -43,6 +43,13 @@ from call_slot import (
     wait_or_abort,
 )
 from link_gap_log import append_link_gap
+from grokbot_voice import (
+    GROKBOT_MIC_SINK,
+    GROKBOT_MIC_SOURCE,
+    GROKBOT_SPK_SINK,
+    UPLINK_GAIN as GROKBOT_UPLINK_GAIN,
+    get_grokbot_voice,
+)
 from urllib.parse import parse_qs, urlsplit
 from call_tap import RECORD_DIR, CallTap
 from portal_http import EventBus, PortalApp
@@ -75,6 +82,9 @@ AUDIO_RATE = int(os.environ.get("GSM2COMPUTER_AUDIO_RATE", "8000"))
 # (simulator) or PCM at whatever the phone HAL gave us; we resample here.
 BUS_RATE = int(os.environ.get("GSM2COMPUTER_BUS_RATE", "48000"))
 AUTO_MODE_ON_CALL = os.environ.get("GSM2COMPUTER_AUTO_MODE", "openclaw")
+# AUTO_MODE=grokbot answers calls with Grok Bot live voice (patchbay) instead of
+# OpenClaw Talk. OpenClaw stays selectable with AUTO_MODE=openclaw.
+GROKBOT_ON_CALL = (AUTO_MODE_ON_CALL or "").strip().lower() == "grokbot"
 
 
 def _parse_openclaw_talk_mode(raw: Optional[str]) -> str:
@@ -388,7 +398,7 @@ async def switchboard_state() -> dict:
 
 async def set_switchboard_mode(mode: str) -> dict:
     global current_mode
-    allowed = {"clear", "openclaw", "loopback", "conference", "status"}
+    allowed = {"clear", "openclaw", "grokbot", "loopback", "conference", "status"}
     if mode not in allowed:
         return {"ok": False, "error": f"unknown mode {mode!r}", "allowed": sorted(allowed - {"status"})}
     rc, out, err = await run_switchboard(mode)
@@ -536,6 +546,8 @@ class PipewireBridge:
         self.downlink_guard = DownlinkSendGuard()
         self._stall_logged_recovery = True
         self._out_writer: Optional[asyncio.StreamWriter] = None
+        # Linear gain on caller audio written to the playback sink (grokbot path).
+        self.uplink_gain = 1.0
 
     def _track_helper(self, proc: asyncio.subprocess.Process, label: str) -> None:
         self._helper_tasks.append(asyncio.create_task(self._log_helper_stderr(proc, label)))
@@ -829,6 +841,8 @@ class PipewireBridge:
         bus_pcm, self._in_ratecv = _resample_pcm(pcm, src_rate, self.rate, self._in_ratecv)
         if not bus_pcm:
             return
+        if self.uplink_gain != 1.0:
+            bus_pcm = audioop.mul(bus_pcm, 2, self.uplink_gain)
         proc = self._playback
         if not proc or not proc.stdin:
             return
@@ -1182,14 +1196,23 @@ def _maybe_schedule_e2e_after_silent_call(tap_summary: dict[str, Any]) -> None:
     duration = _tap_duration_s(tap_summary)
     if duration < float(os.environ.get("GSM2COMPUTER_E2E_SILENT_MIN_S", "10")):
         return
-    spk = _tap_stream_peak(tap_summary, "openclaw-spk-48k-stereo")
-    downlink = _tap_stream_peak(tap_summary, "gsm-downlink-8k-mono")
     thresh = float(os.environ.get("GSM2COMPUTER_E2E_PEAK_MIN", "0.02"))
-    if spk >= thresh or downlink >= thresh:
-        return
+    if meta.get("mode") == "grokbot":
+        # gsm-downlink also carries the patchbay hold tone; judge Suzie only.
+        spk = _tap_stream_peak(tap_summary, "grok-spk-48k-stereo")
+        downlink = _tap_stream_peak(tap_summary, "gsm-downlink-8k-mono")
+        if spk >= thresh:
+            return
+        _request_live_e2e(tap_summary.get("id") or "unknown")
+    else:
+        spk = _tap_stream_peak(tap_summary, "openclaw-spk-48k-stereo")
+        downlink = _tap_stream_peak(tap_summary, "gsm-downlink-8k-mono")
+        if spk >= thresh or downlink >= thresh:
+            return
     LOG.warning(
-        "silent OpenClaw reply after %.1fs call (spk=%.4f dl=%.4f); scheduling e2e",
+        "silent bot reply after %.1fs call (mode=%s spk=%.4f dl=%.4f); scheduling e2e",
         duration,
+        meta.get("mode"),
         spk,
         downlink,
     )
@@ -1198,6 +1221,43 @@ def _maybe_schedule_e2e_after_silent_call(tap_summary: dict[str, Any]) -> None:
     except RuntimeError:
         return
     loop.create_task(_run_e2e_after_silent_call(tap_summary.get("id") or "unknown"))
+
+
+E2E_LIVE_REQUEST = Path(
+    os.environ.get(
+        "GSM2COMPUTER_E2E_LIVE_REQUEST",
+        str(Path.home() / "gsm2computer-e2e" / "live-request"),
+    )
+)
+
+
+def _request_live_e2e(call_id: str) -> None:
+    """Ask the next e2e run for a live Grok voice test (timer runs stay non-invasive)."""
+    try:
+        E2E_LIVE_REQUEST.parent.mkdir(parents=True, exist_ok=True)
+        E2E_LIVE_REQUEST.write_text(json.dumps({"call_id": call_id, "ts": _utc_now()}), encoding="utf-8")
+    except OSError as exc:
+        LOG.warning("could not write live e2e request: %s", exc)
+
+
+async def _grokbot_call_start(
+    voice: Any,
+    tap: Optional[CallTap],
+    is_e2e: bool,
+) -> dict[str, Any]:
+    """Switch Grok Bot live voice on for this call; tap Suzie only once she is live."""
+    res = await voice.start()
+    if res.get("ok") and tap is not None:
+        # Started after the switch so the patchbay hold tone is not counted as Suzie.
+        await tap.start_source("grok-spk-48k-stereo", GROKBOT_SPK_SINK, 48000, 2)
+    elif not res.get("ok"):
+        LOG.error(
+            "grokbot call path without live voice (e2e=%s): rc=%s %s",
+            is_e2e,
+            res.get("rc"),
+            res.get("meaning"),
+        )
+    return res
 
 
 async def _run_e2e_after_silent_call(call_id: str) -> None:
@@ -1548,6 +1608,8 @@ async def handle_websocket(
     call_watchdog_task: Optional[asyncio.Task] = None
     path_task: Optional[asyncio.Task] = None
     bridge: Optional[PipewireBridge] = None
+    grok_voice: Optional[Any] = None
+    grok_switch_task: Optional[asyncio.Task] = None
     try:
         accept = ws_accept_key(key)
         response = (
@@ -1566,7 +1628,7 @@ async def handle_websocket(
         LOG.info("WebSocket connected path=%s loopback=%s e2e=%s", path, loopback, e2e)
         tap = CallTap.maybe_open(
             loopback=loopback,
-            mode="off" if loopback else OPENCLAW_TALK_MODE,
+            mode="off" if loopback else ("grokbot" if GROKBOT_ON_CALL else OPENCLAW_TALK_MODE),
             e2e=e2e,
         )
         if loopback:
@@ -1576,8 +1638,14 @@ async def handle_websocket(
             result = await set_switchboard_mode(AUTO_MODE_ON_CALL)
             LOG.info("auto mode on call: %s", result.get("applied") or result.get("error"))
 
+        use_openclaw = not loopback and not GROKBOT_ON_CALL
+        use_grokbot = not loopback and GROKBOT_ON_CALL
         if loopback:
             downlink_monitor = GSM_MONITOR
+        elif use_grokbot:
+            # Caller -> patchbay_mic (grok_mic); grok_bus -> caller. No OpenClaw.
+            playback_sink = GROKBOT_MIC_SINK
+            downlink_monitor = GROKBOT_SPK_SINK
         elif OPENCLAW_TALK_MODE == "webrtc-ui":
             playback_sink = PHONE_UPLINK_SINK
             downlink_monitor = OPENCLAW_DOWNLINK_MONITOR
@@ -1594,7 +1662,7 @@ async def handle_websocket(
         )
         live_call.downlink_probe = bridge.downlink_snapshot
         call_watchdog_task = asyncio.create_task(_watch_live_call(live_call, bridge))
-        if not loopback and OPENCLAW_TALK_MODE == "webrtc-ui":
+        if use_openclaw and OPENCLAW_TALK_MODE == "webrtc-ui":
             if OpenClawTalkUI is None or get_talk_ui is None:
                 await fail_call_handshake(writer, "OpenClaw Control UI Talk supervisor is not available")
                 return
@@ -1608,7 +1676,7 @@ async def handle_websocket(
                 active_openclaw = None
                 await fail_call_handshake(writer, f"openclaw webrtc-ui handshake failed: {exc}")
                 return
-        elif not loopback and OPENCLAW_TALK_MODE == "relay":
+        elif use_openclaw and OPENCLAW_TALK_MODE == "relay":
             if OpenClawTalkBridge is None:
                 await fail_call_handshake(writer, "OpenClaw talk bridge is not available")
                 return
@@ -1642,7 +1710,12 @@ async def handle_websocket(
             await fail_call_handshake(writer, f"hub pipewire handshake failed: {exc}")
             return
 
-        if tap is not None and not loopback and OPENCLAW_TALK_MODE == "webrtc-ui":
+        if use_grokbot:
+            bridge.uplink_gain = GROKBOT_UPLINK_GAIN
+            if tap is not None:
+                await tap.start_source("grok-mic-48k-stereo", GROKBOT_MIC_SOURCE, 48000, 2)
+
+        if tap is not None and use_openclaw and OPENCLAW_TALK_MODE == "webrtc-ui":
             await tap.start_source(
                 "openclaw-mic-48k-stereo",
                 # Prefer sink-capture virtual mic (same node Talk Chromium uses).
@@ -1670,19 +1743,28 @@ async def handle_websocket(
             "type": "session.updated",
             "session": {
                 "id": session_id,
-                "model": f"gsm2computer-hub-{OPENCLAW_TALK_MODE}" if not loopback else "gsm2computer-hub",
+                "model": (
+                    "gsm2computer-hub"
+                    if loopback
+                    else ("gsm2computer-hub-grokbot" if use_grokbot else f"gsm2computer-hub-{OPENCLAW_TALK_MODE}")
+                ),
                 "audio": {
                     "format": DEFAULT_CLIENT_FORMAT,
                     "rate": DEFAULT_CLIENT_RATE,
                     "preferred": {"format": "audio/pcm", "rate": BUS_RATE, "encoding": "s16le"},
                 },
-                "talk": OPENCLAW_TALK_MODE if not loopback else "off",
+                "talk": "off" if loopback else ("grokbot" if use_grokbot else OPENCLAW_TALK_MODE),
                 "e2e": e2e,
             },
         }
         await ws_send_text(writer, json.dumps(session_ack))
         active_bridge = bridge
         live_call.mark_established()
+        if use_grokbot:
+            # Run the switch beside the WS loop: uplink keeps flowing into
+            # grok_mic and the caller hears patchbay's hold tone meanwhile.
+            grok_voice = get_grokbot_voice()
+            grok_switch_task = asyncio.create_task(_grokbot_call_start(grok_voice, tap, e2e))
 
         if openclaw_bridge is not None and OPENCLAW_TALK_MODE == "relay":
             watchdog_task = asyncio.create_task(
@@ -1870,6 +1952,10 @@ async def handle_websocket(
                 LOG.warning("openclaw stop in finally failed", exc_info=True)
             active_openclaw = None
             LOG.info("openclaw talk stopped (mode=%s)", OPENCLAW_TALK_MODE)
+        if grok_voice is not None:
+            # Call is over (clean hangup, abort, or relink grace expired).
+            # patchbay off runs after any still-running switch, off the hot path.
+            grok_voice.stop_later(after=grok_switch_task)
         live_call.release()
         if abort_reason:
             LOG.info("WebSocket disconnected after watchdog: %s", abort_reason)
@@ -1943,8 +2029,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 "ok": True,
                 "mode": current_mode,
                 "openclaw_talk": OPENCLAW_TALK_MODE,
+                "auto_mode": AUTO_MODE_ON_CALL or None,
                 "call": live_call.snapshot(),
             }
+            if GROKBOT_ON_CALL:
+                body["grokbot"] = get_grokbot_voice().snapshot()
             if last_call_tap:
                 body["last_call_tap"] = last_call_tap
             if OPENCLAW_TALK_MODE == "webrtc-ui" and get_talk_ui is not None:
@@ -2141,12 +2230,13 @@ async def main() -> None:
     asyncio.create_task(_reap_stuck_call_slot())
     addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
     LOG.info(
-        "listening on %s (sink=%s auto_mode=%s openclaw_talk=%s "
+        "listening on %s (sink=%s auto_mode=%s openclaw_talk=%s grokbot=%s "
         "call_watchdog=ws_idle=%s uplink_idle=%s max=%s relink_grace=%s)",
         addrs,
         GSM_SINK,
         AUTO_MODE_ON_CALL or "off",
         OPENCLAW_TALK_MODE,
+        GROKBOT_ON_CALL,
         CALL_WATCHDOG.ws_idle_s,
         CALL_WATCHDOG.uplink_idle_s,
         CALL_WATCHDOG.max_s,
@@ -2188,6 +2278,13 @@ async def shutdown() -> None:
             await asyncio.wait_for(bridge_ref.stop(), timeout=5.0)
         except Exception:
             LOG.warning("shutdown bridge stop failed", exc_info=True)
+    if GROKBOT_ON_CALL:
+        voice = get_grokbot_voice()
+        if voice.live or voice.switching:
+            try:
+                await asyncio.wait_for(voice.stop(), timeout=10.0)
+            except Exception:
+                LOG.warning("shutdown grokbot off failed", exc_info=True)
     live_call.release()
     raise SystemExit(0)
 

@@ -329,7 +329,10 @@ def disruptive_heal_blocked(health: dict) -> bool:
     """
     call = health.get("call") or {}
     talk = health.get("talk") or {}
+    grok = health.get("grokbot") or {}
     if talk.get("talk_active"):
+        return True
+    if grok.get("live") or grok.get("switching"):
         return True
     if call.get("busy"):
         return True
