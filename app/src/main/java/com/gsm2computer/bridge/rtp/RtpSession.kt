@@ -13,6 +13,7 @@ import android.media.MediaRecorder
 import android.util.Log
 import com.gsm2computer.bridge.DeviceProfile
 import com.gsm2computer.bridge.diag.BridgeLog
+import com.gsm2computer.bridge.realtime.UplinkWire
 import com.gsm2computer.bridge.RootShell
 import com.gsm2computer.bridge.gsm.GsmCallManager
 import java.net.DatagramPacket
@@ -219,8 +220,9 @@ class RtpSession(
 
     private fun notifyHubWire() {
         if (!wsMode) return
-        Log.i(TAG, "hub wire pcm in=$captureRate out=$playbackRate")
-        transport?.configureWire("audio/pcm", captureRate, "audio/pcm", playbackRate)
+        val wireRate = UplinkWire.wireRate(captureRate)
+        Log.i(TAG, "hub wire pcm in=$wireRate hal=$captureRate out=$playbackRate")
+        transport?.configureWire("audio/pcm", wireRate, "audio/pcm", playbackRate)
     }
 
     /**
@@ -649,8 +651,10 @@ class RtpSession(
             "Capture started: source=$audioSourceName capRate=$captureRate session=$audioSessionId " +
                 "gain=${captureGain}x profile=${profile.name} state=${record.recordingState}"
         )
+        val wireRate = UplinkWire.wireRate(captureRate)
+        val uplinkResampler = UplinkWire.Resampler(captureRate, wireRate)
         BridgeLog.i(
-            "capture start source=$audioSourceName rate=$captureRate " +
+            "capture start source=$audioSourceName rate=$captureRate wire=$wireRate " +
                 "hal=${record.sampleRate} state=${record.recordingState}",
         )
         // Also report via RTP stats so it appears in the app log viewer
@@ -840,7 +844,10 @@ class RtpSession(
                         Log.i(TAG, "TX#$txPacketCount pcm ${read}B @${captureRate}Hz rawRMS=$rawCaptureRms capRMS=$captureRms")
                         if (txPacketCount == 0L) firstTxInfo = "pcm ${captureRate}Hz capRMS=$captureRms"
                     }
-                    transport?.sendAudio(pcmBuf.copyOf(read))
+                    val wirePcm = uplinkResampler.resample(pcmBuf, read)
+                    if (wirePcm.isNotEmpty()) {
+                        transport?.sendAudio(UplinkWire.pack(wirePcm, wireRate))
+                    }
                     txPacketCount++
                 } else {
                     // Encode based on codec and capture sample rate.

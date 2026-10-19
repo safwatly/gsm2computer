@@ -315,6 +315,8 @@ async def ws_read_frame(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         return WsRead(text="", pong=True)
     if opcode == 0x1:
         return WsRead(text=payload.decode("utf-8", errors="replace"))
+    if opcode == 0x2:
+        return WsRead(binary=payload)
     return WsRead(text="")
 
 
@@ -473,6 +475,23 @@ def _as_rate(raw: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return rate if rate > 0 else default
+
+
+def parse_uplink_binary(payload: bytes) -> Optional[Tuple[bytes, str, int]]:
+    """G2 v1 uplink frame: magic, version, format 1 (s16le mono), rate uint16 BE, pcm.
+
+    Old phones keep sending JSON ``input_audio_buffer.append``. A binary frame
+    without this header is PCM only when ``client.audio`` already said so.
+    """
+    if len(payload) < 8 or payload[0:2] != b"G2" or payload[2] != 1 or payload[3] != 1:
+        return None
+    rate = int.from_bytes(payload[4:6], "big")
+    pcm = payload[8:]
+    if rate <= 0 or len(pcm) < 2:
+        return None
+    if len(pcm) & 1:
+        pcm = pcm[:-1]
+    return pcm, "audio/pcm", rate
 
 
 def _to_pcm16(audio: bytes, fmt: str) -> bytes:
@@ -1768,7 +1787,7 @@ async def handle_websocket(
                 "audio": {
                     "format": DEFAULT_CLIENT_FORMAT,
                     "rate": DEFAULT_CLIENT_RATE,
-                    "preferred": {"format": "audio/pcm", "rate": BUS_RATE, "encoding": "s16le"},
+                    "preferred": {"format": "audio/pcm", "rate": 16000, "encoding": "s16le"},
                 },
                 "talk": OPENCLAW_TALK_MODE if not loopback else "off",
                 "e2e": e2e,
@@ -1791,6 +1810,29 @@ async def handle_websocket(
         path_task = asyncio.create_task(
             _watch_call_path(live_call, peer_ip, live_call.claimed_at or 0.0)
         )
+
+        async def ingest_uplink(audio: bytes, fmt: str, rate: int) -> None:
+            if not audio:
+                return
+            live_call.note_uplink()
+            bridge.offer_uplink(audio, fmt, rate)
+            if loopback:
+                wire_fmt = _normalize_format(fmt) or bridge.client_in_format
+                energy = (
+                    _pcm_rms_energy(_to_pcm16(audio, wire_fmt))
+                    if wire_fmt == "audio/pcm"
+                    else _mulaw_rms_energy(audio)
+                )
+                echo = {
+                    "type": "response.output_audio.delta",
+                    "delta": base64.b64encode(audio).decode("ascii"),
+                    "format": wire_fmt,
+                    "rate": _as_rate(rate, bridge.client_in_rate),
+                    "channels": {"l": energy, "r": energy},
+                }
+                await ws_send_text(writer, json.dumps(echo))
+            elif OPENCLAW_TALK_MODE == "relay" and openclaw_bridge is not None:
+                openclaw_bridge.feed_gsm_ulaw(bridge.to_ulaw_8k(audio, fmt, rate))
 
         while True:
             if bridge.aborted() or (live_call.abort.is_set() and not live_call.gap_wake.is_set()):
@@ -1863,8 +1905,19 @@ async def handle_websocket(
                     )
                 live_call.note_ws_activity()
                 continue
-            msg = frame.text
             live_call.note_ws_activity()
+            if frame.binary:
+                parsed = parse_uplink_binary(frame.binary)
+                if parsed is None and bridge.client_in_format == "audio/pcm" and len(frame.binary) >= 2:
+                    raw = frame.binary
+                    if len(raw) & 1:
+                        raw = raw[:-1]
+                    if raw:
+                        parsed = (raw, "audio/pcm", bridge.client_in_rate)
+                if parsed is not None:
+                    await ingest_uplink(*parsed)
+                continue
+            msg = frame.text
             if not msg:
                 continue
             try:
@@ -1886,31 +1939,14 @@ async def handle_websocket(
             elif etype == "input_audio_buffer.append":
                 audio_b64 = event.get("audio") or event.get("data") or ""
                 if audio_b64:
-                    live_call.note_uplink()
+                    # JSON append is the pre-331 phone and the browser simulator.
+                    # Do not await pw-cat here; offer_uplink queues it.
                     audio = base64.b64decode(audio_b64, validate=False)
-                    fmt = event.get("format") or ""
-                    rate = event.get("rate") or 0
-                    # Do not await pw-cat here. A full playback pipe blocks
-                    # drain() forever, the socket stops being read, and the
-                    # phone's ping then dies the connection (~40s) without a
-                    # close frame. Relink never runs while this handler is stuck.
-                    bridge.offer_uplink(audio, fmt, rate)
-                    if loopback:
-                        energy = (
-                            _pcm_rms_energy(_to_pcm16(audio, _normalize_format(fmt) or bridge.client_in_format))
-                            if (_normalize_format(fmt) or bridge.client_in_format) == "audio/pcm"
-                            else _mulaw_rms_energy(audio)
-                        )
-                        echo = {
-                            "type": "response.output_audio.delta",
-                            "delta": base64.b64encode(audio).decode("ascii"),
-                            "format": _normalize_format(fmt) or bridge.client_in_format,
-                            "rate": _as_rate(rate, bridge.client_in_rate),
-                            "channels": {"l": energy, "r": energy},
-                        }
-                        await ws_send_text(writer, json.dumps(echo))
-                    elif OPENCLAW_TALK_MODE == "relay" and openclaw_bridge is not None:
-                        openclaw_bridge.feed_gsm_ulaw(bridge.to_ulaw_8k(audio, fmt, rate))
+                    await ingest_uplink(
+                        audio,
+                        event.get("format") or "",
+                        int(event.get("rate") or 0),
+                    )
             elif etype == "client.ping":
                 try:
                     ws_queue_text(

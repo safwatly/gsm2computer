@@ -6,9 +6,9 @@ package com.gsm2computer.bridge.realtime
  * OkHttp queues until 16 MiB, then starts a close that sits behind that data.
  * Protocol pings share the same writer task, so a TCP window stuck at zero
  * blocks the missed-pong check (ping interval 20 s, fail on the next ping,
- * about 40 s). Past [maxQueuedBytes] we drop audio instead. If the queue
- * stays over the cap for [wedgeAfterMs], the socket is wedged and the caller
- * should cancel it so the reconnect loop runs.
+ * about 40 s). Past [maxQueuedBytes] we drop audio. Cancel only when that
+ * queue does not drain for [wedgeAfterMs]; a hiccup that still ACKs must
+ * not reconnect.
  */
 class WsSendBudget(
     val maxQueuedBytes: Long = DEFAULT_MAX_QUEUED_BYTES,
@@ -21,6 +21,7 @@ class WsSendBudget(
         private set
 
     private var overSinceMs: Long? = null
+    private var highWater: Long = 0
     private val lock = Any()
 
     enum class Decision {
@@ -32,9 +33,16 @@ class WsSendBudget(
     fun decide(queuedBytes: Long, nowMs: Long): Decision = synchronized(lock) {
         if (queuedBytes <= maxQueuedBytes) {
             overSinceMs = null
+            highWater = queuedBytes
             return Decision.SEND
         }
-        val since = overSinceMs ?: nowMs.also { overSinceMs = it }
+        val since = overSinceMs
+        if (since == null || queuedBytes < highWater) {
+            overSinceMs = nowMs
+            highWater = queuedBytes
+            return Decision.DROP
+        }
+        if (queuedBytes > highWater) highWater = queuedBytes
         if (nowMs - since >= wedgeAfterMs) Decision.WEDGE else Decision.DROP
     }
 
@@ -51,8 +59,13 @@ class WsSendBudget(
     }
 
     companion object {
-        /** About two seconds of 48 kHz PCM JSON, far under OkHttp's 16 MiB close. */
-        const val DEFAULT_MAX_QUEUED_BYTES = 256L * 1024L
-        const val DEFAULT_WEDGE_MS = 3_000L
+        /**
+         * About 16 s of 16 kHz s16 mono (~32 KB/s). A short Wi-Fi stall fits
+         * under this; OkHttp's own close is still 16 MiB.
+         */
+        const val DEFAULT_MAX_QUEUED_BYTES = 512L * 1024L
+
+        /** Drop while a full queue is not draining. Cancel only after this. */
+        const val DEFAULT_WEDGE_MS = 15_000L
     }
 }

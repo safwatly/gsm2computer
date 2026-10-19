@@ -78,23 +78,13 @@ HUB_CONTROL_URL=http://hub.mining-ling.ts.net:8787 \
 
 `STREAM_TOKEN_URL` is optional and defaults to `{HUB_CONTROL_URL}/token`. OpenAI `STREAM_MODEL` / `STREAM_VOICE` are unused in hub mode.
 
-### Same-cert install (keeps settings)
+### Signing
 
-The Magisk priv-app on the Pixel is signed with cert id `b3e909f5` (`dumpsys package com.gsm2computer.bridge` shows `Signature{b3e909f5}`). Hot-swap with that same key keeps `/data/data`. Confirm before deploying:
+Release builds use `signing/gsm2computer-upload.keystore` (alias `androiddebugkey`, store and key password `android`). CI and a laptop produce the same cert id **`b337a8a4`**, so `pm install -r` keeps app data. Confirm with `python3 scripts/apk-cert-id.py gateway.apk`.
 
-```bash
-python3 scripts/apk-cert-id.py gateway.apk
-adb shell dumpsys package com.gsm2computer.bridge | grep -m1 signatures
-```
+Build 330 from the GitHub Actions run was signed with a keystore that job generated and did not save (cert id `14894728`). This keystore is a new stable key. The first install over that build needs a one-time replace; the hub URL drop file restores the tunnel. Later builds install with `pm install -r`.
 
-Both must show `b3e909f5`. Build with the matching keystore (passwords are the debug-keystore defaults unless you moved them):
-
-```bash
-GATEWAY_KEYSTORE=/path/to/the-matching.keystore ./build.sh release
-./deploy.sh --no-bridge
-```
-
-versionCode 330 is above the documented priv-app build 329, so a same-cert hot-swap is accepted. A cloud-agent APK is signed with that machine's debug keystore; compare its cert id before installing it.
+Uplink from this APK is 16 kHz mono PCM in a binary WebSocket frame (~260 kbps). Deploy the hub in the same pass (`systemctl --user restart gsm2computer-hub` on the hub machine) so it accepts that frame. JSON appends from older phones still work.
 
 Then open the app once (or let boot autostart) so the foreground-service mic capability is established.
 

@@ -282,6 +282,8 @@ class HubSourceTests(unittest.TestCase):
 
         src = inspect.getsource(hub.handle_websocket)
         self.assertIn("offer_uplink", src)
+        self.assertIn("parse_uplink_binary", src)
+        self.assertIn("input_audio_buffer.append", src)
         self.assertNotIn("await bridge.write_in", src)
         self.assertIn("ws_queue_text", src)
 

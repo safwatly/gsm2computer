@@ -7,6 +7,7 @@ import com.gsm2computer.bridge.diag.BridgeLog
 import com.gsm2computer.bridge.diag.HubLinkGrace
 import com.gsm2computer.bridge.rtp.MediaTransport
 import okhttp3.OkHttpClient
+import okio.ByteString.Companion.toByteString
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
@@ -27,8 +28,9 @@ import java.util.concurrent.atomic.AtomicReference
  * retried. Silence is what the caller hears during the gap.
  *
  * Custom hub: token from `{hub}/token`, WebSocket upgrade on the same host.
- * Audio is PCM s16le at the rates from [configureWire]. Appends without
- * format/rate stay 8 kHz μ-law so the browser simulator keeps working.
+ * Uplink is 16 kHz s16le in a binary frame ([UplinkWire]). Downlink stays
+ * the JSON PCM the hub already sends. Appends without format/rate stay
+ * 8 kHz μ-law so the browser simulator keeps working.
  */
 class HubStreamClient(
     private val tokenUrl: String,
@@ -81,6 +83,7 @@ class HubStreamClient(
     private var summaryAtMs = 0L
     private var summaryAccepted = 0L
     private var summaryDropped = 0L
+    @Volatile private var openedAtMs = 0L
 
     override fun start(sink: MediaTransport.Sink) {
         this.sink = sink
@@ -110,11 +113,12 @@ class HubStreamClient(
                     }
                     val now = System.currentTimeMillis()
                     grace.markLost(now)
-                    val delay = grace.retryDelayMs(now)
-                    if (delay == null) {
+                    val baseDelay = grace.retryDelayMs(now)
+                    if (baseDelay == null) {
                         fail("hub link grace expired after ${linkGraceMs}ms: $pending")
                         return
                     }
+                    val delay = baseDelay + ((grace.attempt * 173L) % 500L)
                     linkState = "hold"
                     sink?.onLinkHold(true, pending)
                     trace(
@@ -189,7 +193,8 @@ class HubStreamClient(
                 reconnectArmed.set(false)
                 ws = webSocket
                 linkState = "open"
-                grace.markRestored()
+                openedAtMs = System.currentTimeMillis()
+                grace.markLinked()
                 sink?.onLinkHold(false, "hub ws open")
                 trace("ws_open", mapOf("session_id" to sessionId, "http" to response.code))
                 BridgeLog.i("ws open http=${response.code} session=${sessionId.ifBlank { "-" }}")
@@ -283,6 +288,10 @@ class HubStreamClient(
             ticks++
             logUplinkSummary()
             if (closed || linkState != "open") continue
+            val opened = openedAtMs
+            if (opened != 0L && System.currentTimeMillis() - opened >= STABLE_LINK_MS) {
+                grace.markStable()
+            }
             if (ticks % 5 != 0) continue
             val socket = ws ?: continue
             val sentAt = System.currentTimeMillis()
@@ -327,7 +336,7 @@ class HubStreamClient(
         }
         BridgeLog.i(
             "uplink sent=$sentPerS/s dropped=$dropPerS/s queue=$queued " +
-                "state=$linkState rtt=$lastRttMs",
+                "rate=$inputRate state=$linkState rtt=$lastRttMs",
         )
     }
 
@@ -477,15 +486,8 @@ class HubStreamClient(
             }
             WsSendBudget.Decision.SEND -> Unit
         }
-        val b64 = Base64.encodeToString(frame, Base64.NO_WRAP)
-        val msg = JSONObject()
-            .put("type", "input_audio_buffer.append")
-            .put("audio", b64)
-            .put("format", inputFormat)
-            .put("rate", inputRate)
-            .toString()
         val ok = try {
-            socket.send(msg)
+            socket.send(frame.toByteString())
         } catch (e: Exception) {
             BridgeLog.e("uplink send threw ${e.javaClass.simpleName}")
             wedgeSocket("send threw ${e.javaClass.simpleName}")
@@ -556,6 +558,7 @@ class HubStreamClient(
     companion object {
         private const val TAG = "HubStream"
         private const val FATAL_PREFIX = "fatal:"
+        private const val STABLE_LINK_MS = 20_000L
 
         const val DEFAULT_INSTRUCTIONS =
             "You are a friendly voice assistant on a phone call bridged from a " +
