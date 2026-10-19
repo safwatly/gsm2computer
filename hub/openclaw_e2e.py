@@ -783,13 +783,29 @@ async def run_once_grokbot(step: str = "grok_live") -> E2EResult:
         async with websockets.connect(
             _ws_url(), additional_headers=headers, max_size=8_000_000, open_timeout=10
         ) as ws:
-            raw = await asyncio.wait_for(ws.recv(), timeout=15)
-            msg = json.loads(raw) if isinstance(raw, str) else {}
+            # Downlink deltas can arrive before session.updated; skip them.
+            msg: dict[str, Any] = {}
+            ack_deadline = time.monotonic() + 15
+            while time.monotonic() < ack_deadline:
+                raw = await asyncio.wait_for(ws.recv(), timeout=15)
+                msg = json.loads(raw) if isinstance(raw, str) else {}
+                if msg.get("type") == "session.updated":
+                    break
             sess = msg.get("session") or {}
             if msg.get("type") != "session.updated" or sess.get("talk") != "grokbot":
                 result.error = f"hub session not grokbot: {msg.get('type')} talk={sess.get('talk')}"
                 await ws.close()
                 return result
+
+            async def _drain() -> None:
+                # Read downlink like the Pixel so the hub never sees backpressure.
+                try:
+                    async for _ in ws:
+                        pass
+                except Exception:
+                    pass
+
+            drain_task = asyncio.create_task(_drain())
             await ws.send(
                 json.dumps(
                     {
@@ -820,6 +836,7 @@ async def run_once_grokbot(step: str = "grok_live") -> E2EResult:
                 ):
                     result.aborted_for_real_call = True
             await ws.close()
+            drain_task.cancel()
         if result.aborted_for_real_call:
             result.error = result.error or "preempted during grok e2e"
             return result
