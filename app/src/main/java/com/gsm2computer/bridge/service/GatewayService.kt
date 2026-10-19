@@ -16,10 +16,12 @@ import android.util.Log
 import com.gsm2computer.bridge.BridgeConfig
 import com.gsm2computer.bridge.BuildConfig
 import com.gsm2computer.bridge.MainActivity
+import com.gsm2computer.bridge.diag.BridgeLog
 import com.gsm2computer.bridge.MicCapabilityGuard
 import com.gsm2computer.bridge.R
 import com.gsm2computer.bridge.RootShell
 import com.gsm2computer.bridge.bridge.CallOrchestrator
+import com.gsm2computer.bridge.config.HubControlInjector
 import com.gsm2computer.bridge.gsm.GsmCallManager
 import com.gsm2computer.bridge.sms.SmsOutboxPoller
 import kotlin.concurrent.thread
@@ -62,6 +64,7 @@ class GatewayService : Service() {
             ACTION_RELOAD_STATS -> reloadStats()
             ACTION_DIAL -> dialFromDialler(intent)
             ACTION_RELAUNCH_FROM_FG -> startGateway(forceRestart = true)
+            ACTION_APPLY_HUB -> applyHubConfig()
             else -> startGateway(forceRestart = intent?.action == ACTION_RELAUNCH_FROM_FG)
         }
         return START_STICKY
@@ -228,6 +231,11 @@ class GatewayService : Service() {
         val worker = thread(name = "sms-outbox") {
             while (!stopped && gen == outboxGeneration) {
                 try {
+                    HubControlInjector.applyDropFile(this@GatewayService)
+                } catch (e: Exception) {
+                    Log.w(TAG, "hub url drop: ${e.message}")
+                }
+                try {
                     SmsOutboxPoller.pollOnce(this@GatewayService)
                 } catch (e: Exception) {
                     Log.w(TAG, "outbox poll: ${e.message}")
@@ -240,6 +248,21 @@ class GatewayService : Service() {
             }
         }
         outboxThread = worker
+    }
+
+    private fun applyHubConfig() {
+        val cfg = BridgeConfig.resolve(BridgeConfig.openPrefs(this))
+        if (!cfg.streamEnabled) {
+            BridgeLog.w("hub url reload skipped")
+            return
+        }
+        if (isCallActive()) {
+            broadcastLog("Hub URL saved; SMS uses it now, audio on the next call")
+            BridgeLog.i("hub url saved during call")
+            return
+        }
+        stopped = false
+        startGateway(forceRestart = true)
     }
 
     private fun isCallActive(): Boolean {
@@ -397,6 +420,7 @@ class GatewayService : Service() {
         const val ACTION_RELOAD_STATS = "com.gsm2computer.bridge.RELOAD_STATS"
         const val ACTION_DIAL = "com.gsm2computer.bridge.DIAL"
         const val ACTION_RELAUNCH_FROM_FG = "com.gsm2computer.bridge.RELAUNCH_FROM_FG"
+        const val ACTION_APPLY_HUB = "com.gsm2computer.bridge.APPLY_HUB"
         const val EXTRA_NUMBER = "number"
         const val STATUS_ACTION = "com.gsm2computer.bridge.STATUS"
         const val LOG_ACTION = "com.gsm2computer.bridge.LOG"
@@ -417,6 +441,31 @@ class GatewayService : Service() {
             context.startService(
                 Intent(context, GatewayService::class.java).apply { action = ACTION_STOP }
             )
+        }
+
+        /** Reload an idle bridge after a hub URL change. [async] avoids joining the caller. */
+        fun requestHubReload(context: Context, async: Boolean) {
+            val run = Runnable {
+                val intent = Intent(context, GatewayService::class.java).apply {
+                    action = ACTION_APPLY_HUB
+                }
+                try {
+                    context.startService(intent)
+                } catch (e: IllegalStateException) {
+                    try {
+                        context.startForegroundService(intent)
+                    } catch (e2: Exception) {
+                        BridgeLog.w("hub url saved; open the app to reload")
+                    }
+                } catch (e: Exception) {
+                    BridgeLog.w("hub url saved; open the app to reload")
+                }
+            }
+            if (async) {
+                thread(name = "hub-reload") { run.run() }
+            } else {
+                run.run()
+            }
         }
     }
 }

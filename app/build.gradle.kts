@@ -22,8 +22,10 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        // Above the priv-app build documented as versionCode 329 so a same-cert
+        // hot-swap is accepted (docs/VOICE_CALL_SILENCING_INVESTIGATION.md).
+        versionCode = 330
+        versionName = "0.1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

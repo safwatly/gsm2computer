@@ -8,6 +8,7 @@ import android.util.Log
 import com.gsm2computer.bridge.BridgeConfig
 import com.gsm2computer.bridge.MicCapabilityGuard
 import com.gsm2computer.bridge.RootShell
+import com.gsm2computer.bridge.config.HubControlInjector
 
 /** Auto-starts the bridge service on boot when hub stream URL is configured. */
 class BootReceiver : BroadcastReceiver() {
@@ -19,26 +20,29 @@ class BootReceiver : BroadcastReceiver() {
         }
         Log.i(TAG, "Boot/update received, checking config...")
         earlyPermissionSetup(context)
-
-        val prefs = BridgeConfig.openPrefs(context)
-        if (!BridgeConfig.resolveAutoconnect(prefs)) {
-            Log.i(TAG, "Autoconnect disabled, skipping")
-            return
-        }
-        if (!BridgeConfig.isConfigured(prefs)) {
-            Log.i(TAG, "Hub stream not configured, skipping auto-start")
-            return
-        }
+        val pending = goAsync()
 
         Thread({
             try {
                 RootShell.init()
+                HubControlInjector.applyDropFile(context.applicationContext, reload = false)
+                val prefs = BridgeConfig.openPrefs(context)
+                if (!BridgeConfig.resolveAutoconnect(prefs)) {
+                    Log.i(TAG, "Autoconnect disabled, skipping")
+                    return@Thread
+                }
+                if (!BridgeConfig.isConfigured(prefs)) {
+                    Log.i(TAG, "Hub stream not configured, skipping auto-start")
+                    return@Thread
+                }
                 if (!MicCapabilityGuard.launchRelaunchActivity(context.packageName)) {
                     GatewayService.start(context)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Foreground relaunch failed: ${e.message}")
                 GatewayService.start(context)
+            } finally {
+                pending.finish()
             }
         }, "boot-relaunch").start()
     }

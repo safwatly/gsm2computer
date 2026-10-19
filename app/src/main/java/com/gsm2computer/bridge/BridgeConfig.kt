@@ -15,6 +15,9 @@ object BridgeConfig {
     const val KEY_AUTOCONNECT = "autoconnect"
     const val KEY_STREAM_ENABLED = "stream_enabled"
     const val KEY_HUB_CONTROL_URL = "hub_control_url"
+
+    /** Last hub URL consumed from [com.gsm2computer.bridge.HubControlUrl.DROP_FILE]. */
+    const val KEY_HUB_URL_DROP = "hub_control_url_drop"
     const val KEY_STREAM_TOKEN_URL = "stream_token_url"
     const val KEY_STREAM_MODEL = "stream_model"
     const val KEY_STREAM_VOICE = "stream_voice"

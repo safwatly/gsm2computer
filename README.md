@@ -53,7 +53,23 @@ sudo ./setup.sh          # once: JDK + Android SDK
 ./deploy.sh --reboot     # first install (Magisk module + priv-app)
 ```
 
-Configure the hub URL on-device or via adb (defaults to the Tailscale hub):
+Configure the hub URL on-device (Settings → hub control URL) or from Cup. The settings field and the adb path write the same SharedPreferences key (`gsm2computer` / `hub_control_url`).
+
+```bash
+./scripts/set-hub-url.sh 'https://YOUR-TUNNEL.example'
+# adb logcat -s GSM2Bridge    →  hub url applied id=....
+```
+
+That writes `/data/local/tmp/gsm2computer-hub.url` and sends `com.gsm2computer.bridge.SET_HUB_URL`. The receiver requires `android.permission.DUMP` (held by `adb shell`). A running bridge applies it without a reboot: SMS on the next poll, call audio on the next call. The drop file lives outside app data, so after an uninstall wipe the next launch restores the URL. Equivalent raw commands:
+
+```bash
+adb shell "printf '%s\n' 'https://YOUR-TUNNEL.example' > /data/local/tmp/gsm2computer-hub.url"
+adb shell am broadcast -a com.gsm2computer.bridge.SET_HUB_URL \
+  -n com.gsm2computer.bridge/.config.HubControlReceiver \
+  --es url 'https://YOUR-TUNNEL.example'
+```
+
+`scripts/configure-bridge.sh` still rewrites the whole prefs XML (including model and voice). `./deploy.sh` runs it unless you pass `--no-bridge`. Use `--no-bridge` when a tunnel URL is already set so deploy does not put the Tailscale default back.
 
 ```bash
 HUB_CONTROL_URL=http://hub.mining-ling.ts.net:8787 \
@@ -61,6 +77,24 @@ HUB_CONTROL_URL=http://hub.mining-ling.ts.net:8787 \
 ```
 
 `STREAM_TOKEN_URL` is optional and defaults to `{HUB_CONTROL_URL}/token`. OpenAI `STREAM_MODEL` / `STREAM_VOICE` are unused in hub mode.
+
+### Same-cert install (keeps settings)
+
+The Magisk priv-app on the Pixel is signed with cert id `b3e909f5` (`dumpsys package com.gsm2computer.bridge` shows `Signature{b3e909f5}`). Hot-swap with that same key keeps `/data/data`. Confirm before deploying:
+
+```bash
+python3 scripts/apk-cert-id.py gateway.apk
+adb shell dumpsys package com.gsm2computer.bridge | grep -m1 signatures
+```
+
+Both must show `b3e909f5`. Build with the matching keystore (passwords are the debug-keystore defaults unless you moved them):
+
+```bash
+GATEWAY_KEYSTORE=/path/to/the-matching.keystore ./build.sh release
+./deploy.sh --no-bridge
+```
+
+versionCode 330 is above the documented priv-app build 329, so a same-cert hot-swap is accepted. A cloud-agent APK is signed with that machine's debug keystore; compare its cert id before installing it.
 
 Then open the app once (or let boot autostart) so the foreground-service mic capability is established.
 
