@@ -12,6 +12,7 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.util.Log
 import com.gsm2computer.bridge.DeviceProfile
+import com.gsm2computer.bridge.diag.BridgeLog
 import com.gsm2computer.bridge.RootShell
 import com.gsm2computer.bridge.gsm.GsmCallManager
 import java.net.DatagramPacket
@@ -478,6 +479,7 @@ class RtpSession(
      */
     private fun failCapture(msg: String) {
         Log.e(TAG, msg)
+        BridgeLog.e("capture error: $msg")
         listener?.onRtpStats(msg)
         listener?.onRtpError(msg)
     }
@@ -485,6 +487,7 @@ class RtpSession(
     fun stop() {
         if (!running.getAndSet(false)) return
         Log.i(TAG, "Stopping RTP session on port $localPort")
+        BridgeLog.i("capture stop tx=$txPacketCount")
 
         audioRecord?.let {
             try { it.stop() } catch (_: Exception) {}
@@ -646,6 +649,10 @@ class RtpSession(
             "Capture started: source=$audioSourceName capRate=$captureRate session=$audioSessionId " +
                 "gain=${captureGain}x profile=${profile.name} state=${record.recordingState}"
         )
+        BridgeLog.i(
+            "capture start source=$audioSourceName rate=$captureRate " +
+                "hal=${record.sampleRate} state=${record.recordingState}",
+        )
         // Also report via RTP stats so it appears in the app log viewer
         listener?.onRtpStats(
             "Capture: source=$audioSourceName rate=$captureRate halRate=${record.sampleRate} " +
@@ -670,11 +677,27 @@ class RtpSession(
         // transport owns the wire, so only resolve the RTP peer for the UDP path.
         val defaultRemoteInet = if (wsMode) null else InetAddress.getByName(remoteAddr)
         var silenceFrameCount = 0
+        var captureErrors = 0
 
         while (running.get()) {
             try {
                 val read = record.read(pcmBuf, 0, pcmBuf.size)
-                if (read <= 0) continue
+                if (read < 0) {
+                    captureErrors++
+                    if (captureErrors == 1 || captureErrors % 50 == 0) {
+                        BridgeLog.e(
+                            "capture read failed code=$read source=$audioSourceName " +
+                                "errors=$captureErrors",
+                        )
+                    }
+                    try {
+                        Thread.sleep(20)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                    continue
+                }
+                if (read == 0) continue
 
                 // Measure raw capture level BEFORE echo gate for diagnostics.
                 // If rawCaptureRms=0, the audio source itself is silent
@@ -861,7 +884,10 @@ class RtpSession(
                     txTimestamp += 160 // 20ms at 8000Hz RTP clock
                 }
             } catch (e: Exception) {
-                if (running.get()) Log.e(TAG, "Capture error: ${e.message}")
+                if (running.get()) {
+                    Log.e(TAG, "Capture error: ${e.message}")
+                    BridgeLog.e("capture error: ${e.javaClass.simpleName} ${e.message?.take(120) ?: ""}")
+                }
             }
         }
         captureTap?.close()
@@ -1591,54 +1617,11 @@ class RtpSession(
                             }
                         }
 
-                        // Phase 7: Probe ALSA capture PCMs for non-zero audio data.
-                        // All AudioRecord sources return silence (rawCapRMS=0) on this
-                        // device.  This probe reads raw bytes from each RUNNING capture
-                        // PCM across ALL cards to find which device has modem downlink
-                        // audio.  Card 1 (aboxvdma) may carry modem voice data.
-                        if (running.get()) {
-                            val probeCmd = buildString {
-                                append("echo '=== ALSA capture PCM probe (all cards) ==='; ")
-                                append("if [ ! -x /data/local/tmp/tinycap ]; then ")
-                                append("  echo 'tinycap not found'; ")
-                                append("else ")
-                                // Iterate all capture PCMs across all cards
-                                append("for d in /proc/asound/card*/pcm*c; do ")
-                                append("  [ -d \"\$d/sub0\" ] || continue; ")
-                                append("  s=\$(head -1 \$d/sub0/status 2>/dev/null); ")
-                                append("  card=\${d#/proc/asound/}; card=\${card%%/*}; ")
-                                append("  cardnum=\${card#card}; ")
-                                append("  pcm=\${d##*/}; devnum=\${pcm#pcm}; devnum=\${devnum%c}; ")
-                                append("  name=\$(cat \$d/info 2>/dev/null | grep '^name:' | head -1 | cut -d: -f2-); ")
-                                append("  echo \"\$card/\$pcm:\$name status=\$s\"; ")
-                                append("  if echo \"\$s\" | grep -q RUNNING; then ")
-                                // Parse actual hw_params for this PCM
-                                append("    ch=\$(cat \$d/sub0/hw_params 2>/dev/null | grep '^channels:' | awk '{print \$2}'); ")
-                                append("    rate=\$(cat \$d/sub0/hw_params 2>/dev/null | grep '^rate:' | awk '{print \$2}'); ")
-                                append("    fmt=\$(cat \$d/sub0/hw_params 2>/dev/null | grep '^format:' | awk '{print \$2}'); ")
-                                append("    bits=16; echo \"\$fmt\" | grep -q S32 && bits=32; ")
-                                append("    echo \"  hw: fmt=\$fmt ch=\$ch rate=\$rate bits=\$bits\"; ")
-                                // Capture 1 second of raw audio with actual params
-                                append("    timeout 2 /data/local/tmp/tinycap /data/local/tmp/probe_\${cardnum}_\${devnum}.raw ")
-                                append("-D \$cardnum -d \$devnum -c \${ch:-2} -r \${rate:-48000} -b \${bits} -p 480 -n 4 2>&1 | head -2; ")
-                                append("    f=/data/local/tmp/probe_\${cardnum}_\${devnum}.raw; ")
-                                append("    if [ -f \"\$f\" ] && [ -s \"\$f\" ]; then ")
-                                append("      sz=\$(wc -c < \"\$f\"); ")
-                                append("      nz=\$(od -An -tx1 \"\$f\" | tr ' ' '\\n' | grep -cv '^00\$\\|^\$'); ")
-                                append("      echo \"  probe: \${sz}B, \${nz} non-zero bytes\"; ")
-                                append("      rm -f \"\$f\"; ")
-                                append("    else ")
-                                append("      echo '  probe: no data captured'; ")
-                                append("    fi; ")
-                                append("  fi; ")
-                                append("done; ")
-                                append("fi")
-                            }
-                            val probeResult = RootShell.execForOutput(probeCmd, timeoutMs = 30000)
-                            for (line in probeResult.lines().filter { it.isNotBlank() }) {
-                                Log.i(TAG, "Diag: $line")
-                            }
-                        }
+                        // Do not tinycap a RUNNING capture PCM during a call.
+                        // This probe used to sleep 5s and then open every live
+                        // capture device, which steals it from AudioRecord and
+                        // stops uplink frames a few seconds into the call.
+                        Log.i(TAG, "Diag: skip in-call tinycap (would steal capture PCM)")
                     } catch (e: Exception) {
                         Log.w(TAG, "Diag routing check failed: ${e.message}")
                     }
