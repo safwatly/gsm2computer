@@ -243,5 +243,43 @@ class E2EHelpersTest(unittest.TestCase):
             self.assertLess(tail_loud, 3.0)
 
 
+class GrokbotUplinkWriterTest(unittest.IsolatedAsyncioTestCase):
+    async def test_grokbot_uplink_goes_through_side_writer_with_gain(self) -> None:
+        import audioop
+        import types
+        import hub
+
+        class Stdin:
+            def __init__(self) -> None:
+                self.data = b""
+                self.transport = types.SimpleNamespace(get_write_buffer_size=lambda: 0)
+
+            def write(self, data: bytes) -> None:
+                self.data += data
+
+            async def drain(self) -> None:
+                return None
+
+        stdin = Stdin()
+        bridge = hub.PipewireBridge(gv.GROKBOT_MIC_SINK, gv.GROKBOT_SPK_SINK, 48000)
+        bridge._playback = types.SimpleNamespace(stdin=stdin, returncode=None)  # type: ignore[assignment]
+        bridge.uplink_gain = 2.0
+        bridge._uplink_q = asyncio.Queue(maxsize=25)
+        task = asyncio.create_task(bridge._pump_uplink())
+        frame = b"\x00\x01" * 960  # 20 ms @ 48k
+        bridge.offer_uplink(frame, "audio/pcm", 48000)
+        await asyncio.sleep(0.1)
+        self.assertEqual(bridge.uplink_written, 1)
+        self.assertEqual(audioop.max(stdin.data, 2), 2 * audioop.max(frame, 2))
+        snap = bridge.downlink_snapshot()
+        self.assertEqual(snap["uplink_dropped_frames"], 0)
+        bridge._closed = True
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 if __name__ == "__main__":
     unittest.main()
