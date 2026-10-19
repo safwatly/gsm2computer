@@ -22,8 +22,10 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        // 331 follows the installed build 330. Same signing/gsm2computer-upload.keystore
+        // on every machine so `pm install -r` keeps app data.
+        versionCode = 331
+        versionName = "0.1.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -36,7 +38,7 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
+            storeFile = rootProject.file("signing/gsm2computer-upload.keystore")
             storePassword = "android"
             keyAlias = "androiddebugkey"
             keyPassword = "android"

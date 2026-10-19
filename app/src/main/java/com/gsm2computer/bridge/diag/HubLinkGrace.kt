@@ -33,6 +33,20 @@ class HubLinkGrace(
     }
 
     /**
+     * The socket is up again. The grace window restarts so a flap does not
+     * hang up the GSM call, but [attempt] stays so the next retry backs off.
+     */
+    fun markLinked() = synchronized(lock) {
+        lostAtMs = null
+    }
+
+    /** The socket has stayed up long enough that the next drop starts at 1s. */
+    fun markStable() = synchronized(lock) {
+        lostAtMs = null
+        attempt = 0
+    }
+
+    /**
      * Milliseconds to wait before the next connect attempt.
      * Null when the grace window is already over (or grace is disabled).
      */

@@ -20,14 +20,22 @@ The browser simulator stays 8 kHz μ-law and must keep working without a format 
 
 | Side | Behavior |
 |------|----------|
-| Phone WS capture | Try AudioRecord at **48 kHz, then 16, then 8**. Send `input_audio_buffer.append` as **s16le mono** with `"format":"audio/pcm"` and `"rate":<hz>`. |
+| Phone WS capture | Try AudioRecord at **48 kHz, then 16, then 8**. Send **16 kHz** s16le mono (downsample when the HAL is faster) as a binary `G2` frame. JSON `input_audio_buffer.append` remains valid for older builds. |
 | Phone WS playback | Try AudioTrack at **48 kHz, then 16, then 8**. Accept PCM or μ-law deltas (`format` + `rate` on `response.output_audio.delta`). |
 | Hub PipeWire | Always **48 kHz s16** `pw-cat` / `pw-record` on `phone_uplink` / `openclaw_bus.monitor`. Resample with `audioop.ratecv`. |
 | Simulator | Unchanged: 8 kHz μ-law, no `client.audio`. |
 
-`client.audio` `{input,output:{format,rate}}` tells the hub what will be sent and what the client can play. `session.updated.audio` still defaults to pcmu/8000 and advertises `preferred: {format: audio/pcm, rate: 48000, encoding: s16le}`.
+`client.audio` `{input,output:{format,rate}}` tells the hub what will be sent and what the client can play. `session.updated.audio` still defaults to pcmu/8000 and advertises `preferred: {format: audio/pcm, rate: 16000, encoding: s16le}`.
 
 UDP/SIP RTP is unchanged (G.711 / G.722). Pixel software gain is device calibration (`captureGain`), not part of this wire.
+
+## Amendment (2026-10-19)
+
+Build 330 sent 48 kHz PCM as base64 JSON (~1 Mbps). On a throttled uplink the phone's send queue filled in about 5 seconds and the socket relinked every ~11 seconds, so the hub heard only a few seconds of a one-minute call. Downlink was fine.
+
+The phone now captures at the HAL rate and **sends 16 kHz mono s16le** (48 kHz is averaged down). Each frame is a binary WebSocket message with an 8-byte `G2` header (version, format, rate) plus the PCM. That is about **260 kbps**. Downlink stays JSON PCM at the playback rate. `client.audio` still announces input and output. Missing `format` / `rate` on a JSON append is still 8 kHz μ-law, so the simulator and build 330 keep working. The hub resamples whatever arrives to the 48 kHz PipeWire bus.
+
+`session.updated.audio.preferred.rate` is 16000. Old clients that ignore `preferred` are unchanged.
 
 ## Consequences
 

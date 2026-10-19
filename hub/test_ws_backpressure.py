@@ -15,6 +15,7 @@ sys.modules.setdefault("audioop", types.ModuleType("audioop"))  # py3.13 CI; unu
 from call_slot import CallSlot  # noqa: E402
 from ws_backpressure import (  # noqa: E402
     DownlinkSendGuard,
+    offer_nowait,
     reconnect_should_supersede,
     transport_buffered,
 )
@@ -210,6 +211,57 @@ class RealSocketStallTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(reason)
 
 
+class UplinkQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_offer_nowait_drops_oldest_when_full(self) -> None:
+        q: asyncio.Queue = asyncio.Queue(maxsize=2)
+        self.assertEqual(offer_nowait(q, "a"), 0)
+        self.assertEqual(offer_nowait(q, "b"), 0)
+        self.assertEqual(offer_nowait(q, "c"), 1)
+        self.assertEqual(q.get_nowait(), "b")
+        self.assertEqual(q.get_nowait(), "c")
+
+    async def test_stalled_playback_does_not_block_the_offerer(self) -> None:
+        """pw-cat stdin that never drains must not stall offer_uplink."""
+        import hub
+
+        class Stdin:
+            def __init__(self) -> None:
+                self.writes = 0
+                self.transport = types.SimpleNamespace(get_write_buffer_size=lambda: 1_000_000)
+
+            def write(self, data: bytes) -> None:
+                self.writes += 1
+
+            async def drain(self) -> None:
+                await asyncio.sleep(30)
+
+        class Proc:
+            def __init__(self, stdin: Stdin) -> None:
+                self.stdin = stdin
+                self.returncode = None
+
+        stdin = Stdin()
+        bridge = hub.PipewireBridge("phone_uplink", "phone_uplink.monitor", 48000)
+        bridge._playback = Proc(stdin)  # type: ignore[assignment]
+        bridge._uplink_q = asyncio.Queue(maxsize=4)
+        task = asyncio.create_task(bridge._pump_uplink())
+        started = time.monotonic()
+        for i in range(30):
+            bridge.offer_uplink(b"\x00\x01" * 20, "audio/pcm", 48000)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.5, "offer_uplink blocked on stalled playback")
+        await asyncio.sleep(0.2)
+        self.assertEqual(bridge._uplink_q.qsize(), 0)
+        self.assertEqual(stdin.writes, 0)
+        self.assertGreater(bridge.uplink_dropped, 0)
+        bridge._closed = True
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 class HubSourceTests(unittest.TestCase):
     def test_pump_out_no_longer_aborts_on_drain_timeout(self) -> None:
         import hub
@@ -222,8 +274,18 @@ class HubSourceTests(unittest.TestCase):
     def test_pong_never_awaits_drain(self) -> None:
         import hub
 
-        for fn in (hub.ws_send_pong, hub.ws_send_ping):
+        for fn in (hub.ws_send_pong, hub.ws_send_ping, hub.ws_queue_text):
             self.assertNotIn(".drain(", inspect.getsource(fn))
+
+    def test_uplink_read_loop_does_not_await_playback(self) -> None:
+        import hub
+
+        src = inspect.getsource(hub.handle_websocket)
+        self.assertIn("offer_uplink", src)
+        self.assertIn("parse_uplink_binary", src)
+        self.assertIn("input_audio_buffer.append", src)
+        self.assertNotIn("await bridge.write_in", src)
+        self.assertIn("ws_queue_text", src)
 
     def test_supersede_does_not_wake_cup(self) -> None:
         import hub

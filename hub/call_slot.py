@@ -291,6 +291,9 @@ class CallSlot:
                 out["downlink_stalled_s"] = dl.get("stalled_s")
                 out["downlink_max_stall_s"] = dl.get("max_stall_s")
                 out["downlink_dropped_frames"] = dl.get("dropped_frames")
+                if "uplink_dropped_frames" in dl:
+                    out["uplink_dropped_frames"] = dl.get("uplink_dropped_frames")
+                    out["uplink_queued"] = dl.get("uplink_queued")
             except Exception:
                 pass
         return out

@@ -20,7 +20,11 @@ from typing import Any, Optional, Tuple
 
 from alert_webhook import post_system_alert
 from ws_backpressure import (
+    UPLINK_BACKLOG_BYTES,
+    UPLINK_QUEUE_FRAMES,
+    UPLINK_WRITE_TIMEOUT_S,
     DownlinkSendGuard,
+    offer_nowait,
     reconnect_should_supersede,
     transport_buffered,
     writer_closing,
@@ -225,6 +229,13 @@ async def ws_send_text(writer: asyncio.StreamWriter, text: str) -> bool:
     return await _soft_drain(writer)
 
 
+def ws_queue_text(writer: asyncio.StreamWriter, text: str) -> None:
+    """Queue a text frame and return. Awaiting drain here stalls the uplink read loop."""
+    if writer_closing(writer):
+        raise ConnectionResetError("websocket transport closing")
+    writer.write(ws_encode_text(text))
+
+
 async def ws_send_pong(writer: asyncio.StreamWriter, payload: bytes = b"") -> None:
     # Never await drain here: this runs inside the uplink read loop, and a
     # stalled downlink must not stop us reading the Pixel's frames.
@@ -304,6 +315,8 @@ async def ws_read_frame(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         return WsRead(text="", pong=True)
     if opcode == 0x1:
         return WsRead(text=payload.decode("utf-8", errors="replace"))
+    if opcode == 0x2:
+        return WsRead(binary=payload)
     return WsRead(text="")
 
 
@@ -464,6 +477,23 @@ def _as_rate(raw: Any, default: int) -> int:
     return rate if rate > 0 else default
 
 
+def parse_uplink_binary(payload: bytes) -> Optional[Tuple[bytes, str, int]]:
+    """G2 v1 uplink frame: magic, version, format 1 (s16le mono), rate uint16 BE, pcm.
+
+    Old phones keep sending JSON ``input_audio_buffer.append``. A binary frame
+    without this header is PCM only when ``client.audio`` already said so.
+    """
+    if len(payload) < 8 or payload[0:2] != b"G2" or payload[2] != 1 or payload[3] != 1:
+        return None
+    rate = int.from_bytes(payload[4:6], "big")
+    pcm = payload[8:]
+    if rate <= 0 or len(pcm) < 2:
+        return None
+    if len(pcm) & 1:
+        pcm = pcm[:-1]
+    return pcm, "audio/pcm", rate
+
+
 def _to_pcm16(audio: bytes, fmt: str) -> bytes:
     if fmt == "audio/pcm":
         if len(audio) & 1:
@@ -536,6 +566,13 @@ class PipewireBridge:
         self.downlink_guard = DownlinkSendGuard()
         self._stall_logged_recovery = True
         self._out_writer: Optional[asyncio.StreamWriter] = None
+        # Caller audio is queued here and written to pw-cat on a side task.
+        # The WebSocket read loop must not await stdin.drain(): a stalled
+        # playback pipe used to freeze ping/pong handling and the relink path.
+        self._uplink_q: Optional[asyncio.Queue] = None
+        self._uplink_task: Optional[asyncio.Task] = None
+        self.uplink_dropped = 0
+        self.uplink_written = 0
 
     def _track_helper(self, proc: asyncio.subprocess.Process, label: str) -> None:
         self._helper_tasks.append(asyncio.create_task(self._log_helper_stderr(proc, label)))
@@ -659,6 +696,8 @@ class PipewireBridge:
             LOG.info("hub record linked: %s", rec_detail)
             self._out_writer = ws_writer
             self._record_task = asyncio.create_task(self._pump_out())
+        self._uplink_q = asyncio.Queue(maxsize=UPLINK_QUEUE_FRAMES)
+        self._uplink_task = asyncio.create_task(self._pump_uplink(), name="uplink-playback")
         LOG.info(
             "pipewire bridge started sink=%s serial=%s monitor=%s record=%s",
             self.sink,
@@ -704,9 +743,13 @@ class PipewireBridge:
 
     def downlink_snapshot(self) -> dict[str, Any]:
         try:
-            return self.downlink_guard.snapshot()
+            snap = dict(self.downlink_guard.snapshot())
         except Exception:
-            return {}
+            snap = {}
+        snap["uplink_dropped_frames"] = self.uplink_dropped
+        q = self._uplink_q
+        snap["uplink_queued"] = q.qsize() if q is not None else 0
+        return snap
 
     def current_downlink_writer(self) -> Optional[asyncio.StreamWriter]:
         writer = self._out_writer
@@ -810,6 +853,82 @@ class PipewireBridge:
         if self._record.returncode is None:
             await self._record.wait()
 
+    def offer_uplink(self, audio: bytes, fmt: str = "", rate: int = 0) -> None:
+        """Queue one caller frame without waiting. Drops the oldest if pw-cat is behind."""
+        if self._closed or not audio:
+            return
+        q = self._uplink_q
+        if q is None:
+            self.uplink_dropped += 1
+            self._maybe_log_uplink_drop("no queue")
+            return
+        dropped = offer_nowait(q, (bytes(audio), str(fmt or ""), int(rate or 0)))
+        if dropped:
+            self.uplink_dropped += dropped
+            self._maybe_log_uplink_drop("queue")
+
+    def _playback_backlog(self) -> int:
+        proc = self._playback
+        stdin = getattr(proc, "stdin", None) if proc is not None else None
+        if stdin is None:
+            return 0
+        return transport_buffered(stdin)
+
+    def _discard_queued_uplink(self) -> int:
+        q = self._uplink_q
+        if q is None:
+            return 0
+        n = 0
+        while True:
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                return n
+            n += 1
+
+    def _maybe_log_uplink_drop(self, why: str) -> None:
+        n = self.uplink_dropped
+        if n != 1 and n % 50 != 0:
+            return
+        queued = self._uplink_q.qsize() if self._uplink_q is not None else 0
+        LOG.warning(
+            "uplink audio dropped (%s) total=%s backlog=%s queued=%s",
+            why,
+            n,
+            self._playback_backlog(),
+            queued,
+        )
+
+    async def _pump_uplink(self) -> None:
+        """Write queued caller audio to pw-cat. Never runs on the WebSocket read task."""
+        q = self._uplink_q
+        if q is None:
+            return
+        while not self._closed:
+            item = await q.get()
+            if self._closed or item is None:
+                return
+            audio, fmt, rate = item
+            if self._playback_backlog() > UPLINK_BACKLOG_BYTES:
+                extra = self._discard_queued_uplink()
+                self.uplink_dropped += 1 + extra
+                self._maybe_log_uplink_drop("pw-cat backlog")
+                continue
+            try:
+                await asyncio.wait_for(
+                    self.write_in(audio, fmt, rate),
+                    timeout=UPLINK_WRITE_TIMEOUT_S,
+                )
+                self.uplink_written += 1
+            except asyncio.TimeoutError:
+                extra = self._discard_queued_uplink()
+                self.uplink_dropped += 1 + extra
+                self._maybe_log_uplink_drop("pw-cat write timeout")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOG.warning("uplink playback failed: %s", exc)
+
     async def write_in(self, audio: bytes, fmt: str = "", rate: int = 0) -> None:
         if self._closed or not audio:
             return
@@ -857,6 +976,14 @@ class PipewireBridge:
         if self._closed:
             return
         self._closed = True
+        uplink_task = self._uplink_task
+        self._uplink_task = None
+        if uplink_task is not None:
+            uplink_task.cancel()
+            try:
+                await uplink_task
+            except asyncio.CancelledError:
+                pass
         self.playback_linked = False
         self.record_linked = False
         if self._record_task:
@@ -1660,7 +1787,7 @@ async def handle_websocket(
                 "audio": {
                     "format": DEFAULT_CLIENT_FORMAT,
                     "rate": DEFAULT_CLIENT_RATE,
-                    "preferred": {"format": "audio/pcm", "rate": BUS_RATE, "encoding": "s16le"},
+                    "preferred": {"format": "audio/pcm", "rate": 16000, "encoding": "s16le"},
                 },
                 "talk": OPENCLAW_TALK_MODE if not loopback else "off",
                 "e2e": e2e,
@@ -1683,6 +1810,29 @@ async def handle_websocket(
         path_task = asyncio.create_task(
             _watch_call_path(live_call, peer_ip, live_call.claimed_at or 0.0)
         )
+
+        async def ingest_uplink(audio: bytes, fmt: str, rate: int) -> None:
+            if not audio:
+                return
+            live_call.note_uplink()
+            bridge.offer_uplink(audio, fmt, rate)
+            if loopback:
+                wire_fmt = _normalize_format(fmt) or bridge.client_in_format
+                energy = (
+                    _pcm_rms_energy(_to_pcm16(audio, wire_fmt))
+                    if wire_fmt == "audio/pcm"
+                    else _mulaw_rms_energy(audio)
+                )
+                echo = {
+                    "type": "response.output_audio.delta",
+                    "delta": base64.b64encode(audio).decode("ascii"),
+                    "format": wire_fmt,
+                    "rate": _as_rate(rate, bridge.client_in_rate),
+                    "channels": {"l": energy, "r": energy},
+                }
+                await ws_send_text(writer, json.dumps(echo))
+            elif OPENCLAW_TALK_MODE == "relay" and openclaw_bridge is not None:
+                openclaw_bridge.feed_gsm_ulaw(bridge.to_ulaw_8k(audio, fmt, rate))
 
         while True:
             if bridge.aborted() or (live_call.abort.is_set() and not live_call.gap_wake.is_set()):
@@ -1755,8 +1905,19 @@ async def handle_websocket(
                     )
                 live_call.note_ws_activity()
                 continue
-            msg = frame.text
             live_call.note_ws_activity()
+            if frame.binary:
+                parsed = parse_uplink_binary(frame.binary)
+                if parsed is None and bridge.client_in_format == "audio/pcm" and len(frame.binary) >= 2:
+                    raw = frame.binary
+                    if len(raw) & 1:
+                        raw = raw[:-1]
+                    if raw:
+                        parsed = (raw, "audio/pcm", bridge.client_in_rate)
+                if parsed is not None:
+                    await ingest_uplink(*parsed)
+                continue
+            msg = frame.text
             if not msg:
                 continue
             try:
@@ -1778,32 +1939,22 @@ async def handle_websocket(
             elif etype == "input_audio_buffer.append":
                 audio_b64 = event.get("audio") or event.get("data") or ""
                 if audio_b64:
-                    live_call.note_uplink()
+                    # JSON append is the pre-331 phone and the browser simulator.
+                    # Do not await pw-cat here; offer_uplink queues it.
                     audio = base64.b64decode(audio_b64, validate=False)
-                    fmt = event.get("format") or ""
-                    rate = event.get("rate") or 0
-                    await bridge.write_in(audio, fmt, rate)
-                    if loopback:
-                        energy = (
-                            _pcm_rms_energy(_to_pcm16(audio, _normalize_format(fmt) or bridge.client_in_format))
-                            if (_normalize_format(fmt) or bridge.client_in_format) == "audio/pcm"
-                            else _mulaw_rms_energy(audio)
-                        )
-                        echo = {
-                            "type": "response.output_audio.delta",
-                            "delta": base64.b64encode(audio).decode("ascii"),
-                            "format": _normalize_format(fmt) or bridge.client_in_format,
-                            "rate": _as_rate(rate, bridge.client_in_rate),
-                            "channels": {"l": energy, "r": energy},
-                        }
-                        await ws_send_text(writer, json.dumps(echo))
-                    elif OPENCLAW_TALK_MODE == "relay" and openclaw_bridge is not None:
-                        openclaw_bridge.feed_gsm_ulaw(bridge.to_ulaw_8k(audio, fmt, rate))
+                    await ingest_uplink(
+                        audio,
+                        event.get("format") or "",
+                        int(event.get("rate") or 0),
+                    )
             elif etype == "client.ping":
-                await ws_send_text(
-                    writer,
-                    json.dumps({"type": "client.pong", "t": event.get("t")}),
-                )
+                try:
+                    ws_queue_text(
+                        writer,
+                        json.dumps({"type": "client.pong", "t": event.get("t")}),
+                    )
+                except (ConnectionError, BrokenPipeError, OSError) as exc:
+                    LOG.warning("client.pong queue failed: %s", exc)
             else:
                 LOG.debug("ws event type=%s", etype)
     finally:
