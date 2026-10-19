@@ -713,6 +713,12 @@ GROK_LIVE_REQUEST = Path(
     )
 )
 PATCHBAY_BIN = os.environ.get("GSM2COMPUTER_PATCHBAY_BIN", str(Path.home() / "bin" / "patchbay"))
+# A short arithmetic question gets a one-word reply ("Four.") that is too short
+# to tell from an app chime; ask for a few seconds of speech instead.
+GROK_PROMPT = os.environ.get(
+    "GSM2COMPUTER_E2E_GROK_PROMPT",
+    "Hi Suzie, this is an automated test call. Please count slowly from one to five.",
+)
 
 
 def hub_grokbot_mode(h: Optional[dict[str, Any]] = None) -> bool:
@@ -774,7 +780,7 @@ async def run_once_grokbot(step: str = "grok_live") -> E2EResult:
         if not line_idle(h0):
             result.error = f"line not idle: {h0.get('call')}"
             return result
-        pcm = synthesize_prompt_pcm(PROMPT, PCM_RATE)
+        pcm = synthesize_prompt_pcm(GROK_PROMPT, PCM_RATE)
         chunks = _pcm_chunks(pcm, PCM_RATE)
         token = get_token()
         headers = {"Authorization": f"Bearer {token}"}
