@@ -27,6 +27,19 @@ Architecture decisions live in **[docs/adr/](docs/adr/)**. Read those before cha
 
 Android GSM silencing / priv-app notes: [docs/VOICE_CALL_SILENCING_INVESTIGATION.md](docs/VOICE_CALL_SILENCING_INVESTIGATION.md).
 
+## Cloud Agent
+
+`sudo ./setup.sh` installs the Android SDK at `/opt/android-sdk` and writes `local.properties`. Login shells export `ANDROID_HOME` from `/etc/profile.d/gsm2computer-dev.sh`. `adb` and `sdkmanager` are also on `/usr/local/bin`.
+
+Each boot starts PipeWire, WirePlumber, and pipewire-pulse without a systemd user session, creates the null sinks in `hub/setup-audio-bus.sh`, and runs `python3 hub/hub.py` on `127.0.0.1:8787` (`GSM2COMPUTER_HUB_HOST`). `/etc/wireplumber` turns off ALSA device reservation and Bluetooth logind so WirePlumber stays connected on a VM that has no logind. Loopback still links `pw-cat` to `gsm_bus` before the hub echoes μ-law.
+
+```bash
+python3 -m unittest discover -s hub -p 'test_*.py' -v
+npm test --prefix hub/portal
+./gradlew ktlintCheck detekt test --no-daemon
+node simulator/scripts/validate-ws.mjs http://127.0.0.1:8787 --loopback
+```
+
 ## Linear tickets
 
 When speaking with the user about issue numbers (e.g. SAF-18, SAF-120), **always** add a short post-blurb of what the ticket is about. Ticket numbers are hard for humans to recall context from.
