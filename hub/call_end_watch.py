@@ -445,6 +445,8 @@ def journal_summary(since_s: float = 600.0) -> dict[str, Any]:
             ("handshake failed", "ws_drop"),
             ("re-linked openclaw_phone_mic", None),
             ("talk ready", None),
+            ("grokbot live", None),
+            ("grokbot switch", None),
         ]
         hits = []
         for needle, flag in patterns:
@@ -464,8 +466,13 @@ def journal_summary(since_s: float = 600.0) -> dict[str, Any]:
     tap = health.get("last_call_tap") or {}
     streams = tap.get("streams") or {}
     out["tap_id"] = tap.get("id")
+    # Grok Bot path (AUTO_MODE=grokbot) taps grok-*; OpenClaw path taps openclaw-*.
+    grok = "grok-spk-48k-stereo" in streams or "grok-mic-48k-stereo" in streams
+    out["bot_path"] = "grokbot" if grok else "openclaw"
+    spk_name = "grok-spk-48k-stereo" if grok else "openclaw-spk-48k-stereo"
+    mic_name = "grok-mic-48k-stereo" if grok else "openclaw-mic-48k-stereo"
     try:
-        out["spk_peak"] = float((streams.get("openclaw-spk-48k-stereo") or {}).get("peak") or 0) or None
+        out["spk_peak"] = float((streams.get(spk_name) or {}).get("peak") or 0) or None
     except (TypeError, ValueError):
         pass
     try:
@@ -473,10 +480,14 @@ def journal_summary(since_s: float = 600.0) -> dict[str, Any]:
     except (TypeError, ValueError):
         pass
     try:
-        out["mic_peak"] = float((streams.get("openclaw-mic-48k-stereo") or {}).get("peak") or 0) or None
+        out["mic_peak"] = float((streams.get(mic_name) or {}).get("peak") or 0) or None
     except (TypeError, ValueError):
         pass
-    if (out.get("spk_peak") or 0) > 0.02 or (out.get("downlink_peak") or 0) > 0.02:
+    if grok:
+        # gsm-downlink includes the patchbay hold tone; only Suzie's tap counts.
+        if (out.get("spk_peak") or 0) > 0.02:
+            out["openclaw_replied_suspected"] = True
+    elif (out.get("spk_peak") or 0) > 0.02 or (out.get("downlink_peak") or 0) > 0.02:
         out["openclaw_replied_suspected"] = True
     return out
 

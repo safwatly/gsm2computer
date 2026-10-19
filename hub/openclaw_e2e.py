@@ -700,6 +700,218 @@ async def run_once(step: str = "initial", *, allow_force: bool = False) -> E2ERe
         return result
 
 
+# ---------------------------------------------------------------- grokbot
+# AUTO_MODE=grokbot: calls are answered by Grok Bot live voice via patchbay.
+# Timer runs stay non-invasive (patchbay selftest). A live voice test runs
+# only with --live or when the hub left a live-request after a silent call.
+GROK_LINGER_S = float(os.environ.get("GSM2COMPUTER_E2E_GROK_LINGER_S", "14"))
+GROK_SWITCH_WAIT_S = float(os.environ.get("GSM2COMPUTER_E2E_GROK_SWITCH_WAIT_S", "65"))
+GROK_LIVE_REQUEST = Path(
+    os.environ.get(
+        "GSM2COMPUTER_E2E_LIVE_REQUEST",
+        str(Path.home() / "gsm2computer-e2e" / "live-request"),
+    )
+)
+PATCHBAY_BIN = os.environ.get("GSM2COMPUTER_PATCHBAY_BIN", str(Path.home() / "bin" / "patchbay"))
+
+
+def hub_grokbot_mode(h: Optional[dict[str, Any]] = None) -> bool:
+    h = h or health()
+    return str(h.get("auto_mode") or "").lower() == "grokbot"
+
+
+def wav_tail_loud_s(path: Path, tail_s: float, thresh: float = PEAK_MIN) -> tuple[float, float]:
+    """(loud seconds in the last tail_s, total seconds) using 100 ms RMS windows."""
+    import array
+
+    with wave.open(str(path), "rb") as w:
+        rate = w.getframerate() or 48000
+        ch = w.getnchannels() or 1
+        n = w.getnframes()
+        total = n / float(rate)
+        start = max(0, n - int(tail_s * rate))
+        w.setpos(start)
+        frames = w.readframes(n - start)
+    samples = array.array("h")
+    samples.frombytes(frames[: len(frames) - (len(frames) % 2)])
+    win = max(1, int(rate * ch * 0.1))
+    loud = 0
+    for i in range(0, len(samples), win):
+        seg = samples[i : i + win]
+        if not seg:
+            continue
+        rms = (sum(x * x for x in seg) / len(seg)) ** 0.5 / 32768.0
+        if rms >= thresh / 2:
+            loud += 1
+    return loud * 0.1, total
+
+
+async def _wait_grok_live(t_connect_wall: float, ws: Any) -> tuple[bool, dict[str, Any]]:
+    """Feed uplink silence while the hub's patchbay switch runs; return (live, grokbot)."""
+    deadline = time.monotonic() + GROK_SWITCH_WAIT_S
+    silence = trailing_silence(PCM_RATE, 0.5)
+    grok: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        if await paced_uplink(ws, silence):
+            return False, {"preempted": True}
+        h = await asyncio.to_thread(health)
+        grok = h.get("grokbot") or {}
+        last = grok.get("last_switch") or {}
+        if not grok.get("switching") and (last.get("at") or 0) >= t_connect_wall - 1:
+            return bool(last.get("ok")), grok
+    return False, grok
+
+
+async def run_once_grokbot(step: str = "grok_live") -> E2EResult:
+    t0 = time.monotonic()
+    result = E2EResult(ok=False, step=step, latency_s=0.0)
+    try:
+        h0 = health()
+        if real_call_holding(h0):
+            result.aborted_for_real_call = True
+            result.error = "real call in progress"
+            return result
+        if not line_idle(h0):
+            result.error = f"line not idle: {h0.get('call')}"
+            return result
+        pcm = synthesize_prompt_pcm(PROMPT, PCM_RATE)
+        chunks = _pcm_chunks(pcm, PCM_RATE)
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        t_connect_wall = time.time()
+        live = False
+        async with websockets.connect(
+            _ws_url(), additional_headers=headers, max_size=8_000_000, open_timeout=10
+        ) as ws:
+            raw = await asyncio.wait_for(ws.recv(), timeout=15)
+            msg = json.loads(raw) if isinstance(raw, str) else {}
+            sess = msg.get("session") or {}
+            if msg.get("type") != "session.updated" or sess.get("talk") != "grokbot":
+                result.error = f"hub session not grokbot: {msg.get('type')} talk={sess.get('talk')}"
+                await ws.close()
+                return result
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "client.audio",
+                        "input": {"format": "audio/pcm", "rate": PCM_RATE},
+                        "output": {"format": "audio/pcm", "rate": PCM_RATE},
+                    }
+                )
+            )
+            live, grok = await _wait_grok_live(t_connect_wall, ws)
+            if grok.get("preempted"):
+                result.aborted_for_real_call = True
+                result.error = "preempted waiting for Grok live"
+                return result
+            if not live:
+                last = grok.get("last_switch") or {}
+                result.error = f"Grok live voice did not start: rc={last.get('rc')} {last.get('meaning')}"
+            else:
+                # Let any greeting settle, then speak, then listen.
+                if await paced_uplink(ws, trailing_silence(PCM_RATE, 2.0)):
+                    result.aborted_for_real_call = True
+                if not result.aborted_for_real_call and await paced_uplink(
+                    ws, chunks + trailing_silence(PCM_RATE)
+                ):
+                    result.aborted_for_real_call = True
+                if not result.aborted_for_real_call and await paced_uplink(
+                    ws, trailing_silence(PCM_RATE, GROK_LINGER_S)
+                ):
+                    result.aborted_for_real_call = True
+            await ws.close()
+        if result.aborted_for_real_call:
+            result.error = result.error or "preempted during grok e2e"
+            return result
+        await asyncio.sleep(1.5)
+        h = health()
+        tap = h.get("last_call_tap") or {}
+        streams = tap.get("streams") or {}
+        result.tap_id = tap.get("id")
+        result.spk_peak = float((streams.get("grok-spk-48k-stereo") or {}).get("peak") or 0.0)
+        result.downlink_peak = float((streams.get("gsm-downlink-8k-mono") or {}).get("peak") or 0.0)
+        result.mic_peak = float((streams.get("grok-mic-48k-stereo") or {}).get("peak") or 0.0)
+        reply_s = 0.0
+        spk = streams.get("grok-spk-48k-stereo") or {}
+        if tap.get("dir") and spk.get("file"):
+            try:
+                reply_s, _ = wav_tail_loud_s(Path(tap["dir"]) / spk["file"], GROK_LINGER_S)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("grok spk tail read failed: %s", exc)
+        result.triggered_unforced = reply_s >= 0.5
+        result.transcript = f"(audio only) Suzie spoke {reply_s:.1f}s after the prompt"
+        if not live:
+            return result
+        reasons = []
+        if result.mic_peak < PEAK_MIN:
+            reasons.append(f"grok-mic peak {result.mic_peak:.4f} < {PEAK_MIN} (caller audio not reaching bot)")
+        if result.spk_peak < PEAK_MIN:
+            reasons.append(f"grok-spk peak {result.spk_peak:.4f} < {PEAK_MIN}")
+        if result.downlink_peak < PEAK_MIN:
+            reasons.append(f"gsm-downlink peak {result.downlink_peak:.4f} < {PEAK_MIN}")
+        if not result.triggered_unforced:
+            reasons.append(f"no Suzie audio after prompt ({reply_s:.1f}s loud)")
+        result.ok = not reasons
+        result.error = "; ".join(reasons) or None
+        return result
+    except Exception as exc:  # noqa: BLE001
+        result.error = f"{type(exc).__name__}: {exc}"
+        LOG.exception("grok e2e failed")
+        return result
+    finally:
+        result.latency_s = time.monotonic() - t0
+
+
+def grok_selftest() -> E2EResult:
+    """Non-invasive: patchbay selftest (CDP, devices, routing rule). No live voice."""
+    t0 = time.monotonic()
+    r = E2EResult(ok=False, step="grok_selftest", latency_s=0.0)
+    try:
+        p = subprocess.run(
+            [PATCHBAY_BIN, "selftest", "--json"],
+            capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL,
+        )
+        out = p.stdout or ""
+        data = json.loads(out[out.index("{"):]) if "{" in out else {}
+        r.ok = p.returncode == 0 and bool(data.get("ok"))
+        if not r.ok:
+            r.error = f"patchbay selftest rc={p.returncode} checks={data.get('checks')}"
+        r.transcript = f"checks={data.get('checks')}"
+    except Exception as exc:  # noqa: BLE001
+        r.error = f"{type(exc).__name__}: {exc}"
+    r.latency_s = time.monotonic() - t0
+    return r
+
+
+async def run_grokbot(*, live: bool = False) -> E2EResult:
+    if real_call_holding():
+        r = E2EResult(ok=False, step="skipped", latency_s=0.0, aborted_for_real_call=True,
+                      error="real call in progress")
+        persist(r)
+        return r
+    if not line_idle():
+        r = E2EResult(ok=False, step="skipped", latency_s=0.0, error="line not idle")
+        persist(r)
+        return r
+    requested = GROK_LIVE_REQUEST.is_file()
+    if live or requested:
+        if requested:
+            try:
+                GROK_LIVE_REQUEST.unlink()
+            except OSError:
+                pass
+        r = await run_once_grokbot()
+        await wait_until_idle(timeout_s=30.0)
+    else:
+        r = await asyncio.to_thread(grok_selftest)
+    persist(r, {"mode": "grokbot", "live": bool(live or requested)})
+    if not r.ok and not r.aborted_for_real_call and os.environ.get(
+        "GSM2COMPUTER_E2E_ALERT", "0"
+    ).lower() in ("1", "true", "yes", "on"):
+        post_system_alert(f"Grok Bot e2e FAILED ({r.step}): {r.error}", e2e=True)
+    return r
+
+
 async def soft_reload_talk() -> None:
     LOG.info("heal(a): soft reload Control UI")
     if disruptive_heal_blocked(health()):
@@ -1005,6 +1217,7 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="single attempt, no ladder")
     parser.add_argument("--ladder", action="store_true", help="run with self-heal ladder")
     parser.add_argument("--verify-yield", action="store_true", help="preempt e2e for real path")
+    parser.add_argument("--live", action="store_true", help="grokbot mode: run a live Suzie voice test")
     parser.add_argument(
         "--simulate-gateway-fail",
         action="store_true",
@@ -1028,6 +1241,13 @@ def main() -> int:
         LOG.warning("hub %s unreachable, trying %s", HUB_HTTP, alt)
         HUB_HTTP = alt.rstrip("/")
 
+    try:
+        grok_mode = hub_grokbot_mode()
+    except Exception:
+        grok_mode = False
+    if grok_mode and not args.verify_yield:
+        r = asyncio.run(run_grokbot(live=args.live))
+        return 0 if r.ok else 1
     if args.verify_yield:
         out = asyncio.run(verify_yield())
         LOG.info("yield verify: %s", json.dumps(out))

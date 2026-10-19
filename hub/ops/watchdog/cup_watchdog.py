@@ -407,10 +407,18 @@ def check_reply_audio(ctx: Ctx):
             continue  # still being written / just ended
         if measured >= 3:
             break  # bound runtime; rest next run
-        wav = next((d / n for n in ("openclaw-spk-48k-stereo.wav", "gsm-downlink-8k-mono.wav")
-                    if (d / n).exists()), None)
+        grok = "grokbot" in d.name
+        names = (("grok-spk-48k-stereo.wav",) if grok
+                 else ("openclaw-spk-48k-stereo.wav", "gsm-downlink-8k-mono.wav"))
+        wav = next((d / n for n in names if (d / n).exists()), None)
         newly.append(d.name)
         if wav is None:
+            if grok and (d / "gsm-downlink-8k-mono.wav").exists():
+                # No Suzie tap = live voice never started on this call.
+                dl_db, dl_dur = _wav_peak_db(d / "gsm-downlink-8k-mono.wav")
+                if (dl_dur or 0) >= 10.0:
+                    silent.append(f"{d.name} (Grok Bot live voice never started over {dl_dur:.0f}s)")
+                    continue
             notes.append(f"{d.name}: no reply wav")
             continue
         measured += 1
@@ -432,10 +440,49 @@ def check_reply_audio(ctx: Ctx):
         except OSError:
             pass
     if silent:
-        return False, "silent OpenClaw reply on ended real call(s): " + "; ".join(silent)
+        return False, "silent bot reply on ended real call(s): " + "; ".join(silent)
     if measured:
         return True, "; ".join(notes)[:300]
     return None, ("; ".join(notes) or "no newly ended real calls")[:300]
+
+
+PATCHBAY_BIN = os.environ.get("CUP_WATCHDOG_PATCHBAY", str(HOME / "bin" / "patchbay"))
+
+
+def check_grokbot(ctx: Ctx):
+    """AUTO_MODE=grokbot: Grok Bot app reachable over CDP and room devices present."""
+    if ctx.health is None:
+        return None, "skipped (hub down)"
+    if (ctx.health.get("auto_mode") or "").lower() != "grokbot":
+        return None, "skipped (hub not in grokbot mode)"
+    if ctx.busy:
+        return None, "skipped (line busy)"
+    rc, out = run([PATCHBAY_BIN, "status", "--json"], 20)
+    try:
+        st = json.loads(out[out.index("{"):]) if "{" in out else {}
+    except ValueError:
+        st = {}
+    problems = []
+    if not st:
+        problems.append(f"patchbay status rc={rc} unreadable")
+    else:
+        if not st.get("cdp_up"):
+            problems.append("Grok Bot app CDP down")
+        devs = st.get("devices") or {}
+        for d in ("grok_bus", "grok_mic"):
+            if not devs.get(d):
+                problems.append(f"{d} missing")
+        if not st.get("routing_rule_present"):
+            problems.append("routing rule missing")
+        ui = st.get("ui") or {}
+        if ui.get("live"):
+            problems.append("Grok Bot voice live with no call")
+    grok = ctx.health.get("grokbot") or {}
+    last = grok.get("last_switch") or {}
+    ctx.info["grokbot_last_switch"] = last
+    if problems:
+        return False, "Grok Bot: " + ", ".join(problems)
+    return True, f"ok bot={grok.get('bot')} last_switch_ok={last.get('ok')}"
 
 
 def build_checks() -> list[tuple[str, Callable[[Ctx], tuple]]]:
@@ -452,6 +499,7 @@ def build_checks() -> list[tuple[str, Callable[[Ctx], tuple]]]:
         ("stale_bridge", check_stale_bridge),
         ("e2e_selftest", check_e2e),
         ("reply_audio", check_reply_audio),
+        ("grokbot", check_grokbot),
     ]
     return checks
 
