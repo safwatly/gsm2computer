@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Calls tab content. Extracted verbatim from activity_main.xml's tabCalls block. -->
+<!-- Calls tab: recent rows from the system call log (CallLog.Calls), newest first. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/tabCalls"
     android:layout_width="match_parent"
@@ -7,58 +7,33 @@
     android:orientation="vertical"
     android:background="#111827">
 
-    <!-- Filter + clear toolbar: 3 icon buttons -->
-    <LinearLayout
+    <TextView
+        android:id="@+id/tvCallsHeader"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:paddingHorizontal="8dp"
-        android:paddingTop="10dp"
-        android:paddingBottom="8dp">
+        android:paddingHorizontal="16dp"
+        android:paddingTop="16dp"
+        android:paddingBottom="2dp"
+        android:text="@string/phone_call_log_title"
+        android:textSize="20sp"
+        android:textColor="#FFFFFF" />
 
-        <ImageButton
-            android:id="@+id/btnFilterIn"
-            android:layout_width="0dp"
-            android:layout_height="42dp"
-            android:layout_weight="1"
-            android:src="@drawable/ic_call_incoming"
-            android:scaleType="centerInside"
-            android:backgroundTint="@color/primary"
-            android:layout_marginHorizontal="4dp"
-            android:contentDescription="Incoming"
-            style="?attr/borderlessButtonStyle" />
+    <TextView
+        android:id="@+id/tvCallsSubtitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingHorizontal="16dp"
+        android:paddingBottom="12dp"
+        android:text="@string/phone_call_log_subtitle"
+        android:textSize="13sp"
+        android:textColor="#9CA3AF" />
 
-        <ImageButton
-            android:id="@+id/btnFilterOut"
-            android:layout_width="0dp"
-            android:layout_height="42dp"
-            android:layout_weight="1"
-            android:src="@drawable/ic_call_outgoing"
-            android:scaleType="centerInside"
-            android:backgroundTint="#374151"
-            android:layout_marginHorizontal="4dp"
-            android:contentDescription="Outgoing"
-            style="?attr/borderlessButtonStyle" />
-
-        <ImageButton
-            android:id="@+id/btnCallLogClear"
-            android:layout_width="0dp"
-            android:layout_height="42dp"
-            android:layout_weight="1"
-            android:src="@drawable/ic_trash"
-            android:scaleType="centerInside"
-            android:backgroundTint="#374151"
-            android:layout_marginHorizontal="4dp"
-            android:contentDescription="Clear call log"
-            style="?attr/borderlessButtonStyle" />
-    </LinearLayout>
-
-    <!-- Call log entries (scrollable) -->
     <ScrollView
         android:id="@+id/callLogScroll"
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1">
+        android:layout_weight="1"
+        android:visibility="gone">
 
         <LinearLayout
             android:id="@+id/callLogContainer"
@@ -69,15 +44,41 @@
             android:paddingBottom="16dp" />
     </ScrollView>
 
-    <!-- Empty state text (shown when no calls) -->
-    <TextView
-        android:id="@+id/tvCallsEmpty"
+    <LinearLayout
+        android:id="@+id/callLogMessage"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
+        android:orientation="vertical"
         android:gravity="center"
-        android:text="No calls yet"
-        android:textSize="16sp"
-        android:textColor="#6B7280"
-        android:visibility="gone" />
+        android:padding="24dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/tvCallsMessage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:textSize="16sp"
+            android:textColor="#D1D5DB" />
+
+        <TextView
+            android:id="@+id/tvCallsDetail"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:textSize="13sp"
+            android:textColor="#9CA3AF"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/btnCallLogGrant"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/phone_call_log_grant"
+            android:textAllCaps="false"
+            android:visibility="gone" />
+    </LinearLayout>
 </LinearLayout>
