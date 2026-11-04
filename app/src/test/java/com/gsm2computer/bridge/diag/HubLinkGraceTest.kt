@@ -45,6 +45,19 @@ class HubLinkGraceTest {
     }
 
     @Test
+    fun aShortLivedLinkKeepsTheBackoff() {
+        val grace = HubLinkGrace(graceMs = 55_000L, initialDelayMs = 1_000L, maxDelayMs = 8_000L)
+        grace.markLost(0L)
+        assertEquals(1_000L, grace.retryDelayMs(0L))
+        grace.markLinked()
+        grace.markLost(2_000L)
+        assertEquals(2_000L, grace.retryDelayMs(2_000L))
+        grace.markStable()
+        grace.markLost(30_000L)
+        assertEquals(1_000L, grace.retryDelayMs(30_000L))
+    }
+
+    @Test
     fun zeroGraceDoesNotRetry() {
         val grace = HubLinkGrace(graceMs = 0L)
         grace.markLost(0L)

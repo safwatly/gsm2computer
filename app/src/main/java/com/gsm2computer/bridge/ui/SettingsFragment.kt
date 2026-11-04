@@ -3,6 +3,7 @@ package com.gsm2computer.bridge.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -20,8 +21,11 @@ import androidx.core.widget.doAfterTextChanged
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.ViewModelProvider
 import com.gsm2computer.bridge.BridgeConfig
+import com.gsm2computer.bridge.HubControlUrl
 import com.gsm2computer.bridge.R
+import com.gsm2computer.bridge.config.HubControlInjector
 import com.gsm2computer.bridge.service.GatewayService
+import kotlin.concurrent.thread
 
 class SettingsFragment : Fragment() {
 
@@ -29,6 +33,22 @@ class SettingsFragment : Fragment() {
         ViewModelProvider(requireActivity()).get(GatewayViewModel::class.java)
     }
     private var activeConfigDialog: AlertDialog? = null
+    private var openHubField: EditText? = null
+    private var openTokenField: EditText? = null
+
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
+        if (key != BridgeConfig.KEY_HUB_CONTROL_URL && key != BridgeConfig.KEY_STREAM_TOKEN_URL) {
+            return@OnSharedPreferenceChangeListener
+        }
+        val hubField = openHubField ?: return@OnSharedPreferenceChangeListener
+        val tokenField = openTokenField
+        val url = prefs.getString(BridgeConfig.KEY_HUB_CONTROL_URL, "")?.trim().orEmpty()
+        val token = BridgeConfig.resolveStreamTokenUrl(prefs)
+        hubField.post {
+            if (hubField.text.toString() != url) hubField.setText(url)
+            if (tokenField != null && tokenField.text.toString() != token) tokenField.setText(token)
+        }
+    }
 
     private lateinit var statusDot: View
     private lateinit var tvStatusText: TextView
@@ -85,6 +105,16 @@ class SettingsFragment : Fragment() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        BridgeConfig.openPrefs(requireContext()).registerOnSharedPreferenceChangeListener(prefListener)
+    }
+
+    override fun onStop() {
+        BridgeConfig.openPrefs(requireContext()).unregisterOnSharedPreferenceChangeListener(prefListener)
+        super.onStop()
+    }
+
     private fun startGateway() {
         val cfg = BridgeConfig.resolve(BridgeConfig.openPrefs(requireActivity()))
         if (!cfg.streamEnabled) {
@@ -135,6 +165,8 @@ class SettingsFragment : Fragment() {
         etHubUrl.doAfterTextChanged { updateOpenAiVisibility() }
         etHubUrl.setText(cfg.hubControlUrl)
         etTokenUrl.setText(cfg.streamTokenUrl)
+        openHubField = etHubUrl
+        openTokenField = etTokenUrl
         etModel.setText(cfg.streamModel)
         etVoice.setText(cfg.streamVoice)
         cbAutoconnect.isChecked = cfg.autoconnect
@@ -145,29 +177,57 @@ class SettingsFragment : Fragment() {
             importConfigLauncher.launch("*/*")
         }
 
+        val activity = requireActivity()
         activeConfigDialog = AlertDialog.Builder(requireContext())
             .setTitle("Hub configuration")
             .setView(view)
             .setPositiveButton("Save") { _, _ ->
                 val hubUrl = etHubUrl.text.toString().trim()
                 val tokenUrl = etTokenUrl.text.toString().trim()
-                prefs.edit()
-                    .putString(BridgeConfig.KEY_HUB_CONTROL_URL, hubUrl)
-                    .putString(BridgeConfig.KEY_STREAM_TOKEN_URL, tokenUrl)
-                    .putString(BridgeConfig.KEY_STREAM_MODEL, etModel.text.toString().trim())
-                    .putString(BridgeConfig.KEY_STREAM_VOICE, etVoice.text.toString().trim())
-                    .putBoolean(BridgeConfig.KEY_AUTOCONNECT, cbAutoconnect.isChecked)
-                    .putBoolean(
-                        BridgeConfig.KEY_STREAM_ENABLED,
-                        hubUrl.isNotBlank() || tokenUrl.isNotBlank(),
-                    )
-                    .apply()
-                (requireActivity() as GatewayHost).appendLog(
-                    "Config saved (autoconnect=${cbAutoconnect.isChecked} hub=$hubUrl)"
-                )
+                val model = etModel.text.toString().trim()
+                val voice = etVoice.text.toString().trim()
+                val autoconnect = cbAutoconnect.isChecked
+                val appContext = activity.applicationContext
+                val bridgeRunning = vm.gatewayRunning.value == true
+                thread(name = "hub-url-ui") {
+                    HubControlInjector.stageDropFile(appContext, hubUrl)
+                    val normalized = HubControlUrl.parse(hubUrl)
+                    val previous = prefs.getString(BridgeConfig.KEY_HUB_CONTROL_URL, null)
+                    val dropDerivedToken = normalized != null &&
+                        previous != null &&
+                        HubControlUrl.tokenFollowsHub(previous, tokenUrl) &&
+                        HubControlUrl.normalize(previous) != normalized
+                    val editor = prefs.edit()
+                        .putString(BridgeConfig.KEY_HUB_CONTROL_URL, normalized ?: hubUrl)
+                        .putString(BridgeConfig.KEY_STREAM_MODEL, model)
+                        .putString(BridgeConfig.KEY_STREAM_VOICE, voice)
+                        .putBoolean(BridgeConfig.KEY_AUTOCONNECT, autoconnect)
+                        .putBoolean(
+                            BridgeConfig.KEY_STREAM_ENABLED,
+                            hubUrl.isNotBlank() || tokenUrl.isNotBlank(),
+                        )
+                    if (dropDerivedToken) editor.remove(BridgeConfig.KEY_STREAM_TOKEN_URL)
+                    else editor.putString(BridgeConfig.KEY_STREAM_TOKEN_URL, tokenUrl)
+                    if (normalized != null) {
+                        editor.putString(BridgeConfig.KEY_HUB_URL_DROP, normalized)
+                    } else {
+                        editor.remove(BridgeConfig.KEY_HUB_URL_DROP)
+                    }
+                    editor.commit()
+                    if (bridgeRunning) GatewayService.requestHubReload(appContext, async = true)
+                    activity.runOnUiThread {
+                        (activity as GatewayHost).appendLog(
+                            "Config saved (autoconnect=$autoconnect)",
+                        )
+                    }
+                }
             }
             .setNegativeButton("Cancel", null)
-            .setOnDismissListener { activeConfigDialog = null }
+            .setOnDismissListener {
+                activeConfigDialog = null
+                openHubField = null
+                openTokenField = null
+            }
             .show()
     }
 
@@ -180,7 +240,13 @@ class SettingsFragment : Fragment() {
                 val prefs = BridgeConfig.openPrefs(requireActivity())
                 val editor = prefs.edit()
                 if (json.has("hub_control_url")) {
-                    editor.putString(BridgeConfig.KEY_HUB_CONTROL_URL, json.getString("hub_control_url"))
+                    val hub = json.getString("hub_control_url")
+                    val normalized = HubControlUrl.parse(hub)
+                    editor.putString(BridgeConfig.KEY_HUB_CONTROL_URL, normalized ?: hub)
+                    if (normalized != null) {
+                        HubControlInjector.stageDropFile(requireContext().applicationContext, normalized)
+                        editor.putString(BridgeConfig.KEY_HUB_URL_DROP, normalized)
+                    }
                 }
                 if (json.has("hub_owned_session")) {
                     editor.putBoolean(BridgeConfig.KEY_HUB_OWNED_SESSION, json.getBoolean("hub_owned_session"))

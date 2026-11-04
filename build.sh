@@ -160,7 +160,7 @@ sign_apk() {
         echo "WARNING: apksigner not found; APK left unsigned (priv-app install will fail)"
         return 0
     fi
-    local KS="${GATEWAY_KEYSTORE:-$HOME/.android/debug.keystore}"
+    local KS="${GATEWAY_KEYSTORE:-$SCRIPT_DIR/signing/gsm2computer-upload.keystore}"
     if [ ! -f "$KS" ]; then
         echo "WARNING: keystore not found at $KS; APK left unsigned"
         return 0

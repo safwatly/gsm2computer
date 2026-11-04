@@ -132,6 +132,16 @@
             </intent-filter>
         </receiver>
 
+        <!-- Cup sets the hub URL over adb. DUMP is held by the shell user. -->
+        <receiver
+            android:name=".config.HubControlReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="com.gsm2computer.bridge.SET_HUB_URL" />
+            </intent-filter>
+        </receiver>
+
         <!-- SMS → hub control API. System-only sender via BROADCAST_SMS. -->
         <receiver
             android:name=".sms.SmsReceiver"

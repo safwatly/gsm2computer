@@ -3,9 +3,11 @@ package com.gsm2computer.bridge.realtime
 import android.util.Base64
 import android.util.Log
 import com.gsm2computer.bridge.HubEndpoints
+import com.gsm2computer.bridge.diag.BridgeLog
 import com.gsm2computer.bridge.diag.HubLinkGrace
 import com.gsm2computer.bridge.rtp.MediaTransport
 import okhttp3.OkHttpClient
+import okio.ByteString.Companion.toByteString
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
@@ -26,8 +28,9 @@ import java.util.concurrent.atomic.AtomicReference
  * retried. Silence is what the caller hears during the gap.
  *
  * Custom hub: token from `{hub}/token`, WebSocket upgrade on the same host.
- * Audio is PCM s16le at the rates from [configureWire]. Appends without
- * format/rate stay 8 kHz μ-law so the browser simulator keeps working.
+ * Uplink is 16 kHz s16le in a binary frame ([UplinkWire]). Downlink stays
+ * the JSON PCM the hub already sends. Appends without format/rate stay
+ * 8 kHz μ-law so the browser simulator keeps working.
  */
 class HubStreamClient(
     private val tokenUrl: String,
@@ -42,7 +45,11 @@ class HubStreamClient(
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
+        // Default write timeout is 10s. A blocked audio write then fails the
+        // socket on its own, with no log of the queue that caused it.
+        // Liveness is the 20s ping plus [WsSendBudget] cancelling a wedged queue.
         .readTimeout(0, TimeUnit.MILLISECONDS)
+        .writeTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
@@ -71,6 +78,12 @@ class HubStreamClient(
     @Volatile private var connectModel = model
     private var sessionThread: Thread? = null
     private var pingThread: Thread? = null
+    private val sendBudget = WsSendBudget()
+    private val reconnectArmed = AtomicBoolean(false)
+    private var summaryAtMs = 0L
+    private var summaryAccepted = 0L
+    private var summaryDropped = 0L
+    @Volatile private var openedAtMs = 0L
 
     override fun start(sink: MediaTransport.Sink) {
         this.sink = sink
@@ -100,11 +113,12 @@ class HubStreamClient(
                     }
                     val now = System.currentTimeMillis()
                     grace.markLost(now)
-                    val delay = grace.retryDelayMs(now)
-                    if (delay == null) {
+                    val baseDelay = grace.retryDelayMs(now)
+                    if (baseDelay == null) {
                         fail("hub link grace expired after ${linkGraceMs}ms: $pending")
                         return
                     }
+                    val delay = baseDelay + ((grace.attempt * 173L) % 500L)
                     linkState = "hold"
                     sink?.onLinkHold(true, pending)
                     trace(
@@ -115,6 +129,10 @@ class HubStreamClient(
                             "message" to pending,
                             "session_id" to sessionId,
                         ),
+                    )
+                    BridgeLog.w(
+                        "reconnect attempt=${grace.attempt} delayMs=$delay " +
+                            "reason=${pending.take(160)}",
                     )
                     if (delay > 0 && !sleepMs(delay)) return
                     if (closed) return
@@ -172,11 +190,14 @@ class HubStreamClient(
         val socket = http.newWebSocket(builder.build(), object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 opened.set(true)
+                reconnectArmed.set(false)
                 ws = webSocket
                 linkState = "open"
-                grace.markRestored()
+                openedAtMs = System.currentTimeMillis()
+                grace.markLinked()
                 sink?.onLinkHold(false, "hub ws open")
                 trace("ws_open", mapOf("session_id" to sessionId, "http" to response.code))
+                BridgeLog.i("ws open http=${response.code} session=${sessionId.ifBlank { "-" }}")
                 if (hubOwnedSession) {
                     Log.i(TAG, "WS OPEN — hub owns session (skip session.update / greeting)")
                     sendClientAudio(webSocket)
@@ -197,6 +218,10 @@ class HubStreamClient(
                 val code = response?.code ?: -1
                 val msg = "Hub WS failure (code=$code): ${t.message}"
                 Log.e(TAG, "WS failure code=$code: ${t.message}")
+                BridgeLog.e(
+                    "ws failure code=$code ex=${t.javaClass.simpleName} " +
+                        "msg=${t.message?.take(160) ?: ""}",
+                )
                 if (closed) {
                     finish(null, false)
                     return
@@ -214,6 +239,7 @@ class HubStreamClient(
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.i(TAG, "WS CLOSED code=$code reason=$reason")
+                BridgeLog.i("ws closed code=$code reason=${reason.take(120)}")
                 if (closed) {
                     finish(null, false)
                     return
@@ -256,15 +282,76 @@ class HubStreamClient(
     }
 
     private fun pingLoop() {
+        var ticks = 0
         while (!closed) {
-            if (!sleepMs(5_000)) return
+            if (!sleepMs(1_000)) return
+            ticks++
+            logUplinkSummary()
             if (closed || linkState != "open") continue
+            val opened = openedAtMs
+            if (opened != 0L && System.currentTimeMillis() - opened >= STABLE_LINK_MS) {
+                grace.markStable()
+            }
+            if (ticks % 5 != 0) continue
             val socket = ws ?: continue
             val sentAt = System.currentTimeMillis()
             try {
-                socket.send(JSONObject().put("type", "client.ping").put("t", sentAt).toString())
-            } catch (_: Exception) {
+                val queued = socket.queueSize()
+                when (sendBudget.decide(queued, sentAt)) {
+                    WsSendBudget.Decision.WEDGE ->
+                        wedgeSocket("send queue ${queued}B")
+                    WsSendBudget.Decision.DROP -> Unit
+                    WsSendBudget.Decision.SEND -> {
+                        val ok = socket.send(
+                            JSONObject().put("type", "client.ping").put("t", sentAt).toString(),
+                        )
+                        if (!ok) wedgeSocket("client.ping rejected")
+                    }
+                }
+            } catch (e: Exception) {
+                BridgeLog.w("client.ping failed: ${e.javaClass.simpleName}")
             }
+        }
+    }
+
+    private fun logUplinkSummary() {
+        val now = System.currentTimeMillis()
+        val (accepted, dropped) = sendBudget.counts()
+        if (summaryAtMs == 0L) {
+            summaryAtMs = now
+            summaryAccepted = accepted
+            summaryDropped = dropped
+            return
+        }
+        val dt = (now - summaryAtMs).coerceAtLeast(1L)
+        val sentPerS = (accepted - summaryAccepted) * 1000L / dt
+        val dropPerS = (dropped - summaryDropped) * 1000L / dt
+        summaryAtMs = now
+        summaryAccepted = accepted
+        summaryDropped = dropped
+        val queued = try {
+            ws?.queueSize() ?: -1L
+        } catch (_: Exception) {
+            -1L
+        }
+        BridgeLog.i(
+            "uplink sent=$sentPerS/s dropped=$dropPerS/s queue=$queued " +
+                "rate=$inputRate state=$linkState rtt=$lastRttMs",
+        )
+    }
+
+    /**
+     * OkHttp's writer is blocked or has given up. cancel() unblocks it and
+     * [sessionLoop] reconnects. One shot per socket; [onOpen] arms the next.
+     */
+    private fun wedgeSocket(reason: String) {
+        if (closed) return
+        if (!reconnectArmed.compareAndSet(false, true)) return
+        BridgeLog.w("ws wedge: $reason")
+        try {
+            ws?.cancel()
+        } catch (e: Exception) {
+            BridgeLog.e("ws cancel failed: ${e.javaClass.simpleName}")
         }
     }
 
@@ -272,6 +359,7 @@ class HubStreamClient(
         if (closed) return
         linkState = "closed"
         Log.e(TAG, message)
+        BridgeLog.e("ws give up: ${message.take(160)}")
         trace("ws_give_up", mapOf("message" to message, "session_id" to sessionId))
         sink?.onError(message)
     }
@@ -380,14 +468,37 @@ class HubStreamClient(
     override fun sendAudio(frame: ByteArray) {
         val socket = ws ?: return
         if (linkState != "open") return
-        val b64 = Base64.encodeToString(frame, Base64.NO_WRAP)
-        val msg = JSONObject()
-            .put("type", "input_audio_buffer.append")
-            .put("audio", b64)
-            .put("format", inputFormat)
-            .put("rate", inputRate)
-            .toString()
-        socket.send(msg)
+        val now = System.currentTimeMillis()
+        val queued = try {
+            socket.queueSize()
+        } catch (_: Exception) {
+            return
+        }
+        when (sendBudget.decide(queued, now)) {
+            WsSendBudget.Decision.DROP -> {
+                sendBudget.noteDropped()
+                return
+            }
+            WsSendBudget.Decision.WEDGE -> {
+                sendBudget.noteDropped()
+                wedgeSocket("send queue ${queued}B for ${sendBudget.wedgeAfterMs}ms")
+                return
+            }
+            WsSendBudget.Decision.SEND -> Unit
+        }
+        val ok = try {
+            socket.send(frame.toByteString())
+        } catch (e: Exception) {
+            BridgeLog.e("uplink send threw ${e.javaClass.simpleName}")
+            wedgeSocket("send threw ${e.javaClass.simpleName}")
+            false
+        }
+        if (ok) {
+            sendBudget.noteSent()
+        } else {
+            sendBudget.noteDropped()
+            wedgeSocket("send rejected queue=$queued")
+        }
     }
 
     private fun sendClientAudio(socket: WebSocket?) {
@@ -447,6 +558,7 @@ class HubStreamClient(
     companion object {
         private const val TAG = "HubStream"
         private const val FATAL_PREFIX = "fatal:"
+        private const val STABLE_LINK_MS = 20_000L
 
         const val DEFAULT_INSTRUCTIONS =
             "You are a friendly voice assistant on a phone call bridged from a " +
