@@ -8,4 +8,14 @@
     <string name="notification_text_registered">Ready for calls</string>
     <string name="notification_text_unregistered">Starting…</string>
     <string name="notification_text_call">Call active</string>
+    <string name="phone_call_log_title">Recent calls</string>
+    <string name="phone_call_log_subtitle">From this phone\'s call log</string>
+    <string name="phone_call_log_loading">Loading call log…</string>
+    <string name="phone_call_log_empty">No recent calls</string>
+    <string name="phone_call_log_denied">Call log permission is off, so recent calls cannot be shown.</string>
+    <string name="phone_call_log_denied_detail">Grant call log access to see numbers, names, direction, and times. A saved contact name is shown when the call log already has one.</string>
+    <string name="phone_call_log_grant">Grant access</string>
+    <string name="phone_call_log_settings">Open settings</string>
+    <string name="phone_call_log_error">Could not read the call log.</string>
+    <string name="phone_call_log_callback">Call %1$s</string>
 </resources>
