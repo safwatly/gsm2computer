@@ -19,33 +19,32 @@ The bridge app (`com.gsm2computer.bridge`, launcher `MainActivity`) is a three-t
 3. Switch to Calls. Incoming is selected first. Outgoing is the middle icon. The list is calls the bridge recorded (direction, number, time `dd/MM HH:mm`, duration), or `No calls yet`.
 4. Tap a row to put that number on the dialer. The trash icon clears the log after you confirm.
 
-## Driving it with Gradle
+## Driving it with the emulator
 
-Nothing in the repo clicks these tabs.
-
-What exists:
+JVM tests do not open these tabs. The drive that does is `adb` on AVD `gsm2computer` (Pixel 6, 1080×2400, API 34). Boot and the permission grants are in [SKILL.md](../SKILL.md) under Android emulator. There is no Espresso test to copy.
 
 ```bash
 ./gradlew test --no-daemon
-./gradlew connectedAndroidTest --no-daemon
+./gradlew connectedDebugAndroidTest --no-daemon
 ```
 
 `test` is JVM unit tests (`app/src/test`). They cover codecs, `HubEndpoints` URL shape, call-trace helpers, and the single-call policy. They do not instantiate `CallsFragment` or `DialerFragment`, and there is no `CallLogStore` test.
 
-`connectedAndroidTest` runs `SmokeInstrumentationTest`: package name `com.gsm2computer.bridge`, and the default hub URL `http://hub.mining-ling.ts.net:8787`. It does not open a tab. It needs a device or emulator (`adb`, SDK platform 34).
+`connectedDebugAndroidTest` runs `SmokeInstrumentationTest`: package name `com.gsm2computer.bridge`, and the default hub URL `http://hub.mining-ling.ts.net:8787`. It does not open a tab. On 2026-11-04 it passed 2 tests on `gsm2computer(AVD) - 14`, then uninstalled the package.
 
-The activity to launch, on hardware that has the APK installed:
+After `adb shell am start -W -n com.gsm2computer.bridge/.MainActivity`, dump the UI and tap. Do not send `KEYCODE_BACK` first; that returns to the launcher.
 
-```bash
-adb shell am start -n com.gsm2computer.bridge/.MainActivity
-```
+Proven on that image:
 
-View ids for a human or a future instrumentation test are the ones in Sub-features. There is no Espresso test to copy.
+- Dialer showed `Enter number`, then `5551212` after the digit taps.
+- Calls showed `No calls yet`.
+- A `content://call_log/calls` insert of `+15551212`, type incoming, duration 42, was queryable and did not change the Calls tab.
 
 ## Gotchas
 
-- No Android SDK on a stock cloud VM (`ANDROID_HOME` unset, no `/opt/android-sdk`). `./gradlew test` downloads Gradle 8.5 if needed, then stops before tests: `SDK location not found`. `sudo ./setup.sh` installs the SDK; that is a root setup step, not a substitute for a phone.
-- No `adb`, no emulator, no moto g84. Do not describe the Calls tab as verified.
-- PR #23 is not merged. Do not expect the system call log, and do not file a failure because it is absent.
-- `CallLogStore` updates when the bridge handles a call, which requires the GSM stack. Posting `POST /calls` to the hub does not change this screen.
-- The in-call Answer / Reject / End controls are on the overlay in `activity_main.xml` (`btnInCallAnswer`, `btnInCallReject`, `btnInCallEnd`), not on the Calls tab. Driving them needs a ringing GSM call.
+- A stock cloud VM has no Android SDK. `./gradlew test` downloads Gradle 8.5, then stops: `SDK location not found`. Run `scripts/cloud-agent-android-sdk.sh` (or boot from an environment snapshot that already has `/opt/android-sdk`). `local.properties` is gitignored.
+- `/dev/kvm` is group-writable only. The shell that ran the setup script is not in group `kvm` yet. `scripts/emulator.sh` uses `sg kvm`.
+- PR #23 is not merged. A seeded system call log is not this screen. Do not file a failure because `No calls yet` remains, and do not claim the PR #23 list was shown.
+- `CallLogStore` updates when the bridge handles a call, which requires the GSM stack. Posting `POST /calls` to the hub does not change this screen. The in-memory cache ignores a prefs file written under a live process.
+- The in-call Answer / Reject / End controls are on the overlay in `activity_main.xml` (`btnInCallAnswer`, `btnInCallReject`, `btnInCallEnd`), not on the Calls tab. Driving them needs a ringing GSM call. The green call button on the emulator is not that.
+- `connectedDebugAndroidTest` removes the app when it finishes. Reinstall before another screenshot pass. Grant `RECORD_AUDIO` before launch or `GatewayService` crashes starting its microphone foreground service.

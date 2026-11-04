@@ -2,16 +2,17 @@
 name: verify-gsm2computer
 description: >-
   Verify gsm2computer, the rooted-Android GSM bridge (app/) plus its Python hub
-  (hub/), by running the hub unit tests and driving an isolated local hub over
-  HTTP: /health, SMS ingest and outbox, portal threads, and the portal call
-  log. Use before declaring hub, portal, SMS, or call-slot work done. Call
-  answering, call audio, Bluetooth routing, and the Android Dialer/Calls UI
-  need the physical phone and are not verified by this skill.
+  (hub/). Drive the isolated hub over HTTP (health, SMS, portal threads, portal
+  call log) and, on a cloud VM with KVM, build the debug APK, boot a headless
+  API 34 emulator, and screenshot Dialer, Calls, and Settings. Use before
+  declaring hub, portal, SMS, or Android UI work done. Real GSM calls, call
+  audio injection, Bluetooth routing, and root-only features need the physical
+  phone and are not verified by this skill.
 ---
 
 # Verify gsm2computer
 
-Cloud agents do not have the rooted Motorola moto g84. What they can drive is the hub process, its HTTP API, the portal SQLite store, and the Python unit tests. The phone app is a separate surface: see [Not verifiable here](#not-verifiable-here).
+Cloud agents do not have the rooted Motorola moto g84. What they can drive is the hub process, its HTTP API, the portal SQLite store, the Python unit tests, and — once [scripts/cloud-agent-android-sdk.sh](../../../scripts/cloud-agent-android-sdk.sh) has installed the SDK — the debug app on a headless emulator. Real radio, audio injection, and root stay in [Not verifiable here](#not-verifiable-here).
 
 Run commands from the repo root. The helper is [scripts/instance.sh](scripts/instance.sh).
 
@@ -46,7 +47,7 @@ Android JVM tests, ktlint, detekt, lint, and `assembleRelease` match CI:
 ./gradlew ktlintCheck detekt lint test assembleRelease --no-daemon
 ```
 
-That needs JDK 17+ and an Android SDK with `platforms;android-34` (`sudo ./setup.sh`, or `ANDROID_HOME` plus a debug keystore at `~/.android/debug.keystore` as CI creates). JDK 21 is enough for Gradle 8.5 to start. With no SDK the build stops before any test:
+That needs JDK 17+ and an Android SDK with `platforms;android-34` and `build-tools;34.0.0`. On a cloud agent, [scripts/cloud-agent-android-sdk.sh](../../../scripts/cloud-agent-android-sdk.sh) installs those, the Gradle 8.5 wrapper cache, the emulator, and AVD `gsm2computer`. It writes gitignored `local.properties` (`sdk.dir=/opt/android-sdk`). JDK 21 is enough for Gradle 8.5. With no SDK the build stops before any test:
 
 ```text
 SDK location not found. Define a valid SDK location with an ANDROID_HOME
@@ -54,7 +55,77 @@ environment variable or by setting the sdk.dir path in your project's
 local properties file
 ```
 
-`app/src/androidTest` (`SmokeInstrumentationTest`) needs a device or emulator and `./gradlew connectedAndroidTest`. There is no emulator image in a typical cloud VM, and `adb` is not assumed.
+`app/src/androidTest` (`SmokeInstrumentationTest`) runs on the emulator with `./gradlew connectedDebugAndroidTest`. See [Android emulator](#android-emulator).
+
+## Android emulator
+
+This VM can run a headless API 34 x86_64 emulator. `/dev/kvm` is `crw-rw----` owned by group `kvm` (gid 103, often unnamed until the setup script creates the group). The agent user is not in that group in the shell that ran `usermod`. Open the device with `sg kvm`. Boot was about 35 seconds with software GPU. There is no window; screenshots are `adb exec-out screencap`.
+
+Do not put the emulator in the environment `start` script. It is heavy, and a failed boot must not be something every agent pays for. Boot it only when the change is in `app/`.
+
+```bash
+bash scripts/cloud-agent-android-sdk.sh
+.cursor/skills/verify-gsm2computer/scripts/emulator.sh
+```
+
+The second command is a no-op when `emulator-5554` is already booted (`sys.boot_completed=1`). Otherwise it runs, under `sg kvm`:
+
+```text
+emulator -avd gsm2computer -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -accel on -no-snapshot -no-metrics -ports 5554,5555
+```
+
+AVD `gsm2computer` is a Pixel 6 image (`google_apis` x86_64, API 34), 1080×2400. The setup script creates it and does not boot it.
+
+Install and open the debug build. Grant `RECORD_AUDIO` before the first `am start`. `GatewayService` starts a microphone foreground service and crashes without that permission (`SecurityException` on `FOREGROUND_SERVICE_MICROPHONE` / `RECORD_AUDIO`).
+
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell pm grant com.gsm2computer.bridge android.permission.RECORD_AUDIO
+adb shell pm grant com.gsm2computer.bridge android.permission.READ_CALL_LOG
+adb shell pm grant com.gsm2computer.bridge android.permission.RECEIVE_SMS
+adb shell pm grant com.gsm2computer.bridge android.permission.SEND_SMS
+adb shell pm grant com.gsm2computer.bridge android.permission.CALL_PHONE
+adb shell pm grant com.gsm2computer.bridge android.permission.READ_PHONE_STATE
+adb shell cmd role add-role-holder android.app.role.DIALER com.gsm2computer.bridge
+adb shell am start -W -n com.gsm2computer.bridge/.MainActivity
+```
+
+`cmd role add-role-holder` succeeds only while the package is installed. `./gradlew connectedDebugAndroidTest` uninstalls it when the run finishes, and the role command then fails with `Package does not qualify` / `Cannot get ApplicationInfo`. Reinstall before another UI pass.
+
+Do not send `KEYCODE_BACK` before a screenshot. Back leaves `MainActivity` and the next `screencap` is the Nexus launcher, while the process stays alive. Bring the activity back with `am start -W`.
+
+Dump the hierarchy and read `text` / `resource-id` before tapping. On this 1080×2400 image the proven centers were: digit `5` at `540 1088`, Calls tab `540 2263`, Settings tab `900 2263`, info button `btnInfo` at `880 212`, dialog `CLOSE` at `893 1812`. Re-dump after a font or layout change. Ids to require: `tvDialNumber`, `tabBtnDialer`, `tabBtnCalls`, `tabBtnSettings`, `tvCallsEmpty`.
+
+What that drive showed on 2026-11-04:
+
+- Dialer: hint `Enter number`, then `5551212` after tapping `5` `5` `5` `1` `2` `1` `2`.
+- Calls, before any seed: `No calls yet`.
+- Settings: title `GSM2Computer`, status `Ready for calls`, buttons `STOP` and `LOG`. The log line includes `RootShell` failing `su`. This image is not rooted.
+- Device Info (`btnInfo`): title `Device Info`, GSM `T-Mobile` / `3G` / phone `+15551234567`, Wi-Fi `AndroidWifi`, local IP `10.0.2.16`, button `CHECK GATEWAY SUPPORT`. Those are emulator radio values, not the moto g84.
+- `./gradlew connectedDebugAndroidTest --no-daemon`: `SmokeInstrumentationTest` 2 tests, 0 failures, on `gsm2computer(AVD) - 14`. The Gradle log still prints a `GatewayService` crash from the install that had not been granted `RECORD_AUDIO`. The test process itself passed.
+
+System call log versus the Calls tab on this tree:
+
+```bash
+adb shell content insert --uri content://call_log/calls \
+  --bind number:s:+15551212 --bind type:i:1 \
+  --bind date:l:"$(adb shell date +%s%3N | tr -d '\r')" \
+  --bind duration:l:42 --bind new:i:1
+adb shell content query --uri content://call_log/calls --projection number:type:duration
+```
+
+The query returned `number=+15551212, type=1, duration=42`. The Calls tab still said `No calls yet`. This tree reads `CallLogStore` (app prefs), not `CallLog.Calls`. [PR #23 — Show the phone call log on the bridge Calls tab](https://github.com/safwatly/gsm2computer/pull/23) is the change that would display that row. Do not treat the empty tab as a failure of the insert, and do not claim PR #23's screen was exercised.
+
+Emulator SMS into the isolated hub (the hub must already be launched; the emulator reaches the host as `10.0.2.2`):
+
+```bash
+HUB_CONTROL_URL=http://10.0.2.2:18787 ./scripts/configure-bridge.sh --force
+adb shell am force-stop com.gsm2computer.bridge
+adb shell am start -W -n com.gsm2computer.bridge/.MainActivity
+adb emu sms send +15551212 "hello from emulator"
+```
+
+`SmsReceiver` is guarded by `android.permission.BROADCAST_SMS`, so a shell `am broadcast` is the wrong injection. `adb emu sms send` is the telephony path. Force-stop before the SMS so `SharedPreferences` reloads the file `configure-bridge.sh` wrote. Proven result: logcat `SmsReceiver: SMS received (19 chars) — forwarding`, and `GET /portal/api/threads` contained peer `+15551212` with `lastBody` `hello from emulator` (`status` `received`). The outbox send (`SmsManager`) is still the phone.
 
 ## Launch
 
@@ -280,6 +351,8 @@ A failed attempt still ends with `stop` so the next launch is not blocked by a l
 | `.cursor/skills/verify-gsm2computer/scripts/instance.sh launch` | Start one hub in the empty data dir and wait until `/health` returns |
 | `.cursor/skills/verify-gsm2computer/scripts/instance.sh doctor` | Read-only "worth driving" check |
 | `.cursor/skills/verify-gsm2computer/scripts/instance.sh stop` | Stop that pid and keep evidence |
+| `.cursor/skills/verify-gsm2computer/scripts/emulator.sh` | Boot AVD `gsm2computer` headless, or report that it is already booted |
+| `scripts/cloud-agent-android-sdk.sh` | Install JDK, SDK 34, build-tools 34.0.0, emulator, system image, AVD, Gradle cache |
 
 The SMS curls live in this file, not in the helper, so the phone payload stays visible.
 
@@ -287,12 +360,13 @@ The SMS curls live in this file, not in the helper, so the phone payload stays v
 
 Do not report these as passed because the hub journey passed.
 
-- **Answering a GSM call.** In-call overlay `btnInCallAnswer` / `btnInCallReject` / `btnInCallEnd` on `activity_main.xml`. Needs the phone as the default dialer, with a SIM. No emulator in this repo's cloud path.
-- **Call audio injection and capture.** Privileged `AudioRecord`, uplink injection back into the GSM call, and the PipeWire graph (`gsm_bus`, `phone_uplink`, `openclaw_bus`, `pw-cat` by object serial). `pactl` and `pw-link` are not on a stock cloud image. A WebSocket to `/loopback` is accepted (`101 Switching Protocols`) and then dropped before `session.updated`. The hub log is `FileNotFoundError: [Errno 2] No such file or directory: 'pw-link'` from `parse_switchboard_links` inside `set_switchboard_mode`, reported as `Unhandled exception in client_connected_cb`. `pipewire_handshake_failed` is not sent: that handler only catches `RuntimeError` and `PipewireLinkError` around `PipewireBridge.start`, and this failure is earlier. The slot is released; doctor still reports `call.busy` false.
+- **Answering a real GSM call.** In-call overlay `btnInCallAnswer` / `btnInCallReject` / `btnInCallEnd` on `activity_main.xml`. Needs the moto g84 as the default dialer, with a SIM. The emulator can hold `android.app.role.DIALER` and can show the dialer UI. It does not place a carrier call, and the green call button was not treated as a pass.
+- **Call audio injection and capture.** Privileged `AudioRecord`, uplink injection back into the GSM call, and the PipeWire graph (`gsm_bus`, `phone_uplink`, `openclaw_bus`, `pw-cat` by object serial). The emulator is started with `-no-audio`. `pactl` and `pw-link` are not on a stock cloud image. A WebSocket to `/loopback` is accepted (`101 Switching Protocols`) and then dropped before `session.updated`. The hub log is `FileNotFoundError: [Errno 2] No such file or directory: 'pw-link'` from `parse_switchboard_links` inside `set_switchboard_mode`, reported as `Unhandled exception in client_connected_cb`. `pipewire_handshake_failed` is not sent: that handler only catches `RuntimeError` and `PipewireLinkError` around `PipewireBridge.start`, and this failure is earlier. The slot is released; doctor still reports `call.busy` false.
 - **Simulator as a handset.** `simulator/scripts/validate-ws.mjs` and the portal Simulator tab (`#start-btn`, `#tone-mode`) need that same handshake, then a mic or a tone. `npm run validate` is not a pass on this stand-in.
 - **OpenClaw Talk.** Default `webrtc-ui` needs the dedicated Chromium profile, `DISPLAY`, and CDP `127.0.0.1:9222` (`hub/TALK_WEBRTC.md`). This stand-in forces `GSM2COMPUTER_OPENCLAW_TALK=off` so a missing browser fails the doctor instead of hanging a CDP probe. Do not flip it on to "make Talk pass."
-- **Bluetooth and in-call speaker routing** (`btnInCallSpeaker`). Device audio policy; see `docs/VOICE_CALL_SILENCING_INVESTIGATION.md`.
-- **Android Dialer and Calls tabs**, including the on-phone call log (`CallsFragment`, `CallLogStore`). There is no UI automation. [PR #23](https://github.com/safwatly/gsm2computer/pull/23) (system call log on the Calls tab) is not merged here; the screen on this tree is the bridge's own log. JVM tests do not open it.
-- **Radio SMS.** `SmsOutboxPoller` calls `SmsManager.sendTextMessage` before it acks. The journey above acks `sent` the way the phone does after that call returns. It does not prove a message left the SIM.
-- **Tailscale URL and production bind.** Default hub URL `http://hub.mining-ling.ts.net:8787` and host `100.101.181.110` are the operator's machine, not this VM.
+- **Bluetooth and in-call speaker routing** (`btnInCallSpeaker`). Device audio policy; see `docs/VOICE_CALL_SILENCING_INVESTIGATION.md`. The emulator has no Bluetooth headset path to check.
+- **Root-only phone features.** `RootShell` runs `su`. On this emulator the Settings log records that open failing. Do not grant yourself a root image to make that line pass. The rooted moto g84 is the surface.
+- **PR #23's Calls tab.** [PR #23 — Show the phone call log on the bridge Calls tab](https://github.com/safwatly/gsm2computer/pull/23) is open and is not in this tree. Seeding `content://call_log/calls` does not change `tvCallsEmpty`. The screen here is `CallLogStore`.
+- **Radio SMS out.** `SmsOutboxPoller` calls `SmsManager.sendTextMessage` before it acks. Inbound `adb emu sms send` does reach the hub (see Android emulator). The curl journey acks `sent` the way the phone does after `sendTextMessage` returns. Neither proves a message left a SIM.
+- **Tailscale URL and production bind.** Default hub URL `http://hub.mining-ling.ts.net:8787` and host `100.101.181.110` are the operator's machine, not this VM. The emulator cannot resolve that name. Point it at `http://10.0.2.2:<port>`.
 - **Switchboard audio.** `GET /switchboard/state` shells out to `pw-link`. Without it the response is HTTP 500 `{"ok": false, "error": "internal error"}`, not a soft `ok: false` body. The portal Switchboard page then paints the local mock (`Roster local`), and a preset click looks applied. SMS bodies `STATUS` and `MODE <preset>` are stored and then hit the same `pw-link` crash, so `POST /sms` returns that 500 even though the thread row exists. Trust the messages list, not the status code, for those bodies. Do not use them for the SMS journey above.

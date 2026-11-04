@@ -29,7 +29,7 @@ Android GSM silencing / priv-app notes: [docs/VOICE_CALL_SILENCING_INVESTIGATION
 
 ## Before you call the work done
 
-Read and follow [verify-gsm2computer](.cursor/skills/verify-gsm2computer/SKILL.md) before declaring work done. Launch the isolated hub, run doctor, and drive the feature you changed. Call answering, call audio, and the Android UI need the physical phone; the skill says so, and a green hub check does not cover them.
+Read and follow [verify-gsm2computer](.cursor/skills/verify-gsm2computer/SKILL.md) before declaring work done. Launch the isolated hub, run doctor, and drive the feature you changed. Android UI checks use the headless emulator after [scripts/cloud-agent-android-sdk.sh](scripts/cloud-agent-android-sdk.sh). Real GSM calls, call audio, Bluetooth routing, and root-only features still need the physical phone. A green hub check does not cover them.
 
 ## Linear tickets
 

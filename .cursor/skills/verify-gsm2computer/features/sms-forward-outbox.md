@@ -70,11 +70,28 @@ Portal UI, only as a supplement to those files. Open `$GSM2COMPUTER_HUB_BASE/por
 
 If the page shows `Local mock`, the hub fetch failed and the fixtures in `hub/portal/src/mocks/` were painted. That screen is not evidence.
 
+## Driving inbound SMS from the emulator
+
+The curl above is the journey that does not need a handset. The app path also works on the emulator, because `SmsReceiver` listens for `SMS_RECEIVED` and `adb emu sms send` is delivered with `BROADCAST_SMS`.
+
+The emulator reaches the host loopback as `10.0.2.2`, not `127.0.0.1`. Default `http://hub.mining-ling.ts.net:8787` does not resolve here (`SmsOutbox: Unable to resolve host`).
+
+```bash
+HUB_CONTROL_URL=http://10.0.2.2:18787 ./scripts/configure-bridge.sh --force
+adb shell am force-stop com.gsm2computer.bridge
+adb shell am start -W -n com.gsm2computer.bridge/.MainActivity
+adb emu sms send +15551212 "hello from emulator"
+```
+
+Force-stop so the process reloads the prefs file. Proven: logcat `SmsReceiver: SMS received (19 chars) — forwarding`, and `GET /portal/api/messages?peer=+15551212` returned direction `in`, body `hello from emulator`, status `received`.
+
+That does not lease the outbox or call `SmsManager`. Keep the curl journey for the reply and the ack.
+
 ## Gotchas
 
 - `GET /sms/outbox` is a lease. Repeating it without an ack does not return the same item, and the row stays `sending`.
 - A 10-digit `from` without `+` is stored as `+1` plus those digits (`normalize_e164`). The drive uses `+15551212` so the peer string is stable.
 - Re-running the journey on the same `portal.sqlite` adds another inbound row. Doctor does not require an empty thread list. Use a new `GSM2COMPUTER_VERIFY_HOME` when you need one row.
 - Body `STATUS` or `MODE` plus a preset (`openclaw`, `loopback`, `conference`, `clear`) is written to the thread, then `set_switchboard_mode` runs `pw-link`. Without `pw-link`, `POST /sms` returns HTTP 500 `{"ok": false, "error": "internal error"}` and the row is still in `GET /portal/api/messages`. Do not use those bodies for this journey, and do not treat that 500 as a lost SMS.
-- The ack does not prove `SmsManager.sendTextMessage` ran. The phone only acks after that call. This VM cannot send the radio SMS.
+- The ack does not prove `SmsManager.sendTextMessage` ran. The phone only acks after that call. `adb emu sms send` proves inbound delivery into the hub. It does not prove a reply left a SIM.
 - `npm run dev` in `hub/portal` proxies API calls to port 8787, not to the stand-in port.

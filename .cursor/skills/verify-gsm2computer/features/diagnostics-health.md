@@ -30,7 +30,15 @@ Pass for the stand-in: HTTP 200, `ok` true, `openclaw_talk` `off`, `call.busy` f
 
 Portal Overview selectors at `$GSM2COMPUTER_HUB_BASE/portal/`: nav link Overview, heading `Hub status`. The Talk path value on this stand-in is `off` (the lamp is the warning color unless the value is `webrtc-ui`). Ignore the Token / usage card; it is the mock file when health has no usage.
 
-There is no command that opens Device Info. The dialog runs on the phone. JVM tests do not inflate it. `DiagnosticsController` is only referenced from `SettingsFragment`.
+On the emulator, after the app is in front (see [android-calls-dialer.md](android-calls-dialer.md)):
+
+```bash
+adb shell input tap 900 2263
+adb shell uiautomator dump /sdcard/ui.xml
+adb shell input tap 880 212
+```
+
+The first tap is the Settings tab on the 1080×2400 image. The second is `btnInfo`. Re-dump if the bounds move. Proven dialog text: title `Device Info`, GSM `T-Mobile`, type `3G`, phone `+15551234567`, Wi-Fi `AndroidWifi`, local IP `10.0.2.16`, button `CHECK GATEWAY SUPPORT`, button `CLOSE`. That is the emulator baseband, not the moto g84. `CHECK GATEWAY SUPPORT` was not treated as a pass: those rows are about capture and default-dialer capability on the rooted handset. Close is at about `893 1812` on this image. Do not use `KEYCODE_BACK` to dismiss it if you still need the activity.
 
 ## Gotchas
 
@@ -38,4 +46,4 @@ There is no command that opens Device Info. The dialog runs on the phone. JVM te
 - `mode` stays null until something runs the switchboard. A null mode is not a failed hub.
 - The Overview usage card is a fixture on every hub that does not add a `usage` object. Do not treat those numbers as live token counts.
 - Switchboard `GET /switchboard/state` is a different endpoint. It runs `pw-link -l`. Without `pw-link` the response is HTTP 500 `{"ok": false, "error": "internal error"}`. The routing page catches that and paints the local roster (`Roster local`), not a live PipeWire graph.
-- Device Info cannot be checked here. Default-dialer and capture-source rows need the rooted phone.
+- Device Info on the emulator shows emulator GSM and Wi-Fi. Default-dialer qualification and capture-source rows still need the rooted phone. `RootShell` cannot open `su` on this image.
