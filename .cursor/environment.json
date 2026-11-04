@@ -1,0 +1,4 @@
+{
+  "name": "gsm2computer",
+  "install": "[ ! -d '/agent/repos/gsm2computer' ] || cd '/agent/repos/gsm2computer' || exit $?\nif [ -x scripts/cloud-agent-android-sdk.sh ]; then\n  bash scripts/cloud-agent-android-sdk.sh\nelse\n  test -x /opt/android-sdk/platform-tools/adb\n  test -d /opt/android-sdk/platforms/android-34\n  test -d /opt/android-sdk/system-images/android-34/google_apis/x86_64\nfi\n"
+}
