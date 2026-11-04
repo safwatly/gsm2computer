@@ -27,6 +27,10 @@ Architecture decisions live in **[docs/adr/](docs/adr/)**. Read those before cha
 
 Android GSM silencing / priv-app notes: [docs/VOICE_CALL_SILENCING_INVESTIGATION.md](docs/VOICE_CALL_SILENCING_INVESTIGATION.md).
 
+## Before you call the work done
+
+Read and follow [verify-gsm2computer](.cursor/skills/verify-gsm2computer/SKILL.md) before declaring work done. Launch the isolated hub, run doctor, and drive the feature you changed. Call answering, call audio, and the Android UI need the physical phone; the skill says so, and a green hub check does not cover them.
+
 ## Linear tickets
 
 When speaking with the user about issue numbers (e.g. SAF-18, SAF-120), **always** add a short post-blurb of what the ticket is about. Ticket numbers are hard for humans to recall context from.
