@@ -11,6 +11,15 @@ Environment=GSM2COMPUTER_HUB_HOST=100.101.181.110
 Environment=GSM2COMPUTER_HUB_PORT=8787
 Environment=GSM2COMPUTER_AUTO_MODE=openclaw
 Environment=GSM2COMPUTER_OPENCLAW_TALK=webrtc-ui
+# Public phone entrance is opt-in. Bind loopback only; Caddy owns TLS on :443.
+# On cup set GSM2COMPUTER_HUB_HOST to the Tailscale IP (100.113.222.47) and uncomment:
+# Environment=GSM2COMPUTER_PUBLIC_ENABLE=1
+# Environment=GSM2COMPUTER_PUBLIC_HOST=127.0.0.1
+# Environment=GSM2COMPUTER_PUBLIC_PORT=8790
+# Environment=GSM2COMPUTER_PUBLIC_HOSTNAME=gsm.ta3leam.com
+# Environment=GSM2COMPUTER_DEVICE_TOKENS=%h/.config/gsm2computer/device-tokens.json
+# Tailscale stays open to today's bridge until the device header ships (step 3).
+# Environment=GSM2COMPUTER_TAILSCALE_TOKEN_REQUIRED=0
 Restart=on-failure
 RestartSec=3
 

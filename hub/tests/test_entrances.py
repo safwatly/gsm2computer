@@ -1,0 +1,315 @@
+"""Device token, dual entrance, and call-path stamping."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+_TMP = Path(tempfile.mkdtemp(prefix="gsm-entrances-"))
+os.environ["GSM2COMPUTER_PORTAL_DB"] = str(_TMP / "portal.sqlite")
+os.environ["GSM2COMPUTER_DEVICE_TOKENS"] = str(_TMP / "device-tokens.json")
+os.environ["GSM2COMPUTER_LINK_GAP_LOG"] = str(_TMP / "gaps.jsonl")
+os.environ["GSM2COMPUTER_OPENCLAW_TALK"] = "off"
+os.environ["GSM2COMPUTER_PUBLIC_ENABLE"] = "0"
+os.environ.setdefault("GSM2COMPUTER_HUB_HOST", "127.0.0.1")
+
+HUB_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(HUB_DIR))
+
+from call_slot import CallSlot, CallWatchdogConfig  # noqa: E402
+from device_auth import (  # noqa: E402
+    EPHEMERAL_TOKEN,
+    DeviceTokenFile,
+    Entrance,
+    authorize,
+    generate_token,
+    public_route_allowed,
+    write_device_token,
+)
+from portal_store import PortalStore  # noqa: E402
+
+_HUB_SPEC = importlib.util.spec_from_file_location("gsm2computer_hub", HUB_DIR / "hub.py")
+assert _HUB_SPEC and _HUB_SPEC.loader
+hub = importlib.util.module_from_spec(_HUB_SPEC)
+_HUB_SPEC.loader.exec_module(hub)
+
+TOKEN = generate_token()
+DEVICE = "moto-g84"
+
+
+def _write_tokens() -> None:
+    path = Path(os.environ["GSM2COMPUTER_DEVICE_TOKENS"])
+    if path.exists():
+        path.unlink()
+    write_device_token(path, DEVICE, TOKEN)
+    hub.TOKENS.reload_if_needed()
+
+
+async def _http(
+    port: int,
+    method: str,
+    path: str,
+    headers: dict[str, str] | None = None,
+    body: bytes = b"",
+) -> tuple[int, dict, bytes]:
+    reader, writer = await __import__("asyncio").open_connection("127.0.0.1", port)
+    header_lines = [
+        f"{method} {path} HTTP/1.1",
+        "Host: 127.0.0.1",
+        f"Content-Length: {len(body)}",
+        "Connection: close",
+    ]
+    for key, value in (headers or {}).items():
+        header_lines.append(f"{key}: {value}")
+    writer.write(("\r\n".join(header_lines) + "\r\n\r\n").encode("ascii") + body)
+    await writer.drain()
+    raw = await reader.read()
+    writer.close()
+    await writer.wait_closed()
+    head, _, payload = raw.partition(b"\r\n\r\n")
+    lines = head.decode("iso-8859-1").split("\r\n")
+    status = int(lines[0].split()[1])
+    parsed: dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" in line:
+            name, value = line.split(":", 1)
+            parsed[name.strip().lower()] = value.strip()
+    return status, parsed, payload
+
+
+class TokenUnitTests(unittest.TestCase):
+    def test_short_and_ephemeral_tokens_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            write_device_token(_TMP / "bad.json", "moto-g84", "hub-token")
+        with self.assertRaises(ValueError):
+            write_device_token(_TMP / "bad.json", "moto-g84", EPHEMERAL_TOKEN)
+
+    def test_same_check_required_vs_optional(self) -> None:
+        path = _TMP / "unit-tokens.json"
+        if path.exists():
+            path.unlink()
+        write_device_token(path, DEVICE, TOKEN)
+        tokens = DeviceTokenFile(path)
+        public = Entrance("public", "127.0.0.1", 8790, True)
+        tailscale = Entrance("tailscale", "127.0.0.1", 8787, False)
+        locked = Entrance("tailscale", "127.0.0.1", 8787, True)
+        good = {"x-gsm-device-token": TOKEN}
+        bad = {"x-gsm-device-token": TOKEN[:-4] + "xxxx"}
+        legacy = {"authorization": f"Bearer {EPHEMERAL_TOKEN}"}
+
+        self.assertTrue(authorize({}, tailscale, tokens).ok)
+        self.assertFalse(authorize({}, public, tokens).ok)
+        self.assertEqual(authorize({}, public, tokens).error, "device token required")
+        self.assertFalse(authorize({}, locked, tokens).ok)
+        self.assertEqual(authorize(bad, tailscale, tokens).error, "device token rejected")
+        self.assertEqual(authorize(bad, public, tokens).error, "device token rejected")
+        self.assertEqual(authorize(good, public, tokens).device_id, DEVICE)
+        self.assertEqual(authorize(good, tailscale, tokens).device_id, DEVICE)
+        self.assertTrue(authorize(legacy, tailscale, tokens).ok)
+        self.assertIsNone(authorize(legacy, tailscale, tokens).device_id)
+        self.assertFalse(authorize(legacy, public, tokens).ok)
+        self.assertEqual(authorize({"authorization": f"Bearer {TOKEN}"}, public, tokens).device_id, DEVICE)
+
+    def test_public_allowlist_blocks_portal_and_admin(self) -> None:
+        self.assertTrue(public_route_allowed("GET", "/health", {}))
+        self.assertTrue(public_route_allowed("GET", "/sms/outbox", {}))
+        self.assertTrue(public_route_allowed("POST", "/sms/outbox/abc/ack", {}))
+        self.assertTrue(public_route_allowed("GET", "/", {"upgrade": "websocket", "sec-websocket-key": "x"}))
+        self.assertFalse(public_route_allowed("GET", "/portal/", {}))
+        self.assertFalse(public_route_allowed("POST", "/admin/call/release", {}))
+        self.assertFalse(public_route_allowed("POST", "/switchboard/mode", {}))
+
+    def test_snapshot_path_is_the_entrance(self) -> None:
+        slot = CallSlot(CallWatchdogConfig(enabled=False))
+        self.assertTrue(slot.claim("/loopback", entrance="public"))
+        slot.note_entrance("public", DEVICE)
+        snap = slot.snapshot()
+        self.assertEqual(snap["path"], "public")
+        self.assertEqual(snap["entrance"], "public")
+        self.assertEqual(snap["route"], "/loopback")
+        self.assertEqual(snap["device_id"], DEVICE)
+        self.assertTrue(slot.path_is_e2e("/e2e-test"))
+
+
+class StorePathTests(unittest.TestCase):
+    def test_legacy_calls_table_gains_path(self) -> None:
+        db = _TMP / "legacy.sqlite"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            """CREATE TABLE calls (
+                id TEXT PRIMARY KEY,
+                direction TEXT NOT NULL,
+                number TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                duration_sec INTEGER NOT NULL,
+                switchboard_mode TEXT,
+                session_id TEXT,
+                tap_summary TEXT
+            )"""
+        )
+        conn.commit()
+        conn.close()
+        store = PortalStore(db)
+        try:
+            item = store.add_call("in", "+15550001111", "2026-11-08T00:00:00Z", 3, path="public")
+            self.assertEqual(item["path"], "public")
+            self.assertEqual(store.list_calls()[0]["path"], "public")
+            ignored = store.add_call("in", "+15550002222", "2026-11-08T00:01:00Z", 1, path="loopback")
+            self.assertIsNone(ignored["path"])
+        finally:
+            store.close()
+
+
+class EntranceHttpTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        _write_tokens()
+        hub._active_entrances.clear()
+        self.tailscale = Entrance("tailscale", "127.0.0.1", 0, False)
+        self.public = Entrance("public", "127.0.0.1", 0, True)
+        self.servers = [
+            await hub.listen_entrance(self.tailscale),
+            await hub.listen_entrance(self.public),
+        ]
+        hub._active_entrances.extend([self.tailscale, self.public])
+
+    async def asyncTearDown(self) -> None:
+        for server in self.servers:
+            server.close()
+            await server.wait_closed()
+        hub._active_entrances.clear()
+        hub._finished_call_entrances.clear()
+        hub._finished_call_order.clear()
+
+    async def test_token_matrix_and_shared_outbox(self) -> None:
+        pub = self.public.listen_port
+        ts = self.tailscale.listen_port
+        good = {"X-Gsm-Device-Token": TOKEN}
+        bad = {"X-Gsm-Device-Token": "x" * 32}
+
+        status, _, body = await _http(pub, "GET", "/health")
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body)["error"], "device token required")
+
+        status, _, body = await _http(pub, "GET", "/health", bad)
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body)["error"], "device token rejected")
+
+        status, _, body = await _http(pub, "GET", "/health", {"Authorization": f"Bearer {EPHEMERAL_TOKEN}"})
+        self.assertEqual(status, 401)
+
+        status, _, body = await _http(pub, "GET", "/health", good)
+        self.assertEqual(status, 200)
+        health = json.loads(body)
+        names = {item["name"] for item in health["entrances"]}
+        self.assertEqual(names, {"public", "tailscale"})
+        public_row = next(item for item in health["entrances"] if item["name"] == "public")
+        self.assertEqual(public_row["client_scheme"], "https")
+        self.assertTrue(public_row["token_required"])
+        self.assertFalse(next(item["token_required"] for item in health["entrances"] if item["name"] == "tailscale"))
+        self.assertIsNone(health["call"]["path"])
+
+        status, _, _ = await _http(ts, "GET", "/health")
+        self.assertEqual(status, 200)
+        status, _, _ = await _http(ts, "GET", "/health", {"Authorization": f"Bearer {EPHEMERAL_TOKEN}"})
+        self.assertEqual(status, 200)
+        status, _, body = await _http(ts, "GET", "/health", bad)
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body)["error"], "device token rejected")
+        status, _, body = await _http(ts, "GET", "/health", good)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["call"]["path"], None)
+
+        status, _, _ = await _http(pub, "GET", "/portal/", good)
+        self.assertEqual(status, 404)
+        status, _, _ = await _http(pub, "POST", "/admin/call/release", good)
+        self.assertEqual(status, 404)
+        status, _, _ = await _http(ts, "GET", "/")
+        self.assertEqual(status, 302)
+
+        send = json.dumps({"to": "+15550001111", "body": "ping"}).encode()
+        status, _, body = await _http(ts, "POST", "/portal/api/messages/send", body=send)
+        self.assertEqual(status, 201)
+        outbox_id = json.loads(body)["id"]
+
+        status, _, _ = await _http(pub, "GET", "/sms/outbox")
+        self.assertEqual(status, 401)
+        status, _, body = await _http(pub, "GET", "/sms/outbox", good)
+        self.assertEqual(status, 200)
+        items = json.loads(body)["items"]
+        self.assertEqual(items[0]["id"], outbox_id)
+        ack = json.dumps({"status": "sent"}).encode()
+        status, _, _ = await _http(pub, "POST", f"/sms/outbox/{outbox_id}/ack", good, ack)
+        self.assertEqual(status, 200)
+
+        ws = (
+            "GET /loopback HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        reader, writer = await __import__("asyncio").open_connection("127.0.0.1", pub)
+        writer.write(ws.encode("ascii"))
+        await writer.drain()
+        raw = await reader.read(256)
+        writer.close()
+        await writer.wait_closed()
+        self.assertTrue(raw.startswith(b"HTTP/1.1 401"))
+
+    async def test_call_report_records_observed_entrance(self) -> None:
+        hub.remember_finished_call("hub-abc", "public")
+        body = json.dumps(
+            {"direction": "in", "number": "+15550003333", "started_at": "2026-11-08T18:00:00Z", "duration_sec": 9}
+        ).encode()
+        status, _, payload = await _http(self.tailscale.listen_port, "POST", "/calls", body=body)
+        self.assertEqual(status, 201)
+        call = json.loads(payload)["call"]
+        self.assertEqual(call["path"], "public")
+        listed = hub.portal_store.list_calls()
+        self.assertEqual(listed[0]["path"], "public")
+
+    async def test_tailscale_required_flag_uses_the_same_check(self) -> None:
+        locked = Entrance("tailscale", "127.0.0.1", 0, True)
+        server = await hub.listen_entrance(locked)
+        try:
+            status, _, body = await _http(locked.listen_port, "GET", "/health")
+            self.assertEqual(status, 401)
+            self.assertEqual(json.loads(body)["error"], "device token required")
+            status, _, body = await _http(
+                locked.listen_port,
+                "GET",
+                "/health",
+                {"X-Gsm-Device-Token": TOKEN},
+            )
+            self.assertEqual(status, 200)
+            self.assertIn(b"ok", body)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+
+class EnvEntranceTests(unittest.TestCase):
+    def test_public_entrance_is_opt_in(self) -> None:
+        os.environ["GSM2COMPUTER_PUBLIC_ENABLE"] = "0"
+        os.environ["GSM2COMPUTER_TAILSCALE_TOKEN_REQUIRED"] = "0"
+        names = [(item.name, item.token_required) for item in hub.entrances_from_env()]
+        self.assertEqual(names, [("tailscale", False)])
+        os.environ["GSM2COMPUTER_PUBLIC_ENABLE"] = "1"
+        os.environ["GSM2COMPUTER_PUBLIC_HOST"] = "127.0.0.1"
+        os.environ["GSM2COMPUTER_PUBLIC_PORT"] = "8790"
+        os.environ["GSM2COMPUTER_TAILSCALE_TOKEN_REQUIRED"] = "1"
+        described = {item.name: item.token_required for item in hub.entrances_from_env()}
+        self.assertEqual(described, {"tailscale": True, "public": True})
+        os.environ["GSM2COMPUTER_PUBLIC_ENABLE"] = "0"
+        os.environ["GSM2COMPUTER_TAILSCALE_TOKEN_REQUIRED"] = "0"
+
+
+if __name__ == "__main__":
+    unittest.main()

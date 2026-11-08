@@ -70,6 +70,10 @@ class CallSlot:
         self.last_ws_at: Optional[float] = None
         self.last_uplink_at: Optional[float] = None
         self.path: str = ""
+        # Network entrance that accepted this socket: "public" or "tailscale".
+        # Snapshot `path` reports this value. The URL route stays on `route`.
+        self.entrance: str = ""
+        self.device_id: str = ""
         self.is_e2e: bool = False
         self.abort = asyncio.Event()
         self.abort_reason: Optional[str] = None
@@ -112,7 +116,7 @@ class CallSlot:
         cleaned = (path or "").strip().strip("/")
         return cleaned == "e2e-test" or cleaned.startswith("e2e-test/")
 
-    def claim(self, path: str = "") -> bool:
+    def claim(self, path: str = "", entrance: str = "") -> bool:
         if self.busy:
             return False
         self.busy = True
@@ -121,6 +125,8 @@ class CallSlot:
         self.last_ws_at = None
         self.last_uplink_at = None
         self.path = path
+        self.entrance = entrance if entrance in ("public", "tailscale") else ""
+        self.device_id = ""
         self.is_e2e = self.path_is_e2e(path)
         self.abort = asyncio.Event()
         self.abort_reason = None
@@ -174,6 +180,12 @@ class CallSlot:
     def note_pong_rtt(self, rtt_ms: float) -> None:
         self.last_pong_rtt_ms = round(float(rtt_ms), 1)
 
+    def note_entrance(self, entrance: str, device_id: str = "") -> None:
+        """Record which listen socket is carrying the call right now."""
+        if entrance in ("public", "tailscale"):
+            self.entrance = entrance
+        self.device_id = device_id or ""
+
     def note_tailscale(self, mode: str, relay: str = "", addr: str = "") -> None:
         self.ts_path = mode or ""
         self.ts_relay = relay or ""
@@ -196,6 +208,8 @@ class CallSlot:
         self.last_ws_at = None
         self.last_uplink_at = None
         self.path = ""
+        self.entrance = ""
+        self.device_id = ""
         self.is_e2e = False
         self.abort_reason = None
         self.downlink_probe = None
@@ -262,9 +276,15 @@ class CallSlot:
                 return None
             return round(now - ts, 3)
 
+        entrance = self.entrance or None
         out = {
             "busy": self.busy,
-            "path": self.path or None,
+            # `path` is the network entrance (public|tailscale). The WebSocket
+            # route (/ , /loopback, /e2e-test) is `route` so the two are not mixed.
+            "path": entrance,
+            "entrance": entrance,
+            "route": self.path or None,
+            "device_id": self.device_id or None,
             "e2e": self.is_e2e,
             "age_s": _ago(self.claimed_at),
             "established_s": _ago(self.established_at),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import audioop
 import base64
+import contextvars
 import hashlib
 import json
 import logging
@@ -19,6 +20,13 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from alert_webhook import post_system_alert, start_alert_worker
+from device_auth import (
+    ENTRANCE_PUBLIC,
+    TOKENS,
+    Entrance,
+    authorize,
+    public_route_allowed,
+)
 from ws_backpressure import (
     DownlinkSendGuard,
     reconnect_should_supersede,
@@ -114,6 +122,19 @@ active_openclaw: Optional[Any] = None
 live_call = CallSlot(CALL_WATCHDOG)
 relink_gate = RelinkGate()
 last_call_tap: Optional[dict[str, Any]] = None
+# session_id -> (entrance, monotonic time the socket finished)
+_finished_call_entrances: dict[str, tuple[str, float]] = {}
+_finished_call_order: list[str] = []
+# Anonymous POST /calls (today's bridge omits session_id) inherits the entrance
+# only when the upload follows hangup immediately.
+CALL_PATH_STAMP_WINDOW_S = float(os.environ.get("GSM2COMPUTER_CALL_PATH_STAMP_S", "60"))
+_active_entrances: list[Entrance] = []
+_current_entrance: contextvars.ContextVar[Optional[Entrance]] = contextvars.ContextVar(
+    "gsm_entrance", default=None
+)
+_current_device_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "gsm_device_id", default=""
+)
 
 try:
     from openclaw_talk_bridge import OpenClawTalkBridge
@@ -134,6 +155,7 @@ def json_response(status: int, body: dict, extra_headers: Optional[dict] = None)
         200: "OK",
         201: "Created",
         400: "Bad Request",
+        401: "Unauthorized",
         404: "Not Found",
         409: "Conflict",
         500: "Internal Server Error",
@@ -484,6 +506,66 @@ portal_store = PortalStore(PORTAL_DB)
 portal_events = EventBus()
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def request_entrance() -> Entrance:
+    """Listen socket for this connection. Unset means the Tailscale entrance."""
+    current = _current_entrance.get()
+    if current is not None:
+        return current
+    return Entrance(
+        "tailscale",
+        HOST,
+        PORT,
+        _env_flag("GSM2COMPUTER_TAILSCALE_TOKEN_REQUIRED", False),
+    )
+
+
+def remember_finished_call(session_id: str, entrance: str) -> None:
+    if not session_id or entrance not in ("public", "tailscale"):
+        return
+    _finished_call_entrances[session_id] = (entrance, time.monotonic())
+    _finished_call_order.append(session_id)
+    while len(_finished_call_order) > 32:
+        old = _finished_call_order.pop(0)
+        if old not in _finished_call_order:
+            _finished_call_entrances.pop(old, None)
+
+
+def resolve_call_path(session_id: Optional[str], requested: Optional[str]) -> Optional[str]:
+    """Entrance to store on a call report. The socket we saw beats the client's claim."""
+    now = time.monotonic()
+    observed: Optional[str] = None
+    if session_id:
+        hit = _finished_call_entrances.get(session_id)
+        if hit is not None:
+            observed = hit[0]
+    if observed is None and live_call.busy and live_call.entrance in ("public", "tailscale"):
+        if not session_id or session_id == live_call.session_id:
+            observed = live_call.entrance
+    if observed is None and not session_id and _finished_call_order:
+        last = _finished_call_entrances.get(_finished_call_order[-1])
+        if last is not None and now - last[1] <= CALL_PATH_STAMP_WINDOW_S:
+            observed = last[0]
+    if observed:
+        if requested and requested != observed:
+            LOG.info(
+                "call report path %s overridden by observed entrance %s session=%s",
+                requested,
+                observed,
+                session_id or "-",
+            )
+        return observed
+    if requested in ("public", "tailscale"):
+        return requested
+    return None
+
+
 def _portal_mode() -> Optional[str]:
     return current_mode
 
@@ -499,6 +581,7 @@ portal_app = PortalApp(
     mode_getter=_portal_mode,
     tap_getter=_portal_tap,
     record_dir=RECORD_DIR,
+    path_getter=resolve_call_path,
 )
 
 
@@ -1239,7 +1322,12 @@ async def _run_e2e_after_silent_call(call_id: str) -> None:
 
 def _record_link_event(kind: str, **fields: Any) -> None:
     """Persist a link event. Failures stay off the audio path."""
-    event = {"kind": kind, "ts": _utc_now(), **fields}
+    event = {
+        "kind": kind,
+        "ts": _utc_now(),
+        "entrance": live_call.entrance or None,
+        **fields,
+    }
     try:
         append_link_gap(event)
     except Exception:
@@ -1253,6 +1341,7 @@ def _record_link_event(kind: str, **fields: Any) -> None:
             initiator=fields.get("initiator"),
             detail=str(fields.get("detail") or "") or None,
             ts=event["ts"],
+            entrance=event.get("entrance") if isinstance(event.get("entrance"), str) else None,
         )
     except Exception:
         LOG.warning("link gap sqlite write failed", exc_info=True)
@@ -1442,9 +1531,20 @@ async def handle_websocket(
     resume_id = (headers.get("x-gsm-call-session") or "").strip()
     park_id = relink_gate.resume_session(resume_id)
     if park_id and await _park_relink_socket(reader, writer, park_id, key):
+        entrance = request_entrance()
+        live_call.note_entrance(entrance.name, _current_device_id.get())
         if not resume_id:
             LOG.info(
-                "header-less reconnect parked session=%s utc=%s",
+                "header-less reconnect parked session=%s entrance=%s utc=%s",
+                park_id,
+                entrance.name,
+                _utc_now(),
+            )
+        else:
+            LOG.info(
+                "relink entrance=%s device=%s session=%s utc=%s",
+                entrance.name,
+                _current_device_id.get() or "-",
                 park_id,
                 _utc_now(),
             )
@@ -1529,17 +1629,22 @@ async def handle_websocket(
         return
 
     # Keep call admission out of the short idle URL repair window.
-    if get_talk_ui is not None and get_talk_ui().page_heal_in_progress:
+    # The flag lives on the Talk UI when that supervisor is current. A build
+    # that imported talk_chromium without the flag must still accept the call.
+    talk_ui = get_talk_ui() if get_talk_ui is not None else None
+    if talk_ui is not None and getattr(talk_ui, "page_heal_in_progress", False):
         writer.write(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nConnection: close\r\n\r\n")
         await writer.drain()
         return
     session_id = "hub-" + uuid.uuid4().hex[:16]
-    if not live_call.claim(path):
+    entrance = request_entrance()
+    if not live_call.claim(path, entrance=entrance.name):
         LOG.warning("rejecting websocket: call slot raced %s", live_call.snapshot())
         writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
         await writer.drain()
         return
     live_call.session_id = session_id
+    live_call.note_entrance(entrance.name, _current_device_id.get())
 
     playback_sink = GSM_SINK
     openclaw_bridge: Optional[Any] = None
@@ -1563,7 +1668,14 @@ async def handle_websocket(
 
         loopback = path.strip("/") == "loopback" or path.startswith("/loopback")
         e2e = CallSlot.path_is_e2e(path)
-        LOG.info("WebSocket connected path=%s loopback=%s e2e=%s", path, loopback, e2e)
+        LOG.info(
+            "WebSocket connected entrance=%s route=%s loopback=%s e2e=%s device=%s",
+            live_call.entrance or "-",
+            path,
+            loopback,
+            e2e,
+            live_call.device_id or "-",
+        )
         tap = CallTap.maybe_open(
             loopback=loopback,
             mode="off" if loopback else OPENCLAW_TALK_MODE,
@@ -1670,6 +1782,7 @@ async def handle_websocket(
             "type": "session.updated",
             "session": {
                 "id": session_id,
+                "entrance": live_call.entrance or None,
                 "model": f"gsm2computer-hub-{OPENCLAW_TALK_MODE}" if not loopback else "gsm2computer-hub",
                 "audio": {
                     "format": DEFAULT_CLIENT_FORMAT,
@@ -1870,6 +1983,7 @@ async def handle_websocket(
                 LOG.warning("openclaw stop in finally failed", exc_info=True)
             active_openclaw = None
             LOG.info("openclaw talk stopped (mode=%s)", OPENCLAW_TALK_MODE)
+        remember_finished_call(live_call.session_id, live_call.entrance)
         live_call.release()
         if abort_reason:
             LOG.info("WebSocket disconnected after watchdog: %s", abort_reason)
@@ -1920,6 +2034,32 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     path_only = split.path or "/"
     query = parse_qs(split.query)
 
+    # Same check on every listen socket. The entrance only changes whether a
+    # missing token is still allowed (Tailscale, during the bridge transition).
+    entrance = request_entrance()
+    decision = authorize(headers, entrance, TOKENS)
+    if not decision.ok:
+        LOG.info(
+            "device token %s entrance=%s peer=%s %s %s",
+            decision.reason,
+            entrance.name,
+            peer,
+            method,
+            path_only,
+        )
+        writer.write(json_response(decision.status, {"ok": False, "error": decision.error}))
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return
+    _current_device_id.set(decision.device_id or "")
+    if entrance.name == ENTRANCE_PUBLIC and not public_route_allowed(method, path_only, headers):
+        writer.write(json_response(404, {"ok": False, "error": "not found"}))
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return
+
     if headers.get("upgrade", "").lower() == "websocket" or "sec-websocket-key" in headers:
         await handle_websocket(reader, writer, headers, path_only)
         writer.close()
@@ -1943,6 +2083,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 "ok": True,
                 "mode": current_mode,
                 "openclaw_talk": OPENCLAW_TALK_MODE,
+                "entrances": [item.describe() for item in _active_entrances],
                 "call": live_call.snapshot(),
             }
             if last_call_tap:
@@ -2137,13 +2278,21 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))
 
-    server = await asyncio.start_server(handle_client, HOST, PORT)
+    TOKENS.reload_if_needed()
+    entrances = entrances_from_env()
+    servers: list[asyncio.AbstractServer] = []
+    for entrance in entrances:
+        servers.append(await listen_entrance(entrance))
+        _active_entrances.append(entrance)
     asyncio.create_task(_reap_stuck_call_slot())
-    addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
+    described = ", ".join(
+        f"{item.name}={item.host}:{item.listen_port} token_required={item.token_required}"
+        for item in _active_entrances
+    )
     LOG.info(
         "listening on %s (sink=%s auto_mode=%s openclaw_talk=%s "
         "call_watchdog=ws_idle=%s uplink_idle=%s max=%s relink_grace=%s)",
-        addrs,
+        described,
         GSM_SINK,
         AUTO_MODE_ON_CALL or "off",
         OPENCLAW_TALK_MODE,
@@ -2152,8 +2301,62 @@ async def main() -> None:
         CALL_WATCHDOG.max_s,
         CALL_WATCHDOG.relink_grace_s,
     )
-    async with server:
-        await server.serve_forever()
+    try:
+        await asyncio.gather(*(server.serve_forever() for server in servers))
+    finally:
+        for server in servers:
+            server.close()
+        await asyncio.gather(*(server.wait_closed() for server in servers))
+
+
+def entrances_from_env() -> list[Entrance]:
+    """Tailscale socket always. Public socket only when explicitly enabled."""
+    tailscale = Entrance(
+        "tailscale",
+        os.environ.get("GSM2COMPUTER_HUB_HOST", HOST),
+        int(os.environ.get("GSM2COMPUTER_HUB_PORT", str(PORT))),
+        _env_flag("GSM2COMPUTER_TAILSCALE_TOKEN_REQUIRED", False),
+    )
+    configured = [tailscale]
+    if not _env_flag("GSM2COMPUTER_PUBLIC_ENABLE", False):
+        return configured
+    public = Entrance(
+        ENTRANCE_PUBLIC,
+        os.environ.get("GSM2COMPUTER_PUBLIC_HOST", "127.0.0.1"),
+        int(os.environ.get("GSM2COMPUTER_PUBLIC_PORT", "8790")),
+        _env_flag("GSM2COMPUTER_PUBLIC_TOKEN_REQUIRED", True),
+    )
+    if not public.token_required:
+        LOG.error(
+            "public entrance has GSM2COMPUTER_PUBLIC_TOKEN_REQUIRED=0; "
+            "do not run that on cup"
+        )
+    if public.host.strip() not in ("127.0.0.1", "::1", "localhost"):
+        LOG.warning(
+            "public entrance binds %s; cup should bind 127.0.0.1 and let Caddy own TLS",
+            public.host,
+        )
+    configured.append(public)
+    return configured
+
+
+async def listen_entrance(entrance: Entrance) -> asyncio.AbstractServer:
+    """Bind one entrance. The accept callback only tags the socket, then calls handle_client."""
+
+    async def client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        token = _current_entrance.set(entrance)
+        try:
+            await handle_client(reader, writer)
+        finally:
+            _current_entrance.reset(token)
+
+    server = await asyncio.start_server(client, entrance.host, entrance.port)
+    socks = server.sockets or []
+    if socks:
+        bound = socks[0].getsockname()
+        if isinstance(bound, tuple) and len(bound) >= 2:
+            entrance.bound_port = int(bound[1])
+    return server
 
 
 _server: Optional[asyncio.AbstractServer] = None

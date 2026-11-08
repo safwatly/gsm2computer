@@ -11,6 +11,7 @@ Architecture decisions live in **[docs/adr/](docs/adr/)**. Read those before cha
 | [docs/adr/0005-native-pcm-hub-wire.md](docs/adr/0005-native-pcm-hub-wire.md) | Phone PCM at HAL rate; hub 48 kHz. Missing fields = 8 kHz μ-law |
 | [docs/adr/0006-portal-messaging.md](docs/adr/0006-portal-messaging.md) | Hub PWA / SQLite SMS + call log; Pixel 10s outbox poll; Tailscale-only auth (SAF-29–34) |
 | [docs/adr/0007-hub-machine-name-and-https.md](docs/adr/0007-hub-machine-name-and-https.md) | Machine `hub`; no `portal.hub…`; do not Tailscale Serve `/` to gsm2computer |
+| [docs/adr/0008-public-audio-entrance.md](docs/adr/0008-public-audio-entrance.md) | Public phone audio on cup: one handler, device token, Caddy TLS, nftables |
 | [docs/TAILSCALE_PORTAL_HTTPS.md](docs/TAILSCALE_PORTAL_HTTPS.md) | MagicDNS URLs, Chrome cert red flags, rename checklist |
 | [hub/TALK_WEBRTC.md](hub/TALK_WEBRTC.md) | Commands, first DCV login, env knobs |
 
@@ -23,9 +24,14 @@ Architecture decisions live in **[docs/adr/](docs/adr/)**. Read those before cha
 - Dedicated Talk Chromium profile only (`chromium-openclaw-talk`). Do not attach the operator’s daily Chrome for production Talk.
 - One live call (ADR 0004). A waiting GSM leg or second hub WebSocket is rejected; it must not hang up the established call or steal the mixer.
 - Phone WS audio is native PCM at the HAL rate (ADR 0005). The hub resamples to 48 kHz. Deploy hub and APK together. Simulator omits `format`/`rate` and stays 8 kHz μ-law.
+- Public phone audio is a second listen socket on the same `handle_client` ([ADR 0008](docs/adr/0008-public-audio-entrance.md)). Caddy terminates TLS in front of `127.0.0.1`. Do not copy the handler, do not `tailscale serve` the hub, and do not publish the upstream port.
 - Do not commit gateway tokens, `#token=` URLs, or CDP ports bound to non-localhost.
 
 Android GSM silencing / priv-app notes: [docs/VOICE_CALL_SILENCING_INVESTIGATION.md](docs/VOICE_CALL_SILENCING_INVESTIGATION.md).
+
+## Before you call the work done
+
+Read and follow [verify-gsm2computer](.cursor/skills/verify-gsm2computer/SKILL.md) before declaring work done. Launch the isolated hub, run doctor, and drive the feature you changed. Real GSM calls, call audio, Bluetooth routing, and root-only features still need the physical phone. A green hub check does not cover them.
 
 ## Linear tickets
 

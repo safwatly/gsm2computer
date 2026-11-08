@@ -23,6 +23,8 @@ RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
 ModeGetter = Callable[[], Optional[str]]
 TapGetter = Callable[[], Optional[dict[str, Any]]]
+# (session_id, requested path) -> public|tailscale|None. Hub observation wins.
+PathGetter = Callable[[Optional[str], Optional[str]], Optional[str]]
 
 
 class EventBus:
@@ -150,6 +152,7 @@ class PortalApp:
         mode_getter: Optional[ModeGetter] = None,
         tap_getter: Optional[TapGetter] = None,
         record_dir: Optional[Path] = None,
+        path_getter: Optional[PathGetter] = None,
     ) -> None:
         self.store = store
         self.events = events
@@ -157,6 +160,7 @@ class PortalApp:
         self.mode_getter = mode_getter or (lambda: None)
         self.tap_getter = tap_getter or (lambda: None)
         self.record_dir = Path(record_dir) if record_dir is not None else _default_record_dir()
+        self.path_getter = path_getter
 
     async def dispatch(
         self,
@@ -316,6 +320,13 @@ class PortalApp:
             session_id = str(tap.get("id") or "") or None
         if not tap_summary:
             tap_summary = _tap_summary_text(tap)
+        requested = str(payload.get("path") or payload.get("entrance") or "").strip().lower()
+        if requested not in ("public", "tailscale"):
+            requested = ""
+        if self.path_getter is not None:
+            path = self.path_getter(session_id, requested or None)
+        else:
+            path = requested or None
 
         item = self.store.add_call(
             direction=direction,
@@ -325,6 +336,7 @@ class PortalApp:
             switchboard_mode=mode,
             session_id=session_id,
             tap_summary=tap_summary,
+            path=path,
         )
         self.events.publish("call", item)
         return json_response(201, {"ok": True, "call": item})

@@ -1,0 +1,17 @@
+[Unit]
+Description=gsm2computer public TLS entrance (Caddy)
+After=network-online.target gsm2computer-hub.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/gsm2computer/public-entrance.env
+ExecStart=/usr/bin/caddy run --config /etc/gsm2computer/Caddyfile --adapter caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/gsm2computer/Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
