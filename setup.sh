@@ -164,9 +164,11 @@ setup_gradle_wrapper() {
 setup_environment() {
     cd "$SCRIPT_DIR"
 
-    # Create local.properties for the Android project
-    echo "sdk.dir=$ANDROID_SDK_DIR" > local.properties
-    log "Created local.properties (sdk.dir=$ANDROID_SDK_DIR)"
+    # Rewrite sdk.dir only. A full overwrite drops GSM2COMPUTER_* signing keys.
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/build.sh"
+    write_sdk_dir "$SCRIPT_DIR/local.properties" "$ANDROID_SDK_DIR"
+    log "local.properties sdk.dir=$ANDROID_SDK_DIR (other lines kept)"
 
     # Make build scripts executable
     chmod +x build.sh gradlew 2>/dev/null || true
