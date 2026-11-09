@@ -18,6 +18,7 @@ import java.util.TimeZone
  * Writes under Android/data/…/files/call-taps/<utc>/:
  *   pre-gate.wav   — raw AudioRecord, before noise/echo gate and gain
  *   post-gate.wav  — after noise/echo gate and gain (zeros = gated)
+ *   playback.wav  — exactly what the app wrote into the call (hub -> caller)
  *   seconds.jsonl  — one JSON object per second of gate/RMS stats
  *   meta.json      — source, rate, gain, totals
  */
@@ -30,6 +31,8 @@ class CaptureTap private constructor(
     private val post = PcmWav(File(dir, "post-gate.wav"), rate)
     private val seconds = File(dir, "seconds.jsonl").bufferedWriter()
     private var closed = false
+    private var play: PcmWav? = null
+    private var playBytes = 0L
 
     private var frames = 0
     private var secRawSq = 0.0
@@ -62,6 +65,22 @@ class CaptureTap private constructor(
     }
 
     @Synchronized
+    fun writePlay(pcm: ByteArray, nbytes: Int, rate: Int) {
+        if (closed) return
+        val w = play ?: PcmWav(File(dir, "playback.wav"), rate).also {
+            play = it
+            meta.put("playback_rate", rate)
+        }
+        w.write(pcm, nbytes)
+        playBytes += nbytes
+    }
+
+    @Synchronized
+    fun putMeta(key: String, value: Any) {
+        meta.put(key, value)
+    }
+
+    @Synchronized
     fun noteFrame(rawRms: Int, postRms: Int, forwarded: Boolean, noiseGated: Boolean, echoGated: Boolean, playRms: Int) {
         if (closed) return
         frames++
@@ -85,6 +104,9 @@ class CaptureTap private constructor(
         seconds.close()
         pre.close()
         post.close()
+        play?.close()
+        meta.put("playback_bytes", playBytes)
+        try { for ((k, v) in com.gsm2computer.bridge.gsm.GsmCallManager.btMeta) meta.put(k, v) } catch (_: Exception) {}
         val elapsedS = (android.os.SystemClock.elapsedRealtime() - startedAtMs) / 1000.0
         val preSamples = preBytes / 2.0
         val impliedHz = if (elapsedS > 0.2) preSamples / elapsedS else 0.0

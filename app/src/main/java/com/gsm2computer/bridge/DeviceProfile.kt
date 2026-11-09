@@ -179,6 +179,12 @@ data class DeviceProfile(
                 hw.contains("tensor") || model.contains("pixel 7") ->
                     pixel7Tensor()
 
+                // Motorola moto g84 5G (SM6375 "holi" / aw87xxx speaker amps).
+                // Must precede the generic-Qualcomm fallthrough (which forces
+                // speakerphone and sets Voice Rx Device Mute — kills capture here).
+                board.contains("holi") || board.contains("bangkk") || model.contains("moto g84") ->
+                    motoG84Holi()
+
                 // Generic Qualcomm — try incall_music, skip WCD9304-specific controls
                 hw.contains("qcom") || hw.contains("qualcomm") ->
                     genericQualcomm()
@@ -555,7 +561,8 @@ data class DeviceProfile(
             ),
             audio = AudioCalibration(
                 musicVolPercent = 100,
-                captureGain = 12,
+                // Was 12; clipped post-gate (pre_peak~0.11). After cup NS/EC off (PR #11), 8x ~0.88 peak.
+                captureGain = 8,
                 playbackGain = 2,
                 voiceCallVolPercent = 70,
                 noiseGateThreshold = 3,   // UL capture on aoc-snd-card is quiet; 3 passes speech, gates noise
@@ -577,6 +584,89 @@ data class DeviceProfile(
                 playbackToTelephony = true,
                 isAbox = false,
                 muteMicrophoneAtApi = true,
+            ),
+        )
+
+        /** Motorola moto g84 5G (SM6375 holi, card holi-9370_aw87xxx-snd-card).
+         *
+         *  Requirement: phone silent locally, audio only between call and hub.
+         *   - Never touch 'Voice Rx Device Mute' (2026-11-01: genericQualcomm set
+         *     it and VOICE_CALL capture read rawCapRMS=0 for the whole call).
+         *   - No speakerphone: stay on the handset route, then cut the earpiece
+         *     DAC, both aw87xxx amps and the codec RX volumes after the route
+         *     settles.  These are codec-side (post-DSP), so DSP incall-record
+         *     and Incall_Music injection are unaffected.
+         *   - Room mic cut at the codec (TX_DEC/ADC volumes), not via
+         *     setMicrophoneMute: the QCOM HAL maps API mute to 'Voice Tx Mute',
+         *     which would also mute Incall_Music injection.
+         *   - Capture caller-only via VOICE_DOWNLINK (incall-rec-downlink =
+         *     MultiMedia9 Mixer VOC_REC_DL), so injected audio cannot echo back.
+         */
+        fun motoG84Holi() = DeviceProfile(
+            name = "Moto g84 (holi)",
+            mixer = MixerProfile(
+                mixerSetupCmd = buildString {
+                    append("tinymix 'aw87xxx_profile_switch_0' Off 2>/dev/null; ")
+                    append("tinymix 'aw87xxx_profile_switch_1' Off 2>/dev/null; ")
+                    append("tinymix 'EAR_RDAC Switch' 0 2>/dev/null; ")
+                    for (i in 0..3) append("tinymix 'TX_DEC$i Volume' 0 2>/dev/null; ")
+                    for (i in 1..3) append("tinymix 'ADC$i Volume' 0 2>/dev/null; ")
+                    append("tinymix 'Voice Tx Mute' 0 2>/dev/null; ")
+                    append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
+                    append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
+                    // holi HAL: USECASE_INCALL_MUSIC_UPLINK = PCM 23 = MultiMedia9
+                    append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 1 2>/dev/null")
+                },
+                mixerRestoreCmd = buildString {
+                    // Idle baseline captured 2026-11-01 (moto-mixer-baseline.txt)
+                    append("tinymix 'RX_RX0 Digital Volume' 79 2>/dev/null; ")
+                    append("tinymix 'RX_RX1 Digital Volume' 79 2>/dev/null; ")
+                    append("tinymix 'RX_RX2 Digital Volume' 84 2>/dev/null; ")
+                    for (i in 0..3) append("tinymix 'TX_DEC$i Volume' 84 2>/dev/null; ")
+                    for (i in 1..3) append("tinymix 'ADC$i Volume' 12 2>/dev/null; ")
+                    append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 0 2>/dev/null; ")
+                    append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 0 2>/dev/null; ")
+                    append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 0 2>/dev/null")
+                },
+                mixerIncallMusicCmd = buildString {
+                    append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
+                    append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
+                    append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 1 2>/dev/null; ")
+                    append("tinymix 'Voice Tx Mute' 0 2>/dev/null")
+                },
+                mixerDiagGrep = "tinymix 2>&1 | grep -iE '(MultiMedia9 Mixer|VOC_REC|Incall_Music|" +
+                    "Voice Tx Mute|Voice Rx|aw87xxx_profile|EAR_RDAC|TX_DEC[0-3] Vol|ADC[1-3] Vol|VoiceMMode1)'",
+                // Re-asserted during the bridge: HAL route changes re-enable amps/mics.
+                micMuteCmd = buildString {
+                    append("tinymix 'aw87xxx_profile_switch_0' Off 2>/dev/null; ")
+                    append("tinymix 'aw87xxx_profile_switch_1' Off 2>/dev/null; ")
+                    append("tinymix 'EAR_RDAC Switch' 0 2>/dev/null; ")
+                    for (i in 0..3) append("tinymix 'TX_DEC$i Volume' 0 2>/dev/null; ")
+                    for (i in 1..3) append("tinymix 'ADC$i Volume' 0 2>/dev/null; ")
+                    append("true")
+                },
+            ),
+            audio = AudioCalibration(
+                musicVolPercent = 60,
+                captureGain = 1,      // 341: pre-gate peaks 0.99 at raw RMS ~7.9k; 2x clipped 7.6%
+                playbackGain = 2,
+                noiseGateThreshold = 3,
+                echoGateThreshold = 300,
+                doubleTalkRatio = 1.5f,
+                voiceCallVolPercent = 0,
+            ),
+            routing = HalRoutingProfile(
+                requireSpeakerMode = false,
+                // Inject via Telephony Tx (incall_music_uplink mixPort in the
+                // Moto audio_policy) instead of MEDIA->handset, which stalled.
+                playbackToTelephony = true,
+                incallMusicParam = "incall_music_enabled",
+                voiceDownlinkWorks = false,
+                captureSource = MediaRecorder.AudioSource.VOICE_CALL,
+                routeChangeDelayMs = 700,
+                appopsPropagationMs = 500,
+                isAbox = false,
+                muteMicrophoneAtApi = false,
             ),
         )
 
