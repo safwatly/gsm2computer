@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
 import android.net.Uri
+import android.os.Build
 import android.telecom.Call
 import android.telecom.CallAudioState
 import android.telecom.InCallService
@@ -117,6 +118,7 @@ object GsmCallManager {
                 }
                 Log.i(TAG, "GSM call active: $number")
                 configureAudioBridge()
+                requestBluetoothRoute()
                 listener?.onGsmCallActive(call)
             }
         }
@@ -160,6 +162,7 @@ object GsmCallManager {
                 }
                 Log.i(TAG, "GSM call active")
                 configureAudioBridge()
+                requestBluetoothRoute()
                 listener?.onGsmCallActive(call)
             }
             Call.STATE_DISCONNECTED -> {
@@ -176,6 +179,81 @@ object GsmCallManager {
             listener?.onGsmCallStateChanged(call, state)
         }
     }
+
+    // ── Bluetooth call-audio routing (build 344) ────────
+
+    /** Per-call BT diagnostics, merged into CaptureTap meta on close. */
+    val btMeta = java.util.concurrent.ConcurrentHashMap<String, Any>()
+    /** Set by CallOrchestrator to forward events into the call trace. */
+    @Volatile var btTrace: ((String, Map<String, Any?>) -> Unit)? = null
+    @Volatile private var btRouteToken = 0
+
+    private fun btPut(k: String, v: Any?) {
+        btMeta[k] = v ?: "null"
+        try { btTrace?.invoke(k, mapOf("value" to v)) } catch (_: Exception) {}
+    }
+
+    private fun btEnabled(): Boolean = try {
+        java.io.File("/data/local/tmp/bt_route_enabled").readText().trim() == "1"
+    } catch (_: Exception) {
+        try { RootShell.execForOutput("cat /data/local/tmp/bt_route_enabled", 2000).trim() == "1" } catch (_: Exception) { false }
+    }
+
+    fun noteAudioState(state: android.telecom.CallAudioState?) {
+        if (state == null) return
+        val s = "route=${android.telecom.CallAudioState.audioRouteToString(state.route)} mask=${state.supportedRouteMask} muted=${state.isMuted}" +
+            (if (Build.VERSION.SDK_INT >= 28) " active=${state.activeBluetoothDevice?.address} supported=${state.supportedBluetoothDevices.size}" else "")
+        btPut("bt_audio_state", s)
+    }
+
+    private fun requestBluetoothRoute() {
+        val svc = inCallService ?: return
+        val token = ++btRouteToken
+        btMeta.clear()
+        Thread({
+            try {
+                if (!btEnabled()) { btPut("bt_route_request", "disabled"); return@Thread }
+                btPut("bt_route_request", "start")
+                var result = "unavailable"
+                for (attempt in 1..10) {
+                    if (token != btRouteToken || activeCall == null) { result = "aborted"; break }
+                    @Suppress("DEPRECATION")
+                    val st = svc.callAudioState
+                    noteAudioState(st)
+                    val mask = st?.supportedRouteMask ?: 0
+                    btPut("bt_supported_mask", mask)
+                    if (st != null && st.route == android.telecom.CallAudioState.ROUTE_BLUETOOTH) {
+                        result = "ok attempt=$attempt"
+                        if (Build.VERSION.SDK_INT >= 28) btPut("bt_device_name", safeName(st.activeBluetoothDevice))
+                        break
+                    }
+                    if (mask and android.telecom.CallAudioState.ROUTE_BLUETOOTH != 0) {
+                        val dev = if (Build.VERSION.SDK_INT >= 28) st?.supportedBluetoothDevices?.firstOrNull() else null
+                        if (dev != null) {
+                            btPut("bt_device_name", safeName(dev))
+                            try { svc.requestBluetoothAudio(dev) } catch (e: Exception) { btPut("bt_route_err", "requestBluetoothAudio: ${e.message}") }
+                        }
+                        @Suppress("DEPRECATION")
+                        try { svc.setAudioRoute(android.telecom.CallAudioState.ROUTE_BLUETOOTH) } catch (e: Exception) { btPut("bt_route_err", "setAudioRoute: ${e.message}") }
+                        result = "requested attempt=$attempt"
+                    }
+                    Thread.sleep(500)
+                }
+                @Suppress("DEPRECATION")
+                val fin = svc.callAudioState
+                noteAudioState(fin)
+                if (fin?.route == android.telecom.CallAudioState.ROUTE_BLUETOOTH && !result.startsWith("ok")) result = "ok (after $result)"
+                btPut("bt_route_result", result)
+                appLog("BT route: $result")
+            } catch (e: Exception) {
+                btPut("bt_route_result", "error: ${e.message}")
+            }
+        }, "BtRoute").start()
+    }
+
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun safeName(d: android.bluetooth.BluetoothDevice?): String =
+        if (d == null) "null" else try { "${d.name} (${d.address})" } catch (e: Exception) { d.address ?: "?" }
 
     // ── Call control ────────────────────────────────────
 

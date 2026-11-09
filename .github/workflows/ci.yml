@@ -63,6 +63,15 @@ jobs:
       - name: Unit tests
         run: ./gradlew test --no-daemon
 
+      - name: Bridge paths (public and Tailscale)
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            pipewire pipewire-pulse wireplumber pipewire-bin pulseaudio-utils
+          mkdir -p app/build/reports/bridge-paths
+          GSM2COMPUTER_VERIFY_EVIDENCE="$PWD/app/build/reports/bridge-paths" \
+            bash .cursor/skills/verify-gsm2computer/scripts/drive-bridge-paths.sh
+
       - name: Release build (R8)
         run: ./gradlew assembleRelease --no-daemon
 
@@ -73,6 +82,7 @@ jobs:
           name: test-results
           path: |
             app/build/reports/tests/
+            app/build/reports/bridge-paths/
             app/build/reports/lint-results-*.xml
             app/build/outputs/apk/release/*.apk
           if-no-files-found: ignore

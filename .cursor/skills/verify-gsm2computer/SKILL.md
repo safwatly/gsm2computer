@@ -1,11 +1,11 @@
 ---
 name: verify-gsm2computer
 description: >-
-  Verify the gsm2computer hub: public and Tailscale phone entrances, the
-  shared device-token check, call.path on /health and call reports, Grok Bot
-  mode, G2 uplink, the PR #28 bridge dial contract, loopback audio, SMS
+  Verify the gsm2computer hub and the bridge's ordered hub walk: public and
+  Tailscale phone entrances, the shared device-token check, call.path on
+  /health and call reports, Grok Bot mode, G2 uplink, loopback audio, SMS
   outbox, and the cup nftables drop-in. Use before declaring hub, portal,
-  SMS, entrance, grokbot, or firewall work done.
+  SMS, entrance, grokbot, bridge-path, or firewall work done.
 ---
 
 # Verify gsm2computer
@@ -46,19 +46,19 @@ Firewall drop-in, still not installed on the host:
 .cursor/skills/verify-gsm2computer/scripts/check-firewall.sh
 ```
 
-Bridge contract (PR #28's dial shape, G2 uplink, grokbot session fields). PipeWire is stubbed:
+Bridge connection routine, one call on each entrance (and a failover and a relink). This starts its own hub on ports 18987 and 18990. Grok Bot session fields and G2 uplink are covered by `hub.tests.test_reconcile_interactions`, which stubs PipeWire:
 
 ```bash
 .cursor/skills/verify-gsm2computer/scripts/drive-bridge-paths.sh
 ```
 
-Feature map: [features/README.md](features/README.md).
+Feature map: [features/README.md](features/README.md). How to read which path a call used: [features/bridge-paths.md](features/bridge-paths.md).
 
 ## Evidence
 
 `drive-entrances.py` writes `/opt/cursor/artifacts/verify-gsm2computer/entrances.json`.
-`check-firewall.sh` writes `/opt/cursor/artifacts/verify-gsm2computer/firewall.txt`.
 `drive-bridge-paths.sh` writes `/opt/cursor/artifacts/verify-gsm2computer/bridge-paths.json`.
+`check-firewall.sh` writes `/opt/cursor/artifacts/verify-gsm2computer/firewall.txt`.
 Hub logs stay in `/tmp/gsm2computer-verify/hub.log`. Override the directory with `GSM2COMPUTER_VERIFY_EVIDENCE`.
 
 The journey is the real hub process: HTTP and a WebSocket client that sends `input_audio_buffer.append` frames. Loopback echo is the hub's own `/loopback` path, which still starts `pw-cat` against `gsm_bus`. PipeWire here is a null sink, not the cup graph. Caddy in the drive uses `tls internal` on `127.0.0.1:18443`. That is not Let's Encrypt and not port 443.
@@ -78,8 +78,8 @@ Kills the hub, Caddy, WirePlumber, and PipeWire pids recorded under the state di
 | Launch | `.cursor/skills/verify-gsm2computer/scripts/launch-hub.sh` |
 | Doctor | `.cursor/skills/verify-gsm2computer/scripts/doctor.sh` |
 | Drive entrances | `python3 .cursor/skills/verify-gsm2computer/scripts/drive-entrances.py` |
+| Drive bridge paths | `.cursor/skills/verify-gsm2computer/scripts/drive-bridge-paths.sh` |
 | Firewall | `.cursor/skills/verify-gsm2computer/scripts/check-firewall.sh` |
-| Bridge paths | `.cursor/skills/verify-gsm2computer/scripts/drive-bridge-paths.sh` |
 | Teardown | `.cursor/skills/verify-gsm2computer/scripts/teardown.sh` |
 
 ## Stand-in versus cup
@@ -92,8 +92,7 @@ A passing run on this VM does not show:
 - a rollback timer via `systemd-run` (the netns test uses sleep mode)
 - GSM audio, OpenClaw Talk, or the rooted phone
 - WirePlumber as cup runs it (this VM has no systemd-logind, so the launcher disables the logind plugin; without that, WirePlumber exits and `pw-cat --target` never links)
-- the phone sending `X-Gsm-Device-Token` (the client here is Python)
 - Grok Bot / patchbay / Suzie (the grokbot test stubs `patchbay`)
-- the Android bridge process (PR #28). `drive-bridge-paths.sh` speaks that dial contract from Python
+- the physical phone. `drive-bridge-paths.sh` runs the bridge's `HubConnectionRoutine` and `HubCallDialer` on this VM against loopback sockets. It does not install an APK or place a GSM call.
 
-Cup deploy and rollback: [docs/CUP_PUBLIC_ENTRANCE.md](../../../docs/CUP_PUBLIC_ENTRANCE.md).
+Cup deploy and rollback: [docs/CUP_PUBLIC_ENTRANCE.md](../../../docs/CUP_PUBLIC_ENTRANCE.md) and [docs/CUP_HUB_CUTOVER.md](../../../docs/CUP_HUB_CUTOVER.md).

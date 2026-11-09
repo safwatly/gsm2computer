@@ -2,6 +2,7 @@ package com.gsm2computer.bridge
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.gsm2computer.bridge.diag.HubLinkGrace
 
 /**
  * Hub stream settings: where bridged call audio is sent (WebSocket transport)
@@ -14,10 +15,16 @@ object BridgeConfig {
     const val KEY_AUTOCONNECT = "autoconnect"
     const val KEY_STREAM_ENABLED = "stream_enabled"
     const val KEY_HUB_CONTROL_URL = "hub_control_url"
+    const val KEY_HUB_ENDPOINTS = "hub_endpoints"
+    const val KEY_DEVICE_TOKEN = "device_token"
+
+    /** Last hub URL consumed from [com.gsm2computer.bridge.HubControlUrl.DROP_FILE]. */
+    const val KEY_HUB_URL_DROP = "hub_control_url_drop"
     const val KEY_STREAM_TOKEN_URL = "stream_token_url"
     const val KEY_STREAM_MODEL = "stream_model"
     const val KEY_STREAM_VOICE = "stream_voice"
     const val KEY_HUB_OWNED_SESSION = "hub_owned_session"
+    const val KEY_HUB_LINK_GRACE_MS = "hub_link_grace_ms"
 
     const val DEFAULT_AUTOCONNECT = true
     val defaultStreamEnabled: Boolean get() = BuildConfig.DEFAULT_STREAM_ENABLED
@@ -35,6 +42,31 @@ object BridgeConfig {
         } else {
             DEFAULT_AUTOCONNECT
         }
+
+    fun resolveEndpointUrls(prefs: SharedPreferences): List<String> {
+        val explicit = if (prefs.contains(KEY_HUB_ENDPOINTS)) {
+            prefs.getString(KEY_HUB_ENDPOINTS, "")
+        } else {
+            null
+        }
+        val legacy = if (prefs.contains(KEY_HUB_CONTROL_URL)) {
+            prefs.getString(KEY_HUB_CONTROL_URL, "")
+        } else {
+            null
+        }
+        return HubEndpoints.resolveEndpointUrls(explicit, legacy, BuildConfig.DEFAULT_HUB_ENDPOINTS)
+    }
+
+    fun resolveDeviceToken(prefs: SharedPreferences): String {
+        val stored = prefs.getString(KEY_DEVICE_TOKEN, null)?.trim().orEmpty()
+        if (stored.isNotEmpty()) return stored
+        return BuildConfig.DEFAULT_DEVICE_TOKEN.trim()
+    }
+
+    fun resolveEndpoints(prefs: SharedPreferences): List<HubEndpoint> {
+        val token = resolveDeviceToken(prefs)
+        return resolveEndpointUrls(prefs).map { HubEndpoint(it, token) }
+    }
 
     fun resolveHubControlUrl(prefs: SharedPreferences): String {
         if (prefs.contains(KEY_HUB_CONTROL_URL)) {
@@ -58,6 +90,7 @@ object BridgeConfig {
         }
         if (!on) return false
         return resolveStreamTokenUrl(prefs).isNotBlank() ||
+            resolveEndpointUrls(prefs).isNotEmpty() ||
             resolveHubControlUrl(prefs).isNotBlank()
     }
 
@@ -69,13 +102,24 @@ object BridgeConfig {
         prefs.getString(KEY_STREAM_VOICE, null)?.takeIf { it.isNotBlank() }
             ?: defaultStreamVoice
 
+    /**
+     * How long to keep the GSM call while the hub websocket is retried.
+     * `0` disables the hold and tears the call down on the first failure.
+     */
+    fun resolveHubLinkGraceMs(prefs: SharedPreferences): Long {
+        if (!prefs.contains(KEY_HUB_LINK_GRACE_MS)) return HubLinkGrace.DEFAULT_GRACE_MS
+        return prefs.getLong(KEY_HUB_LINK_GRACE_MS, HubLinkGrace.DEFAULT_GRACE_MS)
+            .coerceIn(0L, 180_000L)
+    }
+
     fun resolveHubOwnedSession(prefs: SharedPreferences): Boolean {
         val stored = if (prefs.contains(KEY_HUB_OWNED_SESSION)) {
             prefs.getBoolean(KEY_HUB_OWNED_SESSION, true)
         } else {
             null
         }
-        return HubEndpoints.hubOwnedSession(resolveHubControlUrl(prefs), stored)
+        val hub = resolveEndpointUrls(prefs).firstOrNull() ?: resolveHubControlUrl(prefs)
+        return HubEndpoints.hubOwnedSession(hub, stored)
     }
 
     fun isConfigured(prefs: SharedPreferences): Boolean =
@@ -85,19 +129,23 @@ object BridgeConfig {
         val autoconnect: Boolean,
         val streamEnabled: Boolean,
         val hubControlUrl: String,
+        val endpoints: List<HubEndpoint>,
         val streamTokenUrl: String,
         val streamModel: String,
         val streamVoice: String,
         val hubOwnedSession: Boolean,
+        val hubLinkGraceMs: Long,
     )
 
     fun resolve(prefs: SharedPreferences): Resolved = Resolved(
         autoconnect = resolveAutoconnect(prefs),
         streamEnabled = resolveStreamEnabled(prefs),
         hubControlUrl = resolveHubControlUrl(prefs),
+        endpoints = resolveEndpoints(prefs),
         streamTokenUrl = resolveStreamTokenUrl(prefs),
         streamModel = resolveStreamModel(prefs),
         streamVoice = resolveStreamVoice(prefs),
         hubOwnedSession = resolveHubOwnedSession(prefs),
+        hubLinkGraceMs = resolveHubLinkGraceMs(prefs),
     )
 }

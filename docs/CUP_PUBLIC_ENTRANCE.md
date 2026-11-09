@@ -1,6 +1,6 @@
 # Public phone entrance on cup
 
-Hub-side of the direct path. The phone keeps using Tailscale until the bridge client (step 3) sends `X-Gsm-Device-Token`. Pulling this code and restarting the hub **without** the new environment variables does not change the Tailscale listener.
+Hub-side of the direct path. The bridge walks `wss://gsm.ta3leam.com/` then `ws://100.113.222.47:8787/` and sends `X-Gsm-Device-Token` on both. Pulling this code and restarting the hub **without** the new environment variables does not change the Tailscale listener.
 
 Cup: public `62.83.35.197`, Tailscale `100.113.222.47`. Nothing in this repo already points a DNS name at that public address. Use a grey-cloud name on `ta3leam.com`. These steps use `gsm.ta3leam.com`.
 
@@ -22,7 +22,7 @@ One connection routine, origins in order: public, then Tailscale.
 |---|---|---|
 | Origin | `https://gsm.ta3leam.com` | `http://100.113.222.47:8787` (or the MagicDNS host) |
 | WebSocket | `wss://gsm.ta3leam.com/` | `ws://100.113.222.47:8787/` |
-| Device header | `X-Gsm-Device-Token: <secret>` on **every** request | omit until you are ready to require it |
+| Device header | `X-Gsm-Device-Token: <secret>` on **every** request | the bridge sends the same header. A missing token is still allowed until `GSM2COMPUTER_TAILSCALE_TOKEN_REQUIRED=1` |
 | Ephemeral bearer | still `Authorization: Bearer <POST /token value>` if the current client fetches `/token` | unchanged (`Bearer hub-token`). This is **not** the device secret |
 
 Phone routes, same paths as today:

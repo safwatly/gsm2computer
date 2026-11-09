@@ -352,6 +352,43 @@ class HubIngestTests(unittest.TestCase):
         self.assertIsNone(none_cmd)
         self.assertEqual(len(self.store.list_messages("+15559876")), 3)
 
+    def test_repeat_client_id_is_one_message_and_skips_the_command(self) -> None:
+        from portal_sms import ingest_inbound_sms
+
+        published: list[str] = []
+
+        class RecordingBus:
+            def publish(self, event_type: str, data: dict) -> None:
+                published.append(event_type)
+
+        bus = RecordingBus()
+        first, command = ingest_inbound_sms(
+            self.store,
+            bus,
+            {
+                "from": "+15559876",
+                "body": "MODE openclaw",
+                "receivedAt": "2026-09-09T12:00:00Z",
+                "clientId": "sms-1",
+            },
+        )
+        self.assertEqual(command, "openclaw")
+        self.assertNotIn("duplicate", first)
+        again, again_command = ingest_inbound_sms(
+            self.store,
+            bus,
+            {
+                "from": "+15559876",
+                "body": "MODE openclaw",
+                "receivedAt": "2026-09-09T12:00:00Z",
+                "clientId": "sms-1",
+            },
+        )
+        self.assertTrue(again["duplicate"])
+        self.assertIsNone(again_command)
+        self.assertEqual(len(self.store.list_messages("+15559876")), 1)
+        self.assertEqual(published, ["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

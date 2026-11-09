@@ -40,6 +40,22 @@ class BuildConfigTest {
     }
 
     @Test
+    fun releaseSigningReadsTheUploadKeystoreFromTheEnvironment() {
+        assertTrue(
+            "GSM2COMPUTER_STORE_FILE must select the upload keystore",
+            gradleScript.contains("GSM2COMPUTER_STORE_FILE"),
+        )
+        assertTrue(
+            "an unset store file must fall back to the debug keystore",
+            gradleScript.contains(".android/debug.keystore"),
+        )
+        assertTrue(
+            gradleScript.contains("GSM2COMPUTER_STORE_PASSWORD") &&
+                gradleScript.contains("local.properties"),
+        )
+    }
+
+    @Test
     fun defaultHubControlUrlPointsAtTailscaleHub() {
         assertTrue(
             "DEFAULT_HUB_CONTROL_URL must point at the Tailscale hub",

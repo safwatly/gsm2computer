@@ -151,7 +151,17 @@ def ingest_inbound_sms(
     }
     from_raw = str(payload.get("from") or "")
     body_text = str(payload.get("body") or "")
+    client_id = str(payload.get("clientId") or "").strip()[:80]
     if from_raw.strip():
-        msg = store.add_message("in", from_raw, body_text, ts=str(received), status="received")
-        events.publish("message", msg)
+        _msg, created = store.add_inbound_message(
+            from_raw,
+            body_text,
+            ts=str(received),
+            status="received",
+            client_id=client_id or None,
+        )
+        if not created:
+            log_entry["duplicate"] = True
+            return log_entry, None
+        events.publish("message", _msg)
     return log_entry, parse_sms_command(body_text)

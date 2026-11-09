@@ -1,5 +1,7 @@
 package com.gsm2computer.bridge.rtp
 
+import com.gsm2computer.bridge.HubLink
+
 /**
  * Pluggable audio wire for [RtpSession].
  *
@@ -33,6 +35,9 @@ interface MediaTransport {
     /** Close the transport. */
     fun stop()
 
+    /** Which entrance the live socket is on. Empty until the handshake opens. */
+    fun currentLink(): HubLink = HubLink()
+
     /** Callbacks from the transport into the owning [RtpSession]. */
     interface Sink {
         /** Inbound agent audio. [format] is `audio/pcm` or `audio/pcmu`. */
@@ -46,6 +51,15 @@ interface MediaTransport {
 
         /** Transport-level status line for the in-app log/stats viewer. */
         fun onStatus(msg: String)
+
+        /**
+         * Hub link dropped and the transport is retrying.
+         * The GSM call stays up; inbound audio simply stops until [holding] is false.
+         */
+        fun onLinkHold(holding: Boolean, detail: String) {}
+
+        /** 338: hub downlink sequence number of the next onAudio frame (-1 = none). */
+        fun onSeq(seq: Int) {}
 
         /** Fatal transport error — the session should tear the call down. */
         fun onError(msg: String)

@@ -105,7 +105,11 @@ class MicIsolationGuard(
         }
         val bufSize = minBuf.coerceAtLeast(frameBytes)
 
-        val sources = if (profile.routing.playbackToTelephony) {
+        // VOICE_CALL mixes in the caller's downlink, so on profiles that capture
+        // VOICE_DOWNLINK (or inject to telephony) it would flag caller noise as a
+        // mic leak. Measure the physical MIC there instead.
+        val sources = if (profile.routing.playbackToTelephony ||
+            profile.routing.captureSource == MediaRecorder.AudioSource.VOICE_DOWNLINK) {
             // VOICE_CALL captures modem downlink on Pixel — not the physical mic.
             listOf(MediaRecorder.AudioSource.MIC to "MIC")
         } else {

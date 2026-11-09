@@ -72,6 +72,14 @@ class DeviceProfileTest {
     }
 
     @Test
+    fun `match returns moto g84 for holi board before generic qualcomm`() {
+        val p = DeviceProfile.match(hints(hw = "qcom", board = "holi"))
+        assertEquals(DeviceProfile.motoG84Holi().name, p.name)
+        assertEquals(false, p.routing.requireSpeakerMode)
+        assertEquals(false, p.mixer.mixerSetupCmd.contains("Voice Rx Device Mute"))
+    }
+
+    @Test
     fun `match returns genericQualcomm for qcom hardware`() {
         val p = DeviceProfile.match(hints(hw = "qcom"))
         assertEquals("Generic Qualcomm", p.name)

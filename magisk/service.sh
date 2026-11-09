@@ -95,6 +95,7 @@ appops set --uid "$PKG" RECORD_AUDIO allow 2>/dev/null
 appops set "$PKG" RECORD_AUDIO allow 2>/dev/null && \
     log -t "$TAG" "appops RECORD_AUDIO: forced allow (--uid + pkg)" || \
     log -t "$TAG" "appops RECORD_AUDIO: failed to set"
+appops set "$PKG" RECORD_INCOMING_PHONE_AUDIO allow 2>/dev/null; appops set --uid "$PKG" RECORD_INCOMING_PHONE_AUDIO allow 2>/dev/null
 
 # Verification: wait 5 seconds and confirm the mode stuck.
 (
@@ -179,3 +180,14 @@ done
 # Log install location for debugging
 log -t "$TAG" "APK path: $APK_PATH"
 log -t "$TAG" "Priv-app: $(ls -la $PRIV_APK 2>/dev/null || echo 'missing')"
+
+# ── Moto g84 (holi) fallback: keep speaker amps + earpiece DAC off in calls ──
+if [ "$(getprop ro.board.platform)" = "holi" ] && [ -f "$MODDIR/moto-callmute.sh" ]; then
+    cp "$MODDIR/moto-callmute.sh" /data/local/tmp/moto-callmute.sh
+    chmod 755 /data/local/tmp/moto-callmute.sh
+    OLD=$(cat /data/local/tmp/moto-callmute.pid 2>/dev/null)
+    if [ -z "$OLD" ] || ! grep -q moto-callmute /proc/$OLD/cmdline 2>/dev/null; then
+        setsid /data/local/tmp/moto-callmute.sh </dev/null >/dev/null 2>&1 &
+        log -t "$TAG" "moto-callmute watcher started"
+    fi
+fi

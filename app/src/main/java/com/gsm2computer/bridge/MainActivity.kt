@@ -27,7 +27,9 @@ import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.ViewModelProvider
 import com.gsm2computer.bridge.BridgeConfig
+import com.gsm2computer.bridge.config.HubControlInjector
 import com.gsm2computer.bridge.gsm.GsmCallManager
+import kotlin.concurrent.thread
 import com.gsm2computer.bridge.service.GatewayService
 import com.gsm2computer.bridge.ui.CallsFragment
 import com.gsm2computer.bridge.ui.DialerFragment
@@ -304,8 +306,14 @@ class MainActivity : AppCompatActivity(), GatewayHost {
         requestBatteryOptimizationExemption()
         requestDefaultDialerRole()
 
-        // Auto-start gateway if autoconnect enabled and credentials configured
-        autoStartGateway()
+        // Drop file first so a wiped prefs store picks up the tunnel URL
+        // before the bridge auto-starts.
+        thread(name = "hub-url") {
+            HubControlInjector.applyDropFile(applicationContext, reload = false)
+            runOnUiThread {
+                if (!isDestroyed) autoStartGateway()
+            }
+        }
 
         handleIntent(intent)
     }

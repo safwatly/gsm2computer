@@ -1,33 +1,39 @@
 #!/usr/bin/env bash
-# Hub-side equivalent of the PR #28 drive.
-# PR #28 runs Android HubPathReleaseTest against a live hub. This branch does
-# not contain the bridge. The unittest speaks the same contract: POST /token
-# and the WebSocket on one origin, the device token, X-Gsm-Call-Session,
-# 409 without superseding, POST /calls path stamping, G2 uplink, grokbot mode.
-# PipeWire and patchbay are stubbed. Cup and the phone are not contacted.
+# Place one call on the public entrance and one on the Tailscale entrance
+# using the bridge's HubConnectionRoutine. Fails unless both succeed.
+# Does not touch cup or a phone. Needs the isolated hub (PipeWire null sinks).
 set -euo pipefail
+
 ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
+STATE=${GSM2COMPUTER_VERIFY_STATE:-/tmp/gsm2computer-bridge-paths}
 EVIDENCE=${GSM2COMPUTER_VERIFY_EVIDENCE:-/opt/cursor/artifacts/verify-gsm2computer}
-mkdir -p "$EVIDENCE"
+# Dedicated ports so this does not attach to a hub the rest of the skill
+# already started on 18787/18790.
+export GSM2COMPUTER_VERIFY_STATE="$STATE"
+export GSM2COMPUTER_VERIFY_EVIDENCE="$EVIDENCE"
+export GSM2COMPUTER_VERIFY_TAILSCALE_PORT=${GSM2COMPUTER_VERIFY_TAILSCALE_PORT:-18987}
+export GSM2COMPUTER_VERIFY_PUBLIC_PORT=${GSM2COMPUTER_VERIFY_PUBLIC_PORT:-18990}
+export GSM2COMPUTER_BRIDGE_PATH_RELEASE=1
+
+mkdir -p "$STATE" "$EVIDENCE"
+rm -f "$EVIDENCE/bridge-paths.json"
+
+if [[ -f "$STATE/hub.pid" ]] && kill -0 "$(cat "$STATE/hub.pid")" 2>/dev/null; then
+  echo "reusing hub pid $(cat "$STATE/hub.pid") ($STATE)"
+else
+  bash "$ROOT/.cursor/skills/verify-gsm2computer/scripts/launch-hub.sh"
+fi
+
 cd "$ROOT"
-python3 -m unittest hub.tests.test_reconcile_interactions
+./gradlew :app:testDebugUnitTest --tests com.gsm2computer.bridge.HubPathReleaseTest --no-daemon
+
 python3 - "$EVIDENCE/bridge-paths.json" <<'PY'
 import json
 import sys
-from pathlib import Path
 
-path = Path(sys.argv[1])
-report = {
-    "ok": True,
-    "driver": "hub.tests.test_reconcile_interactions",
-    "public": "POST /token + WS, G2 uplink, entrance=public",
-    "tailscale": "relink with X-Gsm-Call-Session, entrance=tailscale, POST /calls path=tailscale",
-    "failover": "409 without a session id does not supersede the live call",
-    "relink": "same session id after the public socket drops",
-    "g2": "binary G2 uplink offered on the public socket",
-    "grokbot": "session.talk=grokbot and call.path=public on the public socket",
-}
-path.write_text(json.dumps(report, indent=2) + "\n")
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    report = json.load(handle)
 required = ("public", "tailscale", "failover", "relink")
 missing = [key for key in required if not report.get(key)]
 if not report.get("ok") or missing:

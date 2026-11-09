@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 # Push hub-stream settings into the phone app's SharedPreferences.
+# To rotate only the tunnel URL on a running phone, use scripts/set-hub-url.sh
+# (drop file + broadcast). This script rewrites the prefs XML and needs a
+# process restart before the running bridge sees it.
 #
 # Usage:
-#   HUB_CONTROL_URL=http://hub.mining-ling.ts.net:8787 ./scripts/configure-bridge.sh --force -s <serial>
+#   HUB_ENDPOINTS=$'wss://gsm.ta3leam.com/\nws://100.113.222.47:8787/' \
+#     ./scripts/configure-bridge.sh --force -s <serial>
 #
 # Environment:
-#   HUB_CONTROL_URL             hub origin (default: Tailscale http://hub.mining-ling.ts.net:8787)
-#   STREAM_TOKEN_URL            token endpoint (default: {HUB_CONTROL_URL}/token)
+#   HUB_ENDPOINTS               newline-separated hub URLs (default: public, then Tailscale)
+#   HUB_CONTROL_URL             legacy single origin. Used as the only endpoint when
+#                               HUB_ENDPOINTS is unset and this is set.
+#   DEVICE_TOKEN                X-Gsm-Device-Token. Printed as set or unset, never the value.
+#   STREAM_TOKEN_URL            token endpoint (default: {first endpoint}/token)
 #   STREAM_ENABLED=true|false   (default: true when hub or token URL set)
 #   STREAM_MODEL                OpenAI only (default: gpt-realtime)
 #   STREAM_VOICE                OpenAI only (default: marin)
@@ -22,7 +29,7 @@ PKG="com.gsm2computer.bridge"
 PREFS="gsm2computer"
 FORCE=false
 SERIAL=""
-DEFAULT_HUB="http://hub.mining-ling.ts.net:8787"
+DEFAULT_ENDPOINTS=$'wss://gsm.ta3leam.com/\nws://100.113.222.47:8787/'
 
 usage() {
   echo "Usage: $0 [--force] [-s SERIAL]" >&2
@@ -41,7 +48,21 @@ done
 ADB=(adb)
 [[ -n "$SERIAL" ]] && ADB=(adb -s "$SERIAL")
 
-HUB_CONTROL_URL="${HUB_CONTROL_URL:-$DEFAULT_HUB}"
+if [[ -z "${HUB_ENDPOINTS+x}" ]]; then
+  if [[ -n "${HUB_CONTROL_URL:-}" ]]; then
+    HUB_ENDPOINTS="$HUB_CONTROL_URL"
+  else
+    HUB_ENDPOINTS="$DEFAULT_ENDPOINTS"
+  fi
+fi
+FIRST_ENDPOINT="${HUB_ENDPOINTS%%$'\n'*}"
+HUB_CONTROL_URL="${HUB_CONTROL_URL:-$FIRST_ENDPOINT}"
+DEVICE_TOKEN="${DEVICE_TOKEN:-}"
+if [[ -n "$DEVICE_TOKEN" ]]; then
+  echo "device token: set"
+else
+  echo "device token: unset"
+fi
 STREAM_MODEL="${STREAM_MODEL:-gpt-realtime}"
 STREAM_VOICE="${STREAM_VOICE:-marin}"
 AUTOCONNECT="${AUTOCONNECT:-true}"
@@ -71,6 +92,8 @@ cat >"$TMP" <<EOF
   <boolean name="autoconnect" value="$AUTOCONNECT" />
   <boolean name="stream_enabled" value="$STREAM_ENABLED" />
   <boolean name="hub_owned_session" value="$HUB_OWNED_SESSION" />
+  <string name="hub_endpoints">$(printf '%s' "$HUB_ENDPOINTS" | sed 's/&/\&amp;/g; s/</\&lt;/g')</string>
+  <string name="device_token">$(printf '%s' "$DEVICE_TOKEN" | sed 's/&/\&amp;/g; s/</\&lt;/g')</string>
   <string name="hub_control_url">$HUB_CONTROL_URL</string>
   <string name="stream_token_url">$STREAM_TOKEN_URL</string>
   <string name="stream_model">$STREAM_MODEL</string>

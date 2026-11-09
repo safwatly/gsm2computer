@@ -8,17 +8,99 @@
 # Usage:
 #   ./build.sh          # Build debug APK + Magisk module
 #   ./build.sh release  # Build release APK + Magisk module
+#   ./build.sh release --expect-cert <sha256>
+#
+# `release` fails if the APK signer is the Android debug certificate.
+# GSM2COMPUTER_EXPECT_CERT is the same check as --expect-cert.
 #
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── Source environment if available ──────────────────
+# Replace sdk.dir, or append it. Every other line stays, including
+# GSM2COMPUTER_* signing keys. Rewriting the file with `>` drops those keys
+# and the release build then signs with the debug certificate.
+write_sdk_dir() {
+    local file="$1"
+    local sdk_dir="$2"
+    local tmp
+    tmp="$(mktemp)"
+    if [ -f "$file" ]; then
+        awk -v sdk="$sdk_dir" '
+            BEGIN { found = 0 }
+            /^[[:space:]]*sdk\.dir[[:space:]]*=/ {
+                if (!found) print "sdk.dir=" sdk
+                found = 1
+                next
+            }
+            { print }
+            END { if (!found) print "sdk.dir=" sdk }
+        ' "$file" > "$tmp"
+    else
+        printf 'sdk.dir=%s\n' "$sdk_dir" > "$tmp"
+    fi
+    mv "$tmp" "$file"
+}
 
-if [ -f "$SCRIPT_DIR/.env.build" ]; then
-    source "$SCRIPT_DIR/.env.build"
-fi
+normalize_cert_sha() {
+    printf '%s' "$1" | tr -d '[:space:]:' | tr 'A-F' 'a-f'
+}
+
+apk_signer_sha256() {
+    local apk="$1"
+    local signer="$2"
+    "$signer" verify --print-certs "$apk" 2>/dev/null \
+        | awk -F': ' '/SHA-256 digest:/ { print $2; exit }'
+}
+
+debug_keystore_sha256() {
+    local ks="${1:-$HOME/.android/debug.keystore}"
+    if [ ! -f "$ks" ] || ! command -v keytool >/dev/null 2>&1; then
+        return 0
+    fi
+    keytool -list -v -keystore "$ks" -storepass android -alias androiddebugkey 2>/dev/null \
+        | awk -F': ' '/SHA256:/ { print $2; exit }' || true
+}
+
+# Print the signer SHA-256. A release signed with the debug cert fails.
+# expect_sha (or GSM2COMPUTER_EXPECT_CERT, passed in) must match when set.
+# Returns 1 on a mismatch. Does not exit, so tests can call it.
+assert_signer() {
+    local build_type="$1"
+    local signer_sha="$2"
+    local store_file="$3"
+    local expect_sha="${4:-}"
+    local norm_signer norm_expect debug_sha debug_ks
+    norm_signer="$(normalize_cert_sha "$signer_sha")"
+    echo "Signer SHA-256: $norm_signer"
+    debug_ks="${HOME}/.android/debug.keystore"
+    local is_debug=0
+    if [ -z "$store_file" ] || [ "$store_file" = "$debug_ks" ]; then
+        is_debug=1
+    else
+        debug_sha="$(debug_keystore_sha256 "$debug_ks")"
+        if [ -n "$debug_sha" ] && [ "$norm_signer" = "$(normalize_cert_sha "$debug_sha")" ]; then
+            is_debug=1
+        fi
+    fi
+    if [ "$build_type" = "release" ] && [ "$is_debug" = 1 ]; then
+        echo "ERROR: release build is signed with the Android debug certificate." >&2
+        echo "Signer SHA-256: $norm_signer" >&2
+        echo "A deployable 345 needs the upload keystore. Set GSM2COMPUTER_STORE_FILE" >&2
+        echo "in the environment or local.properties (see README)." >&2
+        echo "Pin it with --expect-cert or GSM2COMPUTER_EXPECT_CERT." >&2
+        return 1
+    fi
+    if [ -n "$expect_sha" ]; then
+        norm_expect="$(normalize_cert_sha "$expect_sha")"
+        if [ "$norm_signer" != "$norm_expect" ]; then
+            echo "ERROR: signer SHA-256 $norm_signer does not match expected $norm_expect" >&2
+            return 1
+        fi
+        echo "Signer SHA-256 matches expected cert"
+    fi
+    return 0
+}
 
 # ── Check prerequisites ──────────────────────────────
 
@@ -63,8 +145,8 @@ check_android_sdk() {
         exit 1
     fi
 
-    # Ensure local.properties exists
-    echo "sdk.dir=$ANDROID_HOME" > local.properties
+    # Keep GSM2COMPUTER_* lines. Only sdk.dir is rewritten.
+    write_sdk_dir "$SCRIPT_DIR/local.properties" "$ANDROID_HOME"
     echo "Android SDK: $ANDROID_HOME"
 }
 
@@ -137,7 +219,7 @@ build_apk() {
         # Sign the APK so it can be installed/updated as a system priv-app.
         # An unsigned release build fails pm install with NO_CERTIFICATES and
         # cannot be used as the basis for a Magisk priv-app overlay update.
-        sign_apk "$SCRIPT_DIR/gateway.apk"
+        sign_apk "$SCRIPT_DIR/gateway.apk" "$BUILD_TYPE"
     else
         echo "ERROR: APK not found at $APK_PATH"
         exit 1
@@ -148,6 +230,7 @@ build_apk() {
 
 sign_apk() {
     local APK="$1"
+    local SIGN_BUILD_TYPE="${2:-${BUILD_TYPE:-debug}}"
     local APKSIGNER=""
     for candidate in \
         "$ANDROID_HOME/build-tools"/*/apksigner \
@@ -157,18 +240,73 @@ sign_apk() {
         if [ -x "$candidate" ] 2>/dev/null; then APKSIGNER="$candidate"; break; fi
     done
     if [ -z "$APKSIGNER" ]; then
+        if [ "$SIGN_BUILD_TYPE" = "release" ]; then
+            echo "ERROR: apksigner not found; refusing an unsigned release APK" >&2
+            return 1
+        fi
         echo "WARNING: apksigner not found; APK left unsigned (priv-app install will fail)"
         return 0
     fi
-    local KS="${GATEWAY_KEYSTORE:-$HOME/.android/debug.keystore}"
+    local KS ALIAS
+    KS="$(gsm_signing GSM2COMPUTER_STORE_FILE)"
+    if [ -z "$KS" ]; then
+        KS="${GATEWAY_KEYSTORE:-$HOME/.android/debug.keystore}"
+        export GSM2COMPUTER_STORE_PASSWORD=android
+        export GSM2COMPUTER_KEY_PASSWORD=android
+        ALIAS=androiddebugkey
+        echo "Signing with the debug keystore (set GSM2COMPUTER_STORE_FILE for a deployable build)"
+    else
+        export GSM2COMPUTER_STORE_PASSWORD="$(gsm_signing GSM2COMPUTER_STORE_PASSWORD)"
+        export GSM2COMPUTER_KEY_PASSWORD="$(gsm_signing GSM2COMPUTER_KEY_PASSWORD)"
+        ALIAS="$(gsm_signing GSM2COMPUTER_KEY_ALIAS)"
+        ALIAS="${ALIAS:-androiddebugkey}"
+        if [ -z "$GSM2COMPUTER_STORE_PASSWORD" ] || [ -z "$GSM2COMPUTER_KEY_PASSWORD" ]; then
+            echo "ERROR: GSM2COMPUTER_STORE_PASSWORD and GSM2COMPUTER_KEY_PASSWORD are required" >&2
+            echo "Put them in local.properties or the environment. Do not commit them." >&2
+            exit 1
+        fi
+        echo "Signing with $KS alias $ALIAS"
+    fi
     if [ ! -f "$KS" ]; then
+        if [ "$SIGN_BUILD_TYPE" = "release" ]; then
+            echo "ERROR: keystore not found at $KS; refusing an unsigned release APK" >&2
+            return 1
+        fi
         echo "WARNING: keystore not found at $KS; APK left unsigned"
         return 0
     fi
     echo "Signing APK with $APKSIGNER ..."
-    "$APKSIGNER" sign --ks "$KS" --ks-pass pass:android \
-        --key-pass pass:android --ks-key-alias androiddebugkey "$APK" \
-        && echo "APK signed" || echo "WARNING: APK signing failed"
+    if ! "$APKSIGNER" sign --ks "$KS" \
+        --ks-pass env:GSM2COMPUTER_STORE_PASSWORD \
+        --key-pass env:GSM2COMPUTER_KEY_PASSWORD \
+        --ks-key-alias "$ALIAS" "$APK"; then
+        echo "ERROR: APK signing failed" >&2
+        return 1
+    fi
+    echo "APK signed"
+    local sha
+    sha="$(apk_signer_sha256 "$APK" "$APKSIGNER")"
+    if [ -z "$sha" ]; then
+        echo "ERROR: apksigner did not print a signer SHA-256 for $APK" >&2
+        return 1
+    fi
+    assert_signer "$SIGN_BUILD_TYPE" "$sha" "$KS" "${EXPECT_CERT:-}"
+}
+
+# Env wins over gitignored local.properties. Prints the value only.
+gsm_signing() {
+    local key="$1"
+    local value="${!key:-}"
+    if [ -n "$value" ]; then
+        printf '%s' "$value"
+        return 0
+    fi
+    local file="$SCRIPT_DIR/local.properties"
+    if [ -f "$file" ]; then
+        local line
+        line="$(grep -m1 "^${key}=" "$file" || true)"
+        printf '%s' "${line#*=}"
+    fi
 }
 
 # ── Build Magisk module ─────────────────────────────
@@ -266,29 +404,74 @@ install_to_device() {
 
 # ── Main ─────────────────────────────────────────────
 
-echo "=== GSM2Computer Bridge Build ==="
-echo ""
+main() {
+    cd "$SCRIPT_DIR"
+    if [ -f "$SCRIPT_DIR/.env.build" ]; then
+        # shellcheck disable=SC1091
+        source "$SCRIPT_DIR/.env.build"
+    fi
 
-check_java
-check_android_sdk
-check_gradle_wrapper
+    echo "=== GSM2Computer Bridge Build ==="
+    echo ""
 
-BUILD_TYPE="${1:-debug}"
-build_apk "$BUILD_TYPE"
-build_magisk
-install_to_device
+    BUILD_TYPE="debug"
+    EXPECT_CERT="${GSM2COMPUTER_EXPECT_CERT:-}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --expect-cert)
+                EXPECT_CERT="${2:-}"
+                if [ -z "$EXPECT_CERT" ]; then
+                    echo "ERROR: --expect-cert needs a SHA-256" >&2
+                    exit 1
+                fi
+                shift 2
+                ;;
+            --expect-cert=*)
+                EXPECT_CERT="${1#*=}"
+                if [ -z "$EXPECT_CERT" ]; then
+                    echo "ERROR: --expect-cert needs a SHA-256" >&2
+                    exit 1
+                fi
+                shift
+                ;;
+            release|debug)
+                BUILD_TYPE="$1"
+                shift
+                ;;
+            *)
+                echo "ERROR: unknown arg: $1" >&2
+                echo "Usage: $0 [debug|release] [--expect-cert SHA256]" >&2
+                exit 1
+                ;;
+        esac
+    done
+    export EXPECT_CERT
+    export BUILD_TYPE
 
-echo ""
-echo "=== Build complete ==="
-echo "  APK:    $SCRIPT_DIR/gateway.apk"
-echo "  Magisk: $SCRIPT_DIR/gateway-magisk.zip"
-echo ""
-echo "Deploy to device:"
-echo "  1. adb push gateway-magisk.zip /sdcard/"
-echo "     Install via Magisk Manager -> Modules, then reboot"
-echo "     (APK is included in the module as a priv-app)"
-echo "  2. After reboot: open app, grant permissions, set as default phone app"
-echo "  3. Enter hub stream URL in Settings, tap START"
-echo ""
-echo "NOTE: Do NOT also 'adb install' — the Magisk module installs the APK"
-echo "      as a privileged system app with CAPTURE_AUDIO_OUTPUT permission."
+    check_java
+    check_android_sdk
+    check_gradle_wrapper
+
+    build_apk "$BUILD_TYPE"
+    build_magisk
+    install_to_device
+
+    echo ""
+    echo "=== Build complete ==="
+    echo "  APK:    $SCRIPT_DIR/gateway.apk"
+    echo "  Magisk: $SCRIPT_DIR/gateway-magisk.zip"
+    echo ""
+    echo "Deploy to device:"
+    echo "  1. adb push gateway-magisk.zip /sdcard/"
+    echo "     Install via Magisk Manager -> Modules, then reboot"
+    echo "     (APK is included in the module as a priv-app)"
+    echo "  2. After reboot: open app, grant permissions, set as default phone app"
+    echo "  3. Enter hub stream URL in Settings, tap START"
+    echo ""
+    echo "NOTE: Do NOT also 'adb install' — the Magisk module installs the APK"
+    echo "      as a privileged system app with CAPTURE_AUDIO_OUTPUT permission."
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -266,6 +266,13 @@ class PortalStore:
             link_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(call_link_events)")}
             if "entrance" not in link_columns:
                 self._conn.execute("ALTER TABLE call_link_events ADD COLUMN entrance TEXT")
+            message_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(messages)")}
+            if "client_id" not in message_columns:
+                self._conn.execute("ALTER TABLE messages ADD COLUMN client_id TEXT")
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS messages_client_id "
+                "ON messages (client_id) WHERE client_id IS NOT NULL AND client_id != ''"
+            )
             self._conn.commit()
 
     def close(self) -> None:
@@ -297,6 +304,75 @@ class PortalStore:
             )
             self._conn.commit()
         return item
+
+    def message_by_client_id(self, client_id: str) -> Optional[dict[str, Any]]:
+        client = (client_id or "").strip()
+        if not client:
+            return None
+        with self._lock:
+            return self._lookup_client_id(client)
+
+    def add_inbound_message(
+        self,
+        peer: str,
+        body: str,
+        ts: Optional[str] = None,
+        status: str = "received",
+        client_id: Optional[str] = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Insert one inbound SMS. Returns (row, created).
+
+        A repeat of the same [client_id] returns the stored row and created=False
+        so a lost response can be retried on the other entrance without a second
+        message, webhook, or switchboard command.
+        """
+        client = (client_id or "").strip()[:80] or None
+        peer_n = normalize_e164(peer) or peer.strip()
+        item = {
+            "id": str(uuid.uuid4()),
+            "direction": "in",
+            "peer": peer_n,
+            "body": body if body is not None else "",
+            "ts": ts or utc_now(),
+            "status": status,
+        }
+        with self._lock:
+            if client:
+                existing = self._lookup_client_id(client)
+                if existing is not None:
+                    return existing, False
+            try:
+                self._conn.execute(
+                    "INSERT INTO messages (id, direction, peer, body, ts, status, client_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        item["id"],
+                        item["direction"],
+                        item["peer"],
+                        item["body"],
+                        item["ts"],
+                        item["status"],
+                        client,
+                    ),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
+                if client:
+                    existing = self._lookup_client_id(client)
+                    if existing is not None:
+                        return existing, False
+                raise
+        return item, True
+
+    def _lookup_client_id(self, client_id: str) -> Optional[dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT id, direction, peer, body, ts, status FROM messages WHERE client_id = ?",
+            (client_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_message(row)
 
     def list_threads(self) -> list[dict[str, Any]]:
         sql = """
