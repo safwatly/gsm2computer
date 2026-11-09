@@ -13,6 +13,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.time.Instant
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
@@ -51,7 +52,9 @@ object SmsForwarder {
         body: String,
         receivedAt: String,
     ) {
-        val payload = HubEndpoints.smsJson(from, body, receivedAt)
+        // One id for every endpoint this walk tries. The hub stores the first
+        // copy and treats a repeat of the same clientId as the same SMS.
+        val payload = HubEndpoints.smsJson(from, body, receivedAt, UUID.randomUUID().toString())
         val result = HubHttpWalk(http).run(endpoints) { endpoint ->
             Request.Builder()
                 .url(HubEndpoints.smsUrl(HubEndpoints.httpOrigin(endpoint.url)))

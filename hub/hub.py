@@ -2293,37 +2293,42 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 payload = {"raw": body.decode("utf-8", errors="replace")}
             log_entry, command = ingest_inbound_sms(portal_store, portal_events, payload)
             LOG.info("sms %s", json.dumps(log_entry, ensure_ascii=False))
-            # The webhook repeats the SMS text the phone reported. It does not
-            # parse MODE or STATUS and it does not change the switchboard.
-            # Those commands run only on the Tailscale entrance, below.
-            try:
-                from portal_sms import should_wake_cup, format_ops_sms_alert
-                if should_wake_cup(
-                    str(log_entry.get("from") or ""),
-                    str(log_entry.get("body") or ""),
-                ):
-                    post_system_alert(
-                        format_ops_sms_alert(
-                            str(log_entry.get("from") or ""),
-                            str(log_entry.get("body") or ""),
-                            str(log_entry.get("receivedAt") or ""),
-                        )
-                    )
-            except Exception:
-                LOG.warning("ops SMS alert webhook failed", exc_info=True)
-            if command and entrance.name != ENTRANCE_PUBLIC:
-                result = await set_switchboard_mode(command)
-                writer.write(json_response(200, {"ok": True, "sms": log_entry, "routing": result}))
-            elif command:
-                LOG.info(
-                    "sms switchboard command ignored on public entrance: %s",
-                    command,
-                )
-                writer.write(
-                    json_response(200, {"ok": True, "sms": log_entry, "commandIgnored": True})
-                )
+            # A repeated clientId is the same SMS retried on another entrance.
+            # Do not store it again, wake cup, or run the command a second time.
+            if log_entry.get("duplicate"):
+                writer.write(json_response(200, {"ok": True, "sms": log_entry, "duplicate": True}))
             else:
-                writer.write(json_response(200, {"ok": True, "sms": log_entry}))
+                # The webhook repeats the SMS text the phone reported. It does not
+                # parse MODE or STATUS and it does not change the switchboard.
+                # Those commands run only on the Tailscale entrance, below.
+                try:
+                    from portal_sms import should_wake_cup, format_ops_sms_alert
+                    if should_wake_cup(
+                        str(log_entry.get("from") or ""),
+                        str(log_entry.get("body") or ""),
+                    ):
+                        post_system_alert(
+                            format_ops_sms_alert(
+                                str(log_entry.get("from") or ""),
+                                str(log_entry.get("body") or ""),
+                                str(log_entry.get("receivedAt") or ""),
+                            )
+                        )
+                except Exception:
+                    LOG.warning("ops SMS alert webhook failed", exc_info=True)
+                if command and entrance.name != ENTRANCE_PUBLIC:
+                    result = await set_switchboard_mode(command)
+                    writer.write(json_response(200, {"ok": True, "sms": log_entry, "routing": result}))
+                elif command:
+                    LOG.info(
+                        "sms switchboard command ignored on public entrance: %s",
+                        command,
+                    )
+                    writer.write(
+                        json_response(200, {"ok": True, "sms": log_entry, "commandIgnored": True})
+                    )
+                else:
+                    writer.write(json_response(200, {"ok": True, "sms": log_entry}))
         elif method == "POST" and path_only == "/admin/call/release":
             # Emergency CallSlot / stale-bridge release.
             # Refuse while a live call has fresh ws/uplink unless force=1 —

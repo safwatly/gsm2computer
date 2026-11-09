@@ -111,6 +111,12 @@ class HubEndpointsTest {
     }
 
     @Test
+    fun smsJsonIncludesClientIdWhenSet() {
+        val json = HubEndpoints.smsJson("+15551212", "hi", "2026-09-02T17:00:00Z", "sms-1")
+        assertTrue(json.contains("\"clientId\":\"sms-1\""))
+    }
+
+    @Test
     fun callJsonHasRequiredKeysAndOmitsBlanks() {
         val json = HubEndpoints.callJson("in", "+15551212", "2026-09-09T12:00:00Z", 42)
         assertEquals(

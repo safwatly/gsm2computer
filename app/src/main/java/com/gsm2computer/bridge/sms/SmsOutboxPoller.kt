@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.telephony.SmsManager
 import android.util.Log
 import com.gsm2computer.bridge.BridgeConfig
+import com.gsm2computer.bridge.HubEndpoint
 import com.gsm2computer.bridge.HubEndpoints
 import com.gsm2computer.bridge.HubHttpWalk
 import com.gsm2computer.bridge.service.GatewayService
@@ -58,7 +59,7 @@ object SmsOutboxPoller {
             Log.w(TAG, "outbox GET HTTP ${result.code} ${result.detail.take(120)}")
             return
         }
-        val hub = HubEndpoints.httpOrigin(result.url)
+        val endpoint = result.endpoint ?: return
         val items = JSONObject(result.body.ifBlank { "{}" }).optJSONArray("items") ?: JSONArray()
         for (i in 0 until items.length()) {
             val item = items.optJSONObject(i) ?: continue
@@ -66,22 +67,27 @@ object SmsOutboxPoller {
             val to = item.optString("to")
             val body = item.optString("body")
             if (id.isBlank() || to.isBlank()) continue
-            sendAndAck(context, hub, id, to, body)
+            sendAndAck(context, endpoint, id, to, body)
         }
     }
 
-    private fun sendAndAck(context: Context, hub: String, id: String, to: String, body: String) {
-        val ackUrl = HubEndpoints.smsOutboxAckUrl(hub, id)
+    private fun sendAndAck(
+        context: Context,
+        endpoint: HubEndpoint,
+        id: String,
+        to: String,
+        body: String,
+    ) {
         try {
             sendSms(to, body)
             RedactingLogger.i(TAG, "SMS sent to $to")
             GatewayService.appendLog(context, "SMS sent to $to")
-            ack(ackUrl, HubEndpoints.outboxAckJson("sent"))
+            ack(endpoint, id, HubEndpoints.outboxAckJson("sent"))
         } catch (e: Exception) {
             val msg = "SMS send failed: ${e.message}"
             Log.e(TAG, msg)
             GatewayService.appendLog(context, msg)
-            ack(ackUrl, HubEndpoints.outboxAckJson("failed", e.message.orEmpty()))
+            ack(endpoint, id, HubEndpoints.outboxAckJson("failed", e.message.orEmpty()))
         }
     }
 
@@ -98,20 +104,22 @@ object SmsOutboxPoller {
     @Suppress("DEPRECATION")
     private fun contextSmsManager(): SmsManager = SmsManager.getDefault()
 
-    private fun ack(url: String, payload: String) {
+    /**
+     * Ack on the same entrance that claimed the row. [HubHttpWalk] adds
+     * `X-Gsm-Device-Token` for that endpoint. A one-element list does not
+     * try another origin.
+     */
+    private fun ack(endpoint: HubEndpoint, id: String, payload: String) {
+        val url = HubEndpoints.smsOutboxAckUrl(HubEndpoints.httpOrigin(endpoint.url), id)
         if (url.isEmpty()) return
-        val req = Request.Builder()
-            .url(url)
-            .post(payload.toRequestBody(JSON))
-            .build()
-        try {
-            http.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    Log.w(TAG, "outbox ack HTTP ${resp.code}")
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "outbox ack failed: ${e.message}")
+        val result = HubHttpWalk(http).run(listOf(endpoint)) {
+            Request.Builder()
+                .url(url)
+                .post(payload.toRequestBody(JSON))
+                .build()
+        }
+        if (!result.opened) {
+            Log.w(TAG, "outbox ack HTTP ${result.code} ${result.detail.take(120)}")
         }
     }
 }

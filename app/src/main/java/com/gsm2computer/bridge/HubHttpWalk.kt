@@ -20,6 +20,7 @@ class HubHttpWalk(
         val body: String,
         val url: String,
         val detail: String,
+        val endpoint: HubEndpoint? = null,
     )
 
     fun run(
@@ -31,6 +32,7 @@ class HubHttpWalk(
         var code = 0
         var body = ""
         var url = ""
+        var openedEndpoint: HubEndpoint? = null
         val routine = HubConnectionRoutine(endpoints, backoff, sleep) { request ->
             val secrets = listOf(request.endpoint.deviceToken)
             try {
@@ -47,6 +49,7 @@ class HubHttpWalk(
                         code = resp.code
                         body = text
                         url = request.endpoint.url
+                        openedEndpoint = request.endpoint
                     }
                     DialResponse(status, resp.code, scrubSecrets(text.take(160), secrets))
                 }
@@ -65,6 +68,7 @@ class HubHttpWalk(
             body = if (result.opened) body else "",
             url = if (result.opened) url else "",
             detail = result.detail,
+            endpoint = if (result.opened) openedEndpoint else null,
         )
     }
 }

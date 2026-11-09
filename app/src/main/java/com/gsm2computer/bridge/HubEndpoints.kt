@@ -118,12 +118,15 @@ object HubEndpoints {
     fun hubOwnedSession(hubControlUrl: String, storedOverride: Boolean?): Boolean =
         storedOverride ?: isCustomHub(hubControlUrl)
 
-    fun smsJson(from: String, body: String, receivedAt: String): String =
+    fun smsJson(from: String, body: String, receivedAt: String, clientId: String = ""): String =
         buildString {
             append('{')
             append("\"from\":").append(jsonString(from)).append(',')
             append("\"body\":").append(jsonString(body)).append(',')
             append("\"receivedAt\":").append(jsonString(receivedAt))
+            if (clientId.isNotEmpty()) {
+                append(',').append("\"clientId\":").append(jsonString(clientId))
+            }
             append('}')
         }
 
