@@ -136,14 +136,13 @@ sudo sshd -t && sudo systemctl reload ssh
 
 ### 6. Firewall
 
-Find the public NIC and Tailscale's UDP port:
+Cup already has `/etc/nftables.conf` with `flush ruleset` and `table inet filter`. That filter drops public inbound except SSH 22, UDP 41641, UDP 41642 (the second Tailscale, portal/Funnel), and ICMP, and it allows RustDesk plus `8787`/`8449` on `tailscale0`. A second `inet` table cannot open TCP 443: a packet has to survive every base chain, the host filter still drops 443, and a public-only allow list that names only 41641 would drop 41642. `flush ruleset` on boot also deletes any table a later unit added if it loses the race.
+
+The drop-in does not flush and does not create a table. It inserts one rule into the existing input chain: `tcp dport 443` on the public NIC. 41641 and 41642 stay where they are.
 
 ```bash
 ip -o -4 addr show | awk '/62.83.35.197/ {print $2}'
-ss -ulnp | grep tailscaled
 ```
-
-If the UDP port is not 41641, export `GSM2COMPUTER_TAILSCALE_UDP_PORT`. If SSH is not 22, export `GSM2COMPUTER_SSH_PORT` **before** apply. Apply does not flush other nftables or iptables tables.
 
 ```bash
 cd ~/gsm2computer
@@ -153,14 +152,14 @@ sudo GSM2COMPUTER_PUBLIC_IF=<nic> GSM2COMPUTER_NFT_ROLLBACK_S=300 \
   deploy/cup/gsm2computer-nft.sh apply
 ```
 
-`apply` arms a timer (default 180 seconds, 300 in the command above). The session you applied from is already established, so it survives. Before the timer fires:
+`apply` inserts the live rule and arms a timer (default 180 seconds, 300 in the command above). The session you applied from is already established, so it survives. Before the timer fires:
 
 1. Open a **new** SSH session. If it fails, run `deploy/cup/gsm2computer-nft.sh revert` from the original session, or wait for the timer.
 2. From outside the tailnet: `curl -sS -o /dev/null -w '%{http_code}\n' https://gsm.ta3leam.com/health` is `401`, and with the token it is `200`.
-3. From outside: RustDesk ports and `8790` and `8787` on the public IP do not accept. `tailscale0` still reaches the hub and RustDesk.
+3. From outside: RustDesk ports and `8790` and `8787` on the public IP do not accept. `tailscale0` still reaches the hub and RustDesk. UDP 41642 still accepts.
 4. `sudo deploy/cup/gsm2computer-nft.sh confirm`
 
-`confirm` writes `/etc/nftables.d/gsm2computer.nft` and enables `gsm2computer-nft.service` before it cancels the rollback timer. The unit does not delete the table on stop. The public interface also allows IPv6 neighbor discovery, so the host's IPv6 neighbors survive cache expiry. `revert` is how the table comes off.
+`confirm` appends an include of `/etc/nftables.d/gsm2computer-public.nft` to `/etc/nftables.conf` and enables `gsm2computer-nft.service` before it cancels the rollback timer. The unit runs after `nftables.service` and only inserts the rule if it is missing. It has no `ExecStop`. `revert` deletes that rule and the include. It does not flush the host filter.
 
 ## Rollback
 
@@ -168,14 +167,14 @@ Do these independently. You do not need to undo all of them.
 
 | What broke | Undo |
 |---|---|
-| Firewall lockout, timer still running | Wait. It restores the previous table. Or from the surviving SSH session: `sudo deploy/cup/gsm2computer-nft.sh revert` |
-| Firewall confirmed, want it gone | `sudo /usr/local/sbin/gsm2computer-nft.sh revert` (disables the boot unit and deletes the table) |
+| Firewall lockout, timer still running | Wait. It removes the TCP 443 rule. Or from the surviving SSH session: `sudo deploy/cup/gsm2computer-nft.sh revert` |
+| Firewall confirmed, want 443 closed | `sudo /usr/local/sbin/gsm2computer-nft.sh revert` (disables the boot unit, deletes the 443 rule, removes the include) |
 | Caddy certificate or proxy | `sudo systemctl disable --now gsm2computer-caddy.service` |
 | Public hub socket | Comment out `GSM2COMPUTER_PUBLIC_ENABLE`, `systemctl --user restart gsm2computer-hub.service`. Tailscale `:8787` keeps the previous behavior |
 | Bad hub code | `git checkout <previous>` in the deployed checkout, restart the user unit. With `PUBLIC_ENABLE` unset the new code still serves only the Tailscale socket |
 | SSH keys-only too strict | `sudo rm /etc/ssh/sshd_config.d/99-gsm2computer-key-only.conf && sudo sshd -t && sudo systemctl reload ssh` |
 
-Netcup's panel firewall, if it is on, has to allow TCP 22, TCP 443, and Tailscale's UDP port as well. This nftables table does not replace that panel.
+Netcup's panel firewall, if it is on, has to allow TCP 22, TCP 443, and UDP 41641 and 41642 as well. This drop-in does not replace that panel.
 
 ## What this host does not prove
 

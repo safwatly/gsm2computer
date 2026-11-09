@@ -1,0 +1,7 @@
+# Drop-in for cup's existing `table inet filter`.
+# Included from /etc/nftables.conf after that table is defined.
+# This file must not flush the host ruleset and must not declare a table.
+# It only accepts the public TLS entrance. UDP 41641 and UDP 41642 stay
+# in the host filter. Packets still have to pass that filter.
+
+insert rule inet filter __INPUT_CHAIN__ position 0 iifname "__PUBLIC_IF__" tcp dport __TLS_PORT__ accept comment "gsm2computer-public-tls"

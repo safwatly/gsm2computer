@@ -1,16 +1,14 @@
 [Unit]
-Description=gsm2computer public-interface firewall
-After=network-pre.target
-Before=network.target
-DefaultDependencies=no
+Description=gsm2computer public TLS rule in the existing inet filter
+After=nftables.service
+Before=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/gsm2computer-nft.sh boot
-# No ExecStop. Stopping or restarting this unit must not delete the table
-# while Caddy is still serving the public address. gsm2computer-nft.sh revert
-# is the only way to remove the table.
+# No ExecStop. Stopping this unit must not flush nftables or delete the
+# host filter. gsm2computer-nft.sh revert removes only the TCP 443 rule.
 
 [Install]
 WantedBy=multi-user.target
