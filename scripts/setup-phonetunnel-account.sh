@@ -35,6 +35,7 @@ CLIENT_ALIVE_COUNT_MAX="3"
 USER_NAME="phonetunnel"
 BUNDLE=""
 ADOPT=0
+ROTATE_KEY=0
 
 usage() {
     cat << 'EOF'
@@ -60,6 +61,10 @@ usage: setup-phonetunnel-account.sh [options]
   --adopt-existing          take over an existing account that is not already
                             this tunnel (has a usable password, or another shell).
                             Without this flag that account is left unchanged.
+  --rotate-key              mint a new phone tunnel key and replace the one in
+                            authorized_keys. Without this flag a re-run never
+                            adds a second key. A missing id_ed25519 reuses
+                            id_ed25519.pub, or the key already installed.
 EOF
 }
 
@@ -81,6 +86,7 @@ while [ $# -gt 0 ]; do
         --user) USER_NAME=$2; shift 2 ;;
         --bundle) BUNDLE=$2; shift 2 ;;
         --adopt-existing) ADOPT=1; shift ;;
+        --rotate-key) ROTATE_KEY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -219,6 +225,11 @@ if [ "$DRY" -eq 1 ]; then
     say "dry-run: Match ClientAliveInterval ${CLIENT_ALIVE_INTERVAL} ClientAliveCountMax ${CLIENT_ALIVE_COUNT_MAX}"
     say "dry-run: would refuse to continue if sshd -T for $USER_NAME is looser than that Match"
     say "dry-run: would generate or reuse keys in $BUNDLE"
+    say "dry-run: a missing id_ed25519 reuses id_ed25519.pub or the key already in authorized_keys"
+    say "dry-run: would not add a second authorized_keys line unless --rotate-key"
+    if [ "$ROTATE_KEY" -eq 1 ]; then
+        say "dry-run: --rotate-key would replace the tunnel key with exactly one new line"
+    fi
     say "dry-run: would install a restricted authorized_keys at $AUTH_KEYS"
     if [ "$APPLY_SYSTEM" -eq 1 ]; then
         say "dry-run: would run sshd -t and reload ssh. Not done."
@@ -345,21 +356,78 @@ fi
 if [ -d "$BUNDLE" ]; then
     cp -a "$BUNDLE/." "$STAGE_BUNDLE/"
 fi
-if [ ! -f "$STAGE_BUNDLE/id_ed25519" ]; then
+# A re-run after `shred -u id_ed25519` must not mint a new login. The
+# public key in the bundle, or the line already in authorized_keys, is
+# the phone's identity. Only --rotate-key replaces that line, and it
+# writes one key rather than appending a second.
+auth_has_key() {
+    [ -f "$AUTH_KEYS" ] && grep -q 'ssh-ed25519 ' "$AUTH_KEYS"
+}
+
+publish_tunnel_pub() {
+    dropbearkey -y -f "$STAGE_BUNDLE/id_ed25519" \
+        | awk '/^ssh-ed25519 / {print $1, $2; exit}' > "$STAGE_BUNDLE/id_ed25519.pub"
+    if [ ! -s "$STAGE_BUNDLE/id_ed25519.pub" ]; then
+        echo "dropbearkey -y did not print an ssh-ed25519 public key" >&2
+        exit 1
+    fi
+}
+
+generate_tunnel_key() {
+    rm -f "$STAGE_BUNDLE/id_ed25519" "$STAGE_BUNDLE/id_ed25519.pub" "$STAGE_BUNDLE/id_ed25519.txt"
     dropbearkey -t ed25519 -f "$STAGE_BUNDLE/id_ed25519" > "$STAGE_BUNDLE/id_ed25519.txt"
+    publish_tunnel_pub
+}
+
+pub_from_authorized_keys() {
+    awk '{
+        for (i = 1; i <= NF; i++) {
+            if ($i == "ssh-ed25519" && $(i + 1) != "") {
+                print $i, $(i + 1)
+                exit
+            }
+        }
+    }' "$AUTH_KEYS" > "$STAGE_BUNDLE/id_ed25519.pub"
+    if [ ! -s "$STAGE_BUNDLE/id_ed25519.pub" ]; then
+        echo "authorized_keys has no ssh-ed25519 key to reuse" >&2
+        exit 1
+    fi
+}
+
+# KEEP_AUTH means the live authorized_keys is copied unchanged.
+KEEP_AUTH=0
+TUNNEL_KEY_NOTE=""
+if [ "$ROTATE_KEY" -eq 1 ]; then
+    generate_tunnel_key
+    TUNNEL_KEY_NOTE="rotated; authorized_keys replaced with the new key"
+elif [ -f "$STAGE_BUNDLE/id_ed25519" ]; then
+    publish_tunnel_pub
+    TUNNEL_KEY_NOTE="reused id_ed25519"
+elif [ -s "$STAGE_BUNDLE/id_ed25519.pub" ]; then
+    KEEP_AUTH=1
+    TUNNEL_KEY_NOTE="reused id_ed25519.pub; did not generate a private key"
+elif auth_has_key; then
+    pub_from_authorized_keys
+    KEEP_AUTH=1
+    TUNNEL_KEY_NOTE="reused the key already in authorized_keys; did not generate a private key"
+else
+    generate_tunnel_key
+    TUNNEL_KEY_NOTE="generated a new tunnel key"
 fi
-dropbearkey -y -f "$STAGE_BUNDLE/id_ed25519" | awk '/^ssh-ed25519 / {print $1, $2; exit}' > "$STAGE_BUNDLE/id_ed25519.pub"
-if [ ! -s "$STAGE_BUNDLE/id_ed25519.pub" ]; then
-    echo "dropbearkey -y did not print an ssh-ed25519 public key" >&2
+if ! awk 'NR==1 && $1=="ssh-ed25519" && $2 != "" { ok=1 } END { exit !ok }' "$STAGE_BUNDLE/id_ed25519.pub"; then
+    echo "tunnel public key is not ssh-ed25519" >&2
     exit 1
 fi
 if [ ! -f "$STAGE_BUNDLE/phone_shell_ed25519" ]; then
     ssh-keygen -t ed25519 -f "$STAGE_BUNDLE/phone_shell_ed25519" -N "" -C "phonetunnel-shell"
 fi
-# The public half is derived from the private key so a re-run does not
-# depend on the .pub file still being in the bundle.
+# When the private key is still here, the public half comes from it, so
+# a re-run does not depend on the .pub file still being in the bundle.
 ssh-keygen -y -f "$STAGE_BUNDLE/phone_shell_ed25519" > "$STAGE_BUNDLE/phone_shell_ed25519.pub"
-chmod 600 "$STAGE_BUNDLE/id_ed25519" "$STAGE_BUNDLE/phone_shell_ed25519"
+chmod 600 "$STAGE_BUNDLE/phone_shell_ed25519"
+if [ -f "$STAGE_BUNDLE/id_ed25519" ]; then
+    chmod 600 "$STAGE_BUNDLE/id_ed25519"
+fi
 chmod 644 "$STAGE_BUNDLE/id_ed25519.pub" "$STAGE_BUNDLE/phone_shell_ed25519.pub"
 
 TUNNEL_PUB=$(awk '{print $1" "$2}' "$STAGE_BUNDLE/id_ed25519.pub")
@@ -370,12 +438,24 @@ TUNNEL_BLOB=$(awk '{print $2}' "$STAGE_BUNDLE/id_ed25519.pub")
 AUTH_LINE="restrict,port-forwarding,permitlisten=\"127.0.0.1:${SSH_REMOTE_PORT}\",permitlisten=\"127.0.0.1:${ADB_REMOTE_PORT}\",permitopen=\"192.0.2.1:9\" ${TUNNEL_PUB} phonetunnel-phone"
 
 STAGE_AUTH="$STAGE/authorized_keys"
-if [ -f "$AUTH_KEYS" ]; then
+# Held until after the adopt check. Refusing an unrelated account must
+# say so, and must not be reported as a second tunnel key.
+REFUSE_SECOND=0
+if [ "$ROTATE_KEY" -eq 1 ]; then
+    printf '%s\n' "$AUTH_LINE" > "$STAGE_AUTH"
+elif [ "$KEEP_AUTH" -eq 1 ] && auth_has_key; then
+    cp -a "$AUTH_KEYS" "$STAGE_AUTH"
+elif ! auth_has_key; then
+    printf '%s\n' "$AUTH_LINE" > "$STAGE_AUTH"
+elif grep -F -q "$TUNNEL_BLOB" "$AUTH_KEYS"; then
+    # Same key, options may have changed. Drop every copy of this blob
+    # and write the line once. Other lines are kept.
     grep -F -v "$TUNNEL_BLOB" "$AUTH_KEYS" > "$STAGE_AUTH" || true
+    printf '%s\n' "$AUTH_LINE" >> "$STAGE_AUTH"
 else
-    : > "$STAGE_AUTH"
+    REFUSE_SECOND=1
+    cp -a "$AUTH_KEYS" "$STAGE_AUTH"
 fi
-printf '%s\n' "$AUTH_LINE" >> "$STAGE_AUTH"
 chmod 600 "$STAGE_AUTH"
 
 # Dropbear known_hosts is "hostname algo base64" with no bracketed port
@@ -545,6 +625,13 @@ if [ "$APPLY_SYSTEM" -eq 1 ] && id "$USER_NAME" >/dev/null 2>&1; then
     fi
 fi
 
+if [ "$REFUSE_SECOND" -eq 1 ]; then
+    echo "refusing to add a second key to ${AUTH_KEYS}." >&2
+    echo "The bundle key is not the one already installed." >&2
+    echo "Pass --rotate-key to replace it. authorized_keys was not changed." >&2
+    exit 1
+fi
+
 # Commit. From here a failure undoes this run.
 trap rollback_commit EXIT
 
@@ -652,6 +739,7 @@ trap remove_stage EXIT
 cat << EOF
 
 phonetunnel account is installed.
+Tunnel key: ${TUNNEL_KEY_NOTE}
 Bundle (root-only): ${BUNDLE}
 
 Phone files to copy to /data/adb/phonetunnel/ on the Moto:
@@ -666,6 +754,11 @@ Keep on cup:
 After the phone has id_ed25519 and the tunnel stays up, delete the
 phone private key from cup:
   shred -u ${BUNDLE}/id_ed25519
+
+Keep id_ed25519.pub. A later run reuses that public key, or the key
+already in authorized_keys, and does not add a login. Pass --rotate-key
+to replace the tunnel key with exactly one new key, then copy the new
+id_ed25519 to the phone.
 
 From cup, once the tunnel is up:
   ssh -i ${BUNDLE}/phone_shell_ed25519 -p ${SSH_REMOTE_PORT} \\
