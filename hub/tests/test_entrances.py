@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -538,6 +539,205 @@ class OverlappingRelinkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bytes(writers[other]), b"")
         hub.relink_gate.close()
         hub.live_call.note_entrance("tailscale", "")
+
+    async def test_losing_handle_websocket_does_not_abort_the_live_call(self) -> None:
+        """Two admissions during one grace window. The loser must 409 and leave the call up."""
+        hub.relink_gate.close()
+        if hub.live_call.busy:
+            hub.live_call.release()
+        self.assertTrue(hub.live_call.claim("/", entrance="tailscale"))
+        hub.live_call.session_id = "hub-live"
+        hub.live_call.last_ws_at = time.monotonic() - 5
+        hub.live_call.note_link_gap()
+        hub.relink_gate.begin("hub-live")
+        # The bug's precondition: this slot looks stale enough to supersede.
+        self.assertTrue(hub.reconnect_should_supersede(hub.live_call.snapshot()))
+        go = asyncio.Event()
+        sockets: dict[str, bytearray] = {}
+
+        class Socket:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.buf = bytearray()
+                sockets[name] = self.buf
+
+            def write(self, data: bytes) -> None:
+                self.buf += data
+
+            async def drain(self) -> None:
+                await go.wait()
+
+        async def connect(name: str) -> None:
+            entrance = Entrance(name, "127.0.0.1", 9, name == "public")
+            entrance_token = hub._current_entrance.set(entrance)
+            device_token = hub._current_device_id.set(f"{name}-phone")
+            try:
+                await hub.handle_websocket(
+                    None,  # type: ignore[arg-type]
+                    Socket(name),  # type: ignore[arg-type]
+                    {
+                        "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+                        "x-gsm-call-session": "hub-live",
+                    },
+                    "/",
+                )
+            finally:
+                hub._current_device_id.reset(device_token)
+                hub._current_entrance.reset(entrance_token)
+
+        public_task = asyncio.create_task(connect("public"))
+        tail_task = asyncio.create_task(connect("tailscale"))
+        for _ in range(30):
+            if sockets.get("public") and sockets.get("tailscale"):
+                break
+            await asyncio.sleep(0)
+        self.assertTrue(bytes(sockets["public"]).startswith(b"HTTP/1.1 101"), sockets["public"][:40])
+        self.assertTrue(bytes(sockets["tailscale"]).startswith(b"HTTP/1.1 409"), sockets["tailscale"][:40])
+        self.assertIsNone(hub.live_call.abort_reason)
+        self.assertFalse(hub.live_call.abort.is_set())
+        self.assertTrue(hub.live_call.busy)
+        self.assertEqual(hub.live_call.entrance, "public")
+        self.assertEqual(hub.live_call.session_id, "hub-live")
+        go.set()
+        await tail_task
+        self.assertFalse(public_task.done())
+        hub.relink_gate.release_holder()
+        await public_task
+        self.assertIsNone(hub.live_call.abort_reason)
+        self.assertTrue(hub.live_call.busy)
+        self.assertEqual(hub.live_call.entrance, "public")
+        hub.relink_gate.close()
+        hub.live_call.release()
+
+    async def test_lost_reservation_does_not_fall_through_to_supersede(self) -> None:
+        """deliver() lost the waiter. That False must not reach admission."""
+        hub.relink_gate.close()
+        if hub.live_call.busy:
+            hub.live_call.release()
+        self.assertTrue(hub.live_call.claim("/", entrance="tailscale"))
+        hub.live_call.session_id = "hub-live"
+        hub.live_call.last_ws_at = time.monotonic() - 5
+        hub.relink_gate.begin("hub-live")
+        self.assertIsNone(hub.live_call.link_gap_since)
+        self.assertTrue(hub.reconnect_should_supersede(hub.live_call.snapshot()))
+        real_deliver = hub.relink_gate.deliver
+
+        def lost(session_id: str, reader: object, writer: object):
+            del session_id, reader, writer
+            return None
+
+        hub.relink_gate.deliver = lost  # type: ignore[method-assign]
+        sock = bytearray()
+
+        class Socket:
+            def write(self, data: bytes) -> None:
+                sock.extend(data)
+
+            async def drain(self) -> None:
+                return None
+
+        try:
+            await hub.handle_websocket(
+                None,  # type: ignore[arg-type]
+                Socket(),  # type: ignore[arg-type]
+                {
+                    "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+                    "x-gsm-call-session": "hub-live",
+                },
+                "/",
+            )
+        finally:
+            hub.relink_gate.deliver = real_deliver  # type: ignore[method-assign]
+        self.assertTrue(bytes(sock).startswith(b"HTTP/1.1 409"), sock[:40])
+        self.assertIsNone(hub.live_call.abort_reason)
+        self.assertTrue(hub.live_call.busy)
+        self.assertEqual(hub.live_call.session_id, "hub-live")
+        hub.relink_gate.close()
+        hub.live_call.release()
+
+    async def test_cancelled_winner_does_not_abort(self) -> None:
+        hub.relink_gate.close()
+        if hub.live_call.busy:
+            hub.live_call.release()
+        self.assertTrue(hub.live_call.claim("/", entrance="tailscale"))
+        hub.live_call.session_id = "hub-live"
+        hub.live_call.note_link_gap()
+        hub.relink_gate.begin("hub-live")
+        started = asyncio.Event()
+
+        class Socket:
+            def __init__(self) -> None:
+                self.buf = bytearray()
+
+            def write(self, data: bytes) -> None:
+                self.buf += data
+                if data.startswith(b"HTTP/1.1 101"):
+                    started.set()
+
+            async def drain(self) -> None:
+                await asyncio.sleep(0)
+
+        async def connect() -> None:
+            entrance = Entrance("public", "127.0.0.1", 9, True)
+            token = hub._current_entrance.set(entrance)
+            try:
+                await hub.handle_websocket(
+                    None,  # type: ignore[arg-type]
+                    Socket(),  # type: ignore[arg-type]
+                    {
+                        "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+                        "x-gsm-call-session": "hub-live",
+                    },
+                    "/",
+                )
+            finally:
+                hub._current_entrance.reset(token)
+
+        task = asyncio.create_task(connect())
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertIsNone(hub.live_call.abort_reason)
+        self.assertFalse(hub.live_call.abort.is_set())
+        self.assertTrue(hub.live_call.busy)
+        hub.relink_gate.close()
+        hub.live_call.release()
+
+    async def test_stale_call_without_a_gap_can_still_be_superseded(self) -> None:
+        hub.relink_gate.close()
+        if hub.live_call.busy:
+            hub.live_call.release()
+        self.assertTrue(hub.live_call.claim("/", entrance="tailscale"))
+        hub.live_call.session_id = "hub-old"
+        hub.live_call.last_ws_at = time.monotonic() - 5
+        self.assertIsNone(hub.live_call.link_gap_since)
+        self.assertTrue(hub.reconnect_should_supersede(hub.live_call.snapshot()))
+        previous = hub.RECONNECT_TAKEOVER_WAIT_S
+        hub.RECONNECT_TAKEOVER_WAIT_S = 0
+
+        class Socket:
+            def __init__(self) -> None:
+                self.buf = bytearray()
+
+            def write(self, data: bytes) -> None:
+                self.buf += data
+
+            async def drain(self) -> None:
+                return None
+
+        try:
+            await hub.handle_websocket(
+                None,  # type: ignore[arg-type]
+                Socket(),  # type: ignore[arg-type]
+                {"sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ=="},
+                "/",
+            )
+        finally:
+            hub.RECONNECT_TAKEOVER_WAIT_S = previous
+        self.assertEqual(hub.live_call.abort_reason, hub.SUPERSEDED_REASON)
+        hub.relink_gate.close()
+        hub.live_call.release()
 
 
 class PublicBindTests(unittest.IsolatedAsyncioTestCase):

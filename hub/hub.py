@@ -6,6 +6,7 @@ import asyncio
 import audioop
 import base64
 import contextvars
+import enum
 import hashlib
 import json
 import logging
@@ -1449,18 +1450,43 @@ def _log_ws_end(slot: CallSlot, frame: Optional[WsRead], initiator: str, detail:
     )
 
 
+class RelinkAdmit(enum.Enum):
+    """How a websocket relates to the open grace window.
+
+    NOT_APPLICABLE is a normal connect: there is no grace waiter for it.
+    PARKED means this socket owns the live call.
+    REJECTED means a relink was in progress and this socket did not get it.
+    REJECTED must close. It must not fall through into admission, or a stale
+    slot will be superseded and the winner's call aborted.
+    """
+
+    NOT_APPLICABLE = "not_applicable"
+    PARKED = "parked"
+    REJECTED = "rejected"
+
+
+def _relink_in_progress() -> bool:
+    """True while a grace window still owns the call, even after its waiter was taken.
+
+    The header does not matter. A different session id during the gap is still
+    not a new call, and it is not allowed to supersede the one in grace.
+    """
+    if not (live_call.busy or active_bridge is not None):
+        return False
+    return live_call.link_gap_since is not None
+
+
 async def _park_relink_socket(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     session_id: str,
     key: str,
 ) -> bool:
-    """101 and hand the socket to the live call. True means this handler must return.
+    """101 and hand the socket to the live call.
 
     ``deliver`` reserves the single waiter with no await. Only that winner
-    stamps the live entrance. A second reconnect can pass ``matches`` and
-    then lose at ``deliver`` once ``drain`` yields; it must not leave its
-    own entrance on the slot, and it must not be told the upgrade succeeded.
+    stamps the live entrance. False means the reservation was already taken
+    or cancelled. The caller must reject that socket and return.
     """
     release_fut = relink_gate.deliver(session_id, reader, writer)
     if release_fut is None:
@@ -1488,8 +1514,36 @@ async def _park_relink_socket(
         await writer.drain()
     except (ConnectionError, OSError):
         LOG.warning("relink 101 drain failed session=%s", session_id, exc_info=True)
+    except asyncio.CancelledError:
+        # The holder already owns this socket. Cancelling the parked handler
+        # must not look like a lost reservation.
+        raise
     await release_fut
     return True
+
+
+async def admit_relink(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    resume_id: str,
+    key: str,
+) -> RelinkAdmit:
+    """Reserve the grace waiter, or say this socket is not the one that may."""
+    park_id = relink_gate.resume_session(resume_id)
+    if not park_id:
+        if _relink_in_progress():
+            return RelinkAdmit.REJECTED
+        return RelinkAdmit.NOT_APPLICABLE
+    try:
+        parked = await _park_relink_socket(reader, writer, park_id, key)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOG.warning("relink park failed session=%s", park_id, exc_info=True)
+        return RelinkAdmit.REJECTED
+    if parked:
+        return RelinkAdmit.PARKED
+    return RelinkAdmit.REJECTED
 
 
 async def _hold_for_relink(
@@ -1626,20 +1680,17 @@ async def handle_websocket(
         return
 
     resume_id = (headers.get("x-gsm-call-session") or "").strip()
-    park_id = relink_gate.resume_session(resume_id)
-    if park_id and await _park_relink_socket(reader, writer, park_id, key):
+    admitted = await admit_relink(reader, writer, resume_id, key)
+    if admitted is RelinkAdmit.PARKED:
         return
-    # Reject only while a grace wait is still open and this socket could not
-    # attach. After the waiter ends (expired/cancelled), fall through so the
-    # supersede / force-release paths can free a stale busy slot.
-    if (
-        live_call.link_gap_since is not None
-        and (live_call.busy or active_bridge is not None)
-        and relink_gate.waiting()
-    ):
+    if admitted is RelinkAdmit.REJECTED:
+        # Lost the reservation, or the grace window is still open and this
+        # socket is not the one that took it. Do not supersede: that aborts
+        # the call the winner just joined.
         LOG.warning(
-            "rejecting websocket during link gap session_hdr=%s %s utc=%s",
+            "rejecting relink session_hdr=%s gap=%s %s utc=%s",
             resume_id or "-",
+            live_call.link_gap_since is not None,
             live_call.snapshot(),
             _utc_now(),
         )
@@ -1670,6 +1721,16 @@ async def handle_websocket(
                 writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
                 await writer.drain()
                 return
+        elif live_call.link_gap_since is not None:
+            # Grace is still open. Supersede here would abort the live session.
+            LOG.warning(
+                "rejecting websocket during link gap %s utc=%s",
+                live_call.snapshot(),
+                _utc_now(),
+            )
+            writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return
         elif live_call.busy and reconnect_should_supersede(live_call.snapshot()):
             # The Pixel only opens a new socket after it gave up on the old one
             # (e.g. Tailscale hiccup). Retire the stale session and let this
