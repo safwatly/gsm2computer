@@ -58,6 +58,7 @@ One feature:
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-nopasswd
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-policy
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-account
+.cursor/skills/verify-phonetunnel/scripts/harness.sh drive-rebind
 ```
 
 All of them, in that order:
@@ -85,7 +86,8 @@ Each drive writes a file under `/opt/cursor/artifacts/verify-phonetunnel/`
 | `watchdog.txt` | streak restart, rate limit, call states, `ip` error, and a bridge package do not over-restart; `tun1` with a CGNAT address is up; carrier CGNAT alone is down; a ~250KB idle dump with historical `OFFHOOK`/`RINGING` still counts as idle under `mksh`, and a current precise foreground of `1` does not |
 | `nopasswd.txt` | Dropbear accepts `root` when `/etc/passwd` has no root line, and rejects any other missing name |
 | `policy.txt` | zero timers are raised, an earlier Include Match is refused and the config restored, key and Match block the extra `-R`, `-L`, and unix-socket forward, and ForceCommand runs |
-| `account.txt` | real `useradd` in a private mount namespace: a loose Match writes nothing, a failure after the hold script rolls the new user back, a fresh account has shell `/bin/sh`, and a second run reuses the key. Host passwd is unchanged. Uninstall does not kill a reused pid |
+| `account.txt` | real `useradd` in a private mount namespace: a loose Match writes nothing, a failure after the hold script rolls the new user back, a fresh account has shell `/bin/sh`, and a second run reuses the key and rewrites an old Match to `ClientAliveInterval 15`. Host passwd is unchanged. Uninstall does not kill a reused pid |
+| `rebind.txt` | after a netns drop, the reverse port stays held, the new client logs a failed forward, and a shell nonce succeeds between 30 and 90 seconds |
 | `phonetunnel.log` | supervisor log copied at the end of `drive-all` |
 | `system-sshd.txt` | the system sshd config was not edited |
 | `drive-all.txt` | `drive-all ok` |
@@ -113,7 +115,7 @@ and does not edit `/etc/ssh/sshd_config`.
 
 ```sh
 .cursor/skills/verify-phonetunnel/scripts/harness.sh \
-  doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-supervise|drive-watchdog|drive-policy|drive-account|drive-all|cleanup
+  doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-supervise|drive-watchdog|drive-policy|drive-account|drive-rebind|drive-all|cleanup
 ```
 
 Cup account setup, used by `launch` with `--root` so it does not touch

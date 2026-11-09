@@ -11,6 +11,7 @@ not one of these features. The module must not touch it.
 | [Shell through the tunnel](phone-shell.md) | `drive-shell` | `phone-shell.txt` |
 | [Adb through the tunnel](adb-forward.md) | `drive-adb` | `adb-forward.txt` |
 | [Reconnect](reconnect.md) | `drive-reconnect` | `reconnect.txt` |
+| [Stale session reaped](stale-session.md) | `drive-rebind` | `rebind.txt` |
 | Sshd supervised while the session stays up | `drive-supervise` | `supervise.txt` |
 | Cup Match, key limits, timers | `drive-policy` | `policy.txt` |
 | [Tailscale watchdog](tailscale-watchdog.md) | `drive-watchdog` | `watchdog.txt` |

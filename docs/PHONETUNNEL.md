@@ -75,7 +75,16 @@ The script:
    `nologin` ignores `-c` and never runs the hold script. The Match sets
    `AllowTcpForwarding remote`, `AllowStreamLocalForwarding no`,
    `PermitOpen none`, `PermitTTY no`, and `PermitListen` for the two
-   localhost ports. `restrict` does not turn off unix-socket forwards;
+   localhost ports. It also sets `ClientAliveInterval 15` and
+   `ClientAliveCountMax 3`. A phone reboot does not send FIN, so the
+   old session would keep holding `127.0.0.1:2222` and `:5556` until
+   the kernel TCP keepalive. OpenSSH sends one probe per interval and
+   disconnects on the interval after `ClientAliveCountMax` unanswered
+   probes, so 15 and 3 drops that session in about 60 seconds. The phone
+   already uses `ServerAliveInterval` and
+   `ExitOnForwardFailure=yes`, and the supervisor retries with backoff,
+   so the new tunnel binds the ports on the next attempt after they
+   are free. `restrict` does not turn off unix-socket forwards;
    `AllowStreamLocalForwarding no` does.
 6. Runs `sshd -t`, then `sshd -T -C user=phonetunnel,host=127.0.0.1,addr=127.0.0.1`
    on a copy of the config. If the effective settings are any looser (an
@@ -95,7 +104,11 @@ not executed. Do not point the account shell at `nologin` or
 
 Re-running the script keeps existing key files and any other file
 already in the bundle, including `phone_known_hosts`. It replaces only
-this account's authorized_keys line and the marked Match block.
+this account's authorized_keys line and the marked Match block, in
+place. A cup that already has the block gets `ClientAliveInterval` and
+`ClientAliveCountMax` on the next run. The block is not stacked, and
+the live `sshd_config` is still swapped by a same-directory rename
+after `sshd -t` and `sshd -T` accept it.
 
 Nothing secret is committed. After the phone has `id_ed25519` and
 `phonetunnel-status` shows `tunnel=up` for a while, delete the phone

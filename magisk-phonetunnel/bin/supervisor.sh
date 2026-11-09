@@ -150,7 +150,13 @@ connect_once() {
     chmod 600 "$STATE_DIR/id_ed25519" 2>/dev/null || true
     log_msg "connecting ${CUP_USER}@${CUP_HOST}:${CUP_PORT} keepalive=${KEEPALIVE_SEC}s"
     # HOME selects dbclient's known_hosts file. -N -T: no command, no pty.
-    # ExitOnForwardFailure: a taken or forbidden remote port exits so we retry.
+    # ExitOnForwardFailure: a taken or forbidden remote port exits so the
+    # backoff loop below retries. After a reboot the previous cup session
+    # still holds the ports until ClientAlive drops it (15 and 3 is about
+    # 60s: one probe per interval, then one more interval to give up). This
+    # client then binds them on the next attempt. ServerAliveInterval is
+    # how this side notices a black hole; Dropbear exits after three
+    # missed replies. ServerAliveCountMax is not a dbclient option.
     HOME="$STATE_DIR/home" \
         "$DBCLIENT" -N -T \
         -i "$STATE_DIR/id_ed25519" \

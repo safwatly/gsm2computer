@@ -26,6 +26,12 @@ PHONE_ADB_PORT="5555"
 KEEPALIVE_SEC="45"
 BACKOFF_INITIAL_SEC="2"
 BACKOFF_MAX_SEC="60"
+# OpenSSH sends one probe per interval and disconnects on the next
+# interval after ClientAliveCountMax unanswered probes, so 15 and 3 is
+# about 60s. A reboot leaves the old session holding the reverse ports
+# until then. 0 disables the probes.
+CLIENT_ALIVE_INTERVAL="15"
+CLIENT_ALIVE_COUNT_MAX="3"
 USER_NAME="phonetunnel"
 BUNDLE=""
 ADOPT=0
@@ -46,6 +52,9 @@ usage: setup-phonetunnel-account.sh [options]
   --keepalive SEC           phone ServerAliveInterval written into config.env
   --backoff-initial SEC
   --backoff-max SEC
+  --client-alive-interval SEC
+                            Match ClientAliveInterval (default 15, range 1..120)
+  --client-alive-count N    Match ClientAliveCountMax (default 3, range 1..10)
   --user NAME               unix account (default phonetunnel)
   --bundle DIR              where keys and the phone bundle are written
   --adopt-existing          take over an existing account that is not already
@@ -67,6 +76,8 @@ while [ $# -gt 0 ]; do
         --keepalive) KEEPALIVE_SEC=$2; shift 2 ;;
         --backoff-initial) BACKOFF_INITIAL_SEC=$2; shift 2 ;;
         --backoff-max) BACKOFF_MAX_SEC=$2; shift 2 ;;
+        --client-alive-interval) CLIENT_ALIVE_INTERVAL=$2; shift 2 ;;
+        --client-alive-count) CLIENT_ALIVE_COUNT_MAX=$2; shift 2 ;;
         --user) USER_NAME=$2; shift 2 ;;
         --bundle) BUNDLE=$2; shift 2 ;;
         --adopt-existing) ADOPT=1; shift ;;
@@ -113,9 +124,20 @@ num_ok() {
 }
 
 for n in "$CUP_PORT" "$SSH_REMOTE_PORT" "$ADB_REMOTE_PORT" "$PHONE_SSH_PORT" \
-    "$PHONE_ADB_PORT" "$KEEPALIVE_SEC" "$BACKOFF_INITIAL_SEC" "$BACKOFF_MAX_SEC"; do
+    "$PHONE_ADB_PORT" "$KEEPALIVE_SEC" "$BACKOFF_INITIAL_SEC" "$BACKOFF_MAX_SEC" \
+    "$CLIENT_ALIVE_INTERVAL" "$CLIENT_ALIVE_COUNT_MAX"; do
     num_ok "$n" || { echo "not a port or number: $n" >&2; exit 2; }
 done
+# 0 turns ClientAlive off. The orphaned session would keep the ports
+# until the kernel TCP keepalive, which is the bug this setting fixes.
+if [ "$CLIENT_ALIVE_INTERVAL" -lt 1 ] || [ "$CLIENT_ALIVE_INTERVAL" -gt 120 ]; then
+    echo "client alive interval must be 1..120 (got $CLIENT_ALIVE_INTERVAL)" >&2
+    exit 2
+fi
+if [ "$CLIENT_ALIVE_COUNT_MAX" -lt 1 ] || [ "$CLIENT_ALIVE_COUNT_MAX" -gt 10 ]; then
+    echo "client alive count must be 1..10 (got $CLIENT_ALIVE_COUNT_MAX)" >&2
+    exit 2
+fi
 
 case "$CUP_HOST" in
     *[!A-Za-z0-9.-]*) echo "bad host: $CUP_HOST" >&2; exit 2 ;;
@@ -178,6 +200,10 @@ Match User ${USER_NAME}
     AllowAgentForwarding no
     PermitOpen none
     PermitListen 127.0.0.1:${SSH_REMOTE_PORT} 127.0.0.1:${ADB_REMOTE_PORT}
+    # A vanished phone does not send FIN. OpenSSH disconnects on the
+    # interval after CountMax unanswered probes (15 and 3 is about 60s).
+    ClientAliveInterval ${CLIENT_ALIVE_INTERVAL}
+    ClientAliveCountMax ${CLIENT_ALIVE_COUNT_MAX}
     ForceCommand ${HOLD_DST}
     PasswordAuthentication no
     KbdInteractiveAuthentication no
@@ -190,6 +216,7 @@ if [ "$DRY" -eq 1 ]; then
     say "dry-run: would install $HOLD_SRC -> $HOLD_DST"
     say "dry-run: would ensure user $USER_NAME shell=$SHELL_BIN shadow='*' (only when --root /)"
     say "dry-run: would insert Match before any other Match in $SSHD_CONFIG"
+    say "dry-run: Match ClientAliveInterval ${CLIENT_ALIVE_INTERVAL} ClientAliveCountMax ${CLIENT_ALIVE_COUNT_MAX}"
     say "dry-run: would refuse to continue if sshd -T for $USER_NAME is looser than that Match"
     say "dry-run: would generate or reuse keys in $BUNDLE"
     say "dry-run: would install a restricted authorized_keys at $AUTH_KEYS"
@@ -448,7 +475,7 @@ fail_effective() {
     echo "effective sshd settings for ${USER_NAME} are not the tunnel policy." >&2
     echo "An earlier Match (often in sshd_config.d, included before this file) won." >&2
     echo "Fix that Match, then re-run. sshd was not reloaded." >&2
-    printf '%s\n' "$EFFECTIVE" | awk '$1 ~ /^(allowtcpforwarding|allowstreamlocalforwarding|permitopen|permitlisten|permittty|x11forwarding|allowagentforwarding|gatewayports|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|forcecommand)$/ {print}' >&2
+    printf '%s\n' "$EFFECTIVE" | awk '$1 ~ /^(allowtcpforwarding|allowstreamlocalforwarding|permitopen|permitlisten|permittty|x11forwarding|allowagentforwarding|gatewayports|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|forcecommand|clientaliveinterval|clientalivecountmax)$/ {print}' >&2
     echo "Live sshd config was not changed." >&2
     exit 1
 }
@@ -464,6 +491,8 @@ fail_effective() {
 [ "$(setting kbdinteractiveauthentication)" = "no" ] || fail_effective
 [ "$(setting pubkeyauthentication)" = "yes" ] || fail_effective
 [ "$(setting forcecommand)" = "$HOLD_DST" ] || fail_effective
+[ "$(setting clientaliveinterval)" = "$CLIENT_ALIVE_INTERVAL" ] || fail_effective
+[ "$(setting clientalivecountmax)" = "$CLIENT_ALIVE_COUNT_MAX" ] || fail_effective
 
 got_listen=$(printf '%s\n' "$EFFECTIVE" | awk '$1=="permitlisten" { for (i=2;i<=NF;i++) print $i }' | sort -u)
 want_listen=$(printf '%s\n' "127.0.0.1:${SSH_REMOTE_PORT}" "127.0.0.1:${ADB_REMOTE_PORT}" | sort)
