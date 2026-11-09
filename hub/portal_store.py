@@ -98,6 +98,11 @@ def normalize_e164(raw: str) -> str:
     return "+" + digits
 
 
+def normalize_peer(raw: str) -> str:
+    """Name the portal tests import. Same rules as normalize_e164."""
+    return normalize_e164(raw)
+
+
 def _row_message(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -629,3 +634,24 @@ class PortalStore:
         with self._lock:
             row = self._conn.execute("SELECT * FROM messages WHERE id = ?", (msg_id,)).fetchone()
         return _row_message(row) if row else None
+
+
+def reset_for_tests(path: Optional[Path] = None) -> PortalStore:
+    """Repoint the imported hub process at a fresh store.
+
+    hub.py builds portal_store at import. Tests set GSM2COMPUTER_PORTAL_DB
+    afterwards and call this so HTTP handlers see the temp database.
+    """
+    import hub as hub_mod
+
+    target = Path(path) if path is not None else Path(
+        os.environ.get("GSM2COMPUTER_PORTAL_DB", str(HUB_DIR / "portal.sqlite"))
+    )
+    try:
+        hub_mod.portal_store.close()
+    except Exception:
+        pass
+    store = PortalStore(target)
+    hub_mod.portal_store = store
+    hub_mod.portal_app.store = store
+    return store

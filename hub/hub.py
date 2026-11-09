@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import audioop
 import base64
 import contextvars
@@ -29,7 +30,11 @@ from device_auth import (
     public_route_allowed,
 )
 from ws_backpressure import (
+    UPLINK_BACKLOG_BYTES,
+    UPLINK_QUEUE_FRAMES,
+    UPLINK_WRITE_TIMEOUT_S,
     DownlinkSendGuard,
+    offer_nowait,
     reconnect_should_supersede,
     transport_buffered,
     writer_closing,
@@ -52,6 +57,13 @@ from call_slot import (
     wait_or_abort,
 )
 from link_gap_log import append_link_gap
+from grokbot_voice import (
+    GROKBOT_MIC_SINK,
+    GROKBOT_MIC_SOURCE,
+    GROKBOT_SPK_SINK,
+    UPLINK_GAIN as GROKBOT_UPLINK_GAIN,
+    get_grokbot_voice,
+)
 from urllib.parse import parse_qs, urlsplit
 from call_tap import RECORD_DIR, CallTap
 from portal_http import EventBus, PortalApp
@@ -84,6 +96,9 @@ AUDIO_RATE = int(os.environ.get("GSM2COMPUTER_AUDIO_RATE", "8000"))
 # (simulator) or PCM at whatever the phone HAL gave us; we resample here.
 BUS_RATE = int(os.environ.get("GSM2COMPUTER_BUS_RATE", "48000"))
 AUTO_MODE_ON_CALL = os.environ.get("GSM2COMPUTER_AUTO_MODE", "openclaw")
+# AUTO_MODE=grokbot answers calls with Grok Bot live voice (patchbay) instead of
+# OpenClaw Talk. OpenClaw stays selectable with AUTO_MODE=openclaw.
+GROKBOT_ON_CALL = (AUTO_MODE_ON_CALL or "").strip().lower() == "grokbot"
 
 
 def _parse_openclaw_talk_mode(raw: Optional[str]) -> str:
@@ -115,6 +130,7 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 current_mode: Optional[str] = None
 WS_SEND_TIMEOUT_S = float(os.environ.get("GSM2COMPUTER_WS_SEND_TIMEOUT_S", "5"))
 WS_PING_SKIP_BACKLOG_BYTES = 256 * 1024
+DOWNLINK_MAX_AGE_S = float(os.environ.get("GSM2COMPUTER_WS_DOWNLINK_MAX_AGE_S", "1.2") or 1.2)
 SUPERSEDED_REASON = "superseded by Pixel reconnect"
 RECONNECT_TAKEOVER_WAIT_S = float(os.environ.get("GSM2COMPUTER_RECONNECT_TAKEOVER_WAIT_S", "8"))
 active_bridge: Optional["PipewireBridge"] = None
@@ -248,6 +264,13 @@ async def read_http_headers(reader: asyncio.StreamReader) -> Tuple[str, str, dic
         raise HttpRequestError(408, "header timeout") from exc
 
 
+def split_request_target(target: str) -> tuple[str, dict[str, str]]:
+    """Path plus the last value of each query key. Portal tests import this."""
+    parts = urlsplit(target)
+    query = {key: values[-1] for key, values in parse_qs(parts.query, keep_blank_values=True).items()}
+    return parts.path or "/", query
+
+
 def content_length_header(headers: dict) -> int:
     raw = headers.get("content-length")
     if raw is None or raw == "":
@@ -303,6 +326,13 @@ async def _soft_drain(writer: asyncio.StreamWriter, timeout: float = WS_SEND_TIM
 async def ws_send_text(writer: asyncio.StreamWriter, text: str) -> bool:
     writer.write(ws_encode_text(text))
     return await _soft_drain(writer)
+
+
+def ws_queue_text(writer: asyncio.StreamWriter, text: str) -> None:
+    """Queue a text frame and return. Awaiting drain here stalls the uplink read loop."""
+    if writer_closing(writer):
+        raise ConnectionResetError("websocket transport closing")
+    writer.write(ws_encode_text(text))
 
 
 async def ws_send_pong(writer: asyncio.StreamWriter, payload: bytes = b"") -> None:
@@ -384,8 +414,23 @@ async def ws_read_frame(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         return WsRead(text="", pong=True)
     if opcode == 0x1:
         return WsRead(text=payload.decode("utf-8", errors="replace"))
+    if opcode == 0x2:
+        return WsRead(binary=payload)
     return WsRead(text="")
 
+
+
+def parse_uplink_binary(payload: bytes) -> Optional[Tuple[bytes, str, int]]:
+    """G2 v1 uplink frame from phone builds >=331: 'G2', ver 1, fmt 1 (s16le mono), rate u16 BE, 2 reserved, pcm."""
+    if len(payload) < 8 or payload[0:2] != b"G2" or payload[2] != 1 or payload[3] != 1:
+        return None
+    rate = int.from_bytes(payload[4:6], "big")
+    pcm = payload[8:]
+    if rate <= 0 or len(pcm) < 2:
+        return None
+    if len(pcm) & 1:
+        pcm = pcm[:-1]
+    return pcm, "audio/pcm", rate
 
 async def ws_send_close(writer: asyncio.StreamWriter, code: int, reason: str) -> None:
     payload = code.to_bytes(2, "big") + reason.encode("utf-8")[:120]
@@ -468,7 +513,7 @@ async def switchboard_state() -> dict:
 
 async def set_switchboard_mode(mode: str) -> dict:
     global current_mode
-    allowed = {"clear", "openclaw", "loopback", "conference", "status"}
+    allowed = {"clear", "openclaw", "grokbot", "loopback", "conference", "status"}
     if mode not in allowed:
         return {"ok": False, "error": f"unknown mode {mode!r}", "allowed": sorted(allowed - {"status"})}
     rc, out, err = await run_switchboard(mode)
@@ -622,21 +667,36 @@ def resolve_call_path(session_id: Optional[str], requested: Optional[str]) -> Op
     return None
 
 
-def session_description(session_id: str, *, loopback: bool, e2e: bool) -> dict[str, Any]:
+def session_description(
+    session_id: str, *, loopback: bool, e2e: bool, grokbot: bool = False
+) -> dict[str, Any]:
     """session.updated from the live slot. Built at send time so a relink onto
-    the other entrance is not stuck with the entrance of the first socket."""
+    the other entrance is not stuck with the entrance of the first socket.
+
+    grokbot selects the production Grok Bot model/talk fields. The entrance
+    still comes from the slot, so a public-socket call reports public.
+    """
+    if loopback:
+        model = "gsm2computer-hub"
+        talk = "off"
+    elif grokbot:
+        model = "gsm2computer-hub-grokbot"
+        talk = "grokbot"
+    else:
+        model = f"gsm2computer-hub-{OPENCLAW_TALK_MODE}"
+        talk = OPENCLAW_TALK_MODE
     return {
         "type": "session.updated",
         "session": {
             "id": session_id,
             "entrance": live_call.entrance or None,
-            "model": f"gsm2computer-hub-{OPENCLAW_TALK_MODE}" if not loopback else "gsm2computer-hub",
+            "model": model,
             "audio": {
                 "format": DEFAULT_CLIENT_FORMAT,
                 "rate": DEFAULT_CLIENT_RATE,
                 "preferred": {"format": "audio/pcm", "rate": BUS_RATE, "encoding": "s16le"},
             },
-            "talk": OPENCLAW_TALK_MODE if not loopback else "off",
+            "talk": talk,
             "e2e": e2e,
         },
     }
@@ -693,8 +753,22 @@ class PipewireBridge:
         self._in_src_rate = DEFAULT_CLIENT_RATE
         self._out_dst_rate = DEFAULT_CLIENT_RATE
         self.downlink_guard = DownlinkSendGuard()
+        self._dl_q = collections.deque()
+        self.dl_seq = 0
+        self.dl_sent = 0
+        self.dl_dropped_oldest = 0
+        self.dl_max_age_s = 0.0
         self._stall_logged_recovery = True
         self._out_writer: Optional[asyncio.StreamWriter] = None
+        # Caller audio is queued here and written to pw-cat on a side task.
+        # The WebSocket read loop must not await stdin.drain(): a stalled
+        # playback pipe used to freeze ping/pong handling and the relink path.
+        self._uplink_q: Optional[asyncio.Queue] = None
+        self._uplink_task: Optional[asyncio.Task] = None
+        self.uplink_dropped = 0
+        self.uplink_written = 0
+        # Linear gain on caller audio written to the playback sink (grokbot path).
+        self.uplink_gain = 1.0
 
     def _track_helper(self, proc: asyncio.subprocess.Process, label: str) -> None:
         self._helper_tasks.append(asyncio.create_task(self._log_helper_stderr(proc, label)))
@@ -818,6 +892,8 @@ class PipewireBridge:
             LOG.info("hub record linked: %s", rec_detail)
             self._out_writer = ws_writer
             self._record_task = asyncio.create_task(self._pump_out())
+        self._uplink_q = asyncio.Queue(maxsize=UPLINK_QUEUE_FRAMES)
+        self._uplink_task = asyncio.create_task(self._pump_uplink(), name="uplink-playback")
         LOG.info(
             "pipewire bridge started sink=%s serial=%s monitor=%s record=%s",
             self.sink,
@@ -863,9 +939,18 @@ class PipewireBridge:
 
     def downlink_snapshot(self) -> dict[str, Any]:
         try:
-            return self.downlink_guard.snapshot()
+            snap = dict(self.downlink_guard.snapshot())
         except Exception:
-            return {}
+            snap = {}
+        snap["uplink_dropped_frames"] = self.uplink_dropped
+        snap["dl_seq"] = getattr(self, "dl_seq", 0)
+        snap["dl_sent"] = getattr(self, "dl_sent", 0)
+        snap["dl_dropped_oldest"] = getattr(self, "dl_dropped_oldest", 0)
+        snap["dl_queued"] = len(getattr(self, "_dl_q", ()))
+        snap["dl_max_age_s"] = round(getattr(self, "dl_max_age_s", 0.0), 2)
+        q = self._uplink_q
+        snap["uplink_queued"] = q.qsize() if q is not None else 0
+        return snap
 
     def current_downlink_writer(self) -> Optional[asyncio.StreamWriter]:
         writer = self._out_writer
@@ -947,27 +1032,122 @@ class PipewireBridge:
                 LOG.error("%s; aborting call %s", dead, guard.snapshot())
                 self._signal_abort(dead)
                 break
-            frame = ws_encode_text(json.dumps(event))
-            if not guard.admit(len(frame)):
-                if guard.drop_run == 1 or guard.drop_run % 250 == 0:
-                    LOG.warning(
-                        "downlink backlog: dropping stale frames (keeping call) %s",
-                        guard.snapshot(),
-                    )
+            # 338: keep a bounded app-side queue and drop the OLDEST frames
+            # (latency cap DOWNLINK_MAX_AGE_S) instead of refusing new ones.
+            self.dl_seq += 1
+            event["seq"] = self.dl_seq
+            now = time.monotonic()
+            q = self._dl_q
+            q.append((now, ws_encode_text(json.dumps(event))))
+            while q and now - q[0][0] > DOWNLINK_MAX_AGE_S:
+                q.popleft()
+                self.dl_dropped_oldest += 1
+                guard.dropped_frames += 1
+                if self.dl_dropped_oldest == 1 or self.dl_dropped_oldest % 250 == 0:
+                    LOG.warning("downlink backlog: dropped oldest frames %s", self.downlink_snapshot())
+            broken = False
+            while q:
+                frame = q[0][1]
+                if not guard.admit(len(frame)):
+                    guard.dropped_frames -= 1
+                    guard.drop_run = 0
+                    break
+                ts, _ = q.popleft()
+                self.dl_max_age_s = max(self.dl_max_age_s, now - ts)
+                try:
+                    ws_writer.write(frame)
+                    self.dl_sent += 1
+                except (ConnectionError, BrokenPipeError, RuntimeError):
+                    if self._out_writer is ws_writer:
+                        self._out_writer = None
+                    broken = True
+                    break
+            if broken:
                 continue
             if guard.stall_started_at is None and guard.max_stall_s >= 1.0 and not self._stall_logged_recovery:
                 self._stall_logged_recovery = True
                 LOG.info("downlink recovered after stall %s", guard.snapshot())
             elif guard.stall_started_at is not None:
                 self._stall_logged_recovery = False
-            try:
-                ws_writer.write(frame)
-            except (ConnectionError, BrokenPipeError, RuntimeError):
-                if self._out_writer is ws_writer:
-                    self._out_writer = None
-                continue
+        LOG.info("downlink call counters %s", self.downlink_snapshot())
         if self._record.returncode is None:
             await self._record.wait()
+
+    def offer_uplink(self, audio: bytes, fmt: str = "", rate: int = 0) -> None:
+        """Queue one caller frame without waiting. Drops the oldest if pw-cat is behind."""
+        if self._closed or not audio:
+            return
+        q = self._uplink_q
+        if q is None:
+            self.uplink_dropped += 1
+            self._maybe_log_uplink_drop("no queue")
+            return
+        dropped = offer_nowait(q, (bytes(audio), str(fmt or ""), int(rate or 0)))
+        if dropped:
+            self.uplink_dropped += dropped
+            self._maybe_log_uplink_drop("queue")
+
+    def _playback_backlog(self) -> int:
+        proc = self._playback
+        stdin = getattr(proc, "stdin", None) if proc is not None else None
+        if stdin is None:
+            return 0
+        return transport_buffered(stdin)
+
+    def _discard_queued_uplink(self) -> int:
+        q = self._uplink_q
+        if q is None:
+            return 0
+        n = 0
+        while True:
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                return n
+            n += 1
+
+    def _maybe_log_uplink_drop(self, why: str) -> None:
+        n = self.uplink_dropped
+        if n != 1 and n % 50 != 0:
+            return
+        queued = self._uplink_q.qsize() if self._uplink_q is not None else 0
+        LOG.warning(
+            "uplink audio dropped (%s) total=%s backlog=%s queued=%s",
+            why,
+            n,
+            self._playback_backlog(),
+            queued,
+        )
+
+    async def _pump_uplink(self) -> None:
+        """Write queued caller audio to pw-cat. Never runs on the WebSocket read task."""
+        q = self._uplink_q
+        if q is None:
+            return
+        while not self._closed:
+            item = await q.get()
+            if self._closed or item is None:
+                return
+            audio, fmt, rate = item
+            if self._playback_backlog() > UPLINK_BACKLOG_BYTES:
+                extra = self._discard_queued_uplink()
+                self.uplink_dropped += 1 + extra
+                self._maybe_log_uplink_drop("pw-cat backlog")
+                continue
+            try:
+                await asyncio.wait_for(
+                    self.write_in(audio, fmt, rate),
+                    timeout=UPLINK_WRITE_TIMEOUT_S,
+                )
+                self.uplink_written += 1
+            except asyncio.TimeoutError:
+                extra = self._discard_queued_uplink()
+                self.uplink_dropped += 1 + extra
+                self._maybe_log_uplink_drop("pw-cat write timeout")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOG.warning("uplink playback failed: %s", exc)
 
     async def write_in(self, audio: bytes, fmt: str = "", rate: int = 0) -> None:
         if self._closed or not audio:
@@ -988,6 +1168,8 @@ class PipewireBridge:
         bus_pcm, self._in_ratecv = _resample_pcm(pcm, src_rate, self.rate, self._in_ratecv)
         if not bus_pcm:
             return
+        if self.uplink_gain != 1.0:
+            bus_pcm = audioop.mul(bus_pcm, 2, self.uplink_gain)
         proc = self._playback
         if not proc or not proc.stdin:
             return
@@ -1016,6 +1198,14 @@ class PipewireBridge:
         if self._closed:
             return
         self._closed = True
+        uplink_task = self._uplink_task
+        self._uplink_task = None
+        if uplink_task is not None:
+            uplink_task.cancel()
+            try:
+                await uplink_task
+            except asyncio.CancelledError:
+                pass
         self.playback_linked = False
         self.record_linked = False
         if self._record_task:
@@ -1341,14 +1531,23 @@ def _maybe_schedule_e2e_after_silent_call(tap_summary: dict[str, Any]) -> None:
     duration = _tap_duration_s(tap_summary)
     if duration < float(os.environ.get("GSM2COMPUTER_E2E_SILENT_MIN_S", "10")):
         return
-    spk = _tap_stream_peak(tap_summary, "openclaw-spk-48k-stereo")
-    downlink = _tap_stream_peak(tap_summary, "gsm-downlink-8k-mono")
     thresh = float(os.environ.get("GSM2COMPUTER_E2E_PEAK_MIN", "0.02"))
-    if spk >= thresh or downlink >= thresh:
-        return
+    if meta.get("mode") == "grokbot":
+        # gsm-downlink also carries the patchbay hold tone; judge Suzie only.
+        spk = _tap_stream_peak(tap_summary, "grok-spk-48k-stereo")
+        downlink = _tap_stream_peak(tap_summary, "gsm-downlink-8k-mono")
+        if spk >= thresh:
+            return
+        _request_live_e2e(tap_summary.get("id") or "unknown")
+    else:
+        spk = _tap_stream_peak(tap_summary, "openclaw-spk-48k-stereo")
+        downlink = _tap_stream_peak(tap_summary, "gsm-downlink-8k-mono")
+        if spk >= thresh or downlink >= thresh:
+            return
     LOG.warning(
-        "silent OpenClaw reply after %.1fs call (spk=%.4f dl=%.4f); scheduling e2e",
+        "silent bot reply after %.1fs call (mode=%s spk=%.4f dl=%.4f); scheduling e2e",
         duration,
+        meta.get("mode"),
         spk,
         downlink,
     )
@@ -1357,6 +1556,43 @@ def _maybe_schedule_e2e_after_silent_call(tap_summary: dict[str, Any]) -> None:
     except RuntimeError:
         return
     loop.create_task(_run_e2e_after_silent_call(tap_summary.get("id") or "unknown"))
+
+
+E2E_LIVE_REQUEST = Path(
+    os.environ.get(
+        "GSM2COMPUTER_E2E_LIVE_REQUEST",
+        str(Path.home() / "gsm2computer-e2e" / "live-request"),
+    )
+)
+
+
+def _request_live_e2e(call_id: str) -> None:
+    """Ask the next e2e run for a live Grok voice test (timer runs stay non-invasive)."""
+    try:
+        E2E_LIVE_REQUEST.parent.mkdir(parents=True, exist_ok=True)
+        E2E_LIVE_REQUEST.write_text(json.dumps({"call_id": call_id, "ts": _utc_now()}), encoding="utf-8")
+    except OSError as exc:
+        LOG.warning("could not write live e2e request: %s", exc)
+
+
+async def _grokbot_call_start(
+    voice: Any,
+    tap: Optional[CallTap],
+    is_e2e: bool,
+) -> dict[str, Any]:
+    """Switch Grok Bot live voice on for this call; tap Suzie only once she is live."""
+    res = await voice.start()
+    if res.get("ok") and tap is not None:
+        # Started after the switch so the patchbay hold tone is not counted as Suzie.
+        await tap.start_source("grok-spk-48k-stereo", GROKBOT_SPK_SINK, 48000, 2)
+    elif not res.get("ok"):
+        LOG.error(
+            "grokbot call path without live voice (e2e=%s): rc=%s %s",
+            is_e2e,
+            res.get("rc"),
+            res.get("meaning"),
+        )
+    return res
 
 
 async def _run_e2e_after_silent_call(call_id: str) -> None:
@@ -1794,6 +2030,8 @@ async def handle_websocket(
     call_watchdog_task: Optional[asyncio.Task] = None
     path_task: Optional[asyncio.Task] = None
     bridge: Optional[PipewireBridge] = None
+    grok_voice: Optional[Any] = None
+    grok_switch_task: Optional[asyncio.Task] = None
     try:
         accept = ws_accept_key(key)
         response = (
@@ -1819,7 +2057,7 @@ async def handle_websocket(
         )
         tap = CallTap.maybe_open(
             loopback=loopback,
-            mode="off" if loopback else OPENCLAW_TALK_MODE,
+            mode="off" if loopback else ("grokbot" if GROKBOT_ON_CALL else OPENCLAW_TALK_MODE),
             e2e=e2e,
         )
         if loopback:
@@ -1829,8 +2067,14 @@ async def handle_websocket(
             result = await set_switchboard_mode(AUTO_MODE_ON_CALL)
             LOG.info("auto mode on call: %s", result.get("applied") or result.get("error"))
 
+        use_openclaw = not loopback and not GROKBOT_ON_CALL
+        use_grokbot = not loopback and GROKBOT_ON_CALL
         if loopback:
             downlink_monitor = GSM_MONITOR
+        elif use_grokbot:
+            # Caller -> patchbay_mic (grok_mic); grok_bus -> caller. No OpenClaw.
+            playback_sink = GROKBOT_MIC_SINK
+            downlink_monitor = GROKBOT_SPK_SINK
         elif OPENCLAW_TALK_MODE == "webrtc-ui":
             playback_sink = PHONE_UPLINK_SINK
             downlink_monitor = OPENCLAW_DOWNLINK_MONITOR
@@ -1847,7 +2091,7 @@ async def handle_websocket(
         )
         live_call.downlink_probe = bridge.downlink_snapshot
         call_watchdog_task = asyncio.create_task(_watch_live_call(live_call, bridge))
-        if not loopback and OPENCLAW_TALK_MODE == "webrtc-ui":
+        if use_openclaw and OPENCLAW_TALK_MODE == "webrtc-ui":
             if OpenClawTalkUI is None or get_talk_ui is None:
                 await fail_call_handshake(writer, "OpenClaw Control UI Talk supervisor is not available")
                 return
@@ -1861,7 +2105,7 @@ async def handle_websocket(
                 active_openclaw = None
                 await fail_call_handshake(writer, f"openclaw webrtc-ui handshake failed: {exc}")
                 return
-        elif not loopback and OPENCLAW_TALK_MODE == "relay":
+        elif use_openclaw and OPENCLAW_TALK_MODE == "relay":
             if OpenClawTalkBridge is None:
                 await fail_call_handshake(writer, "OpenClaw talk bridge is not available")
                 return
@@ -1895,7 +2139,12 @@ async def handle_websocket(
             await fail_call_handshake(writer, f"hub pipewire handshake failed: {exc}")
             return
 
-        if tap is not None and not loopback and OPENCLAW_TALK_MODE == "webrtc-ui":
+        if use_grokbot:
+            bridge.uplink_gain = GROKBOT_UPLINK_GAIN
+            if tap is not None:
+                await tap.start_source("grok-mic-48k-stereo", GROKBOT_MIC_SOURCE, 48000, 2)
+
+        if tap is not None and use_openclaw and OPENCLAW_TALK_MODE == "webrtc-ui":
             await tap.start_source(
                 "openclaw-mic-48k-stereo",
                 # Prefer sink-capture virtual mic (same node Talk Chromium uses).
@@ -1920,10 +2169,18 @@ async def handle_websocket(
                 return
 
         await ws_send_text(
-            writer, json.dumps(session_description(session_id, loopback=loopback, e2e=e2e))
+            writer,
+            json.dumps(
+                session_description(session_id, loopback=loopback, e2e=e2e, grokbot=use_grokbot)
+            ),
         )
         active_bridge = bridge
         live_call.mark_established()
+        if use_grokbot:
+            # Run the switch beside the WS loop: uplink keeps flowing into
+            # grok_mic and the caller hears patchbay's hold tone meanwhile.
+            grok_voice = get_grokbot_voice()
+            grok_switch_task = asyncio.create_task(_grokbot_call_start(grok_voice, tap, e2e))
 
         if openclaw_bridge is not None and OPENCLAW_TALK_MODE == "relay":
             watchdog_task = asyncio.create_task(
@@ -1985,7 +2242,7 @@ async def handle_websocket(
                 try:
                     await ws_send_text(
                         writer,
-                        json.dumps(session_description(session_id, loopback=loopback, e2e=e2e)),
+                        json.dumps(session_description(session_id, loopback=loopback, e2e=e2e, grokbot=use_grokbot)),
                     )
                 except (ConnectionError, BrokenPipeError, OSError) as exc:
                     LOG.warning("relink session.updated failed: %s", exc)
@@ -2015,6 +2272,18 @@ async def handle_websocket(
                 continue
             msg = frame.text
             live_call.note_ws_activity()
+            if frame.binary:
+                parsed = parse_uplink_binary(frame.binary)
+                if parsed is None and bridge.client_in_format == "audio/pcm" and len(frame.binary) >= 2:
+                    raw = frame.binary[: len(frame.binary) & ~1]
+                    parsed = (raw, "audio/pcm", bridge.client_in_rate) if raw else None
+                if parsed is not None:
+                    audio, fmt, rate = parsed
+                    live_call.note_uplink()
+                    bridge.offer_uplink(audio, fmt, rate)
+                    if not loopback and OPENCLAW_TALK_MODE == "relay" and openclaw_bridge is not None:
+                        openclaw_bridge.feed_gsm_ulaw(bridge.to_ulaw_8k(audio, fmt, rate))
+                continue
             if not msg:
                 continue
             try:
@@ -2040,7 +2309,11 @@ async def handle_websocket(
                     audio = base64.b64decode(audio_b64, validate=False)
                     fmt = event.get("format") or ""
                     rate = event.get("rate") or 0
-                    await bridge.write_in(audio, fmt, rate)
+                    # Do not await pw-cat here. A full playback pipe blocks
+                    # drain() forever, the socket stops being read, and the
+                    # phone's ping then dies the connection (~40s) without a
+                    # close frame. Relink never runs while this handler is stuck.
+                    bridge.offer_uplink(audio, fmt, rate)
                     if loopback:
                         energy = (
                             _pcm_rms_energy(_to_pcm16(audio, _normalize_format(fmt) or bridge.client_in_format))
@@ -2058,10 +2331,13 @@ async def handle_websocket(
                     elif OPENCLAW_TALK_MODE == "relay" and openclaw_bridge is not None:
                         openclaw_bridge.feed_gsm_ulaw(bridge.to_ulaw_8k(audio, fmt, rate))
             elif etype == "client.ping":
-                await ws_send_text(
-                    writer,
-                    json.dumps({"type": "client.pong", "t": event.get("t")}),
-                )
+                try:
+                    ws_queue_text(
+                        writer,
+                        json.dumps({"type": "client.pong", "t": event.get("t")}),
+                    )
+                except (ConnectionError, BrokenPipeError, OSError) as exc:
+                    LOG.warning("client.pong queue failed: %s", exc)
             else:
                 LOG.debug("ws event type=%s", etype)
     finally:
@@ -2115,6 +2391,10 @@ async def handle_websocket(
             active_openclaw = None
             LOG.info("openclaw talk stopped (mode=%s)", OPENCLAW_TALK_MODE)
         remember_finished_call(live_call.session_id, live_call.entrance)
+        if grok_voice is not None:
+            # Call is over (clean hangup, abort, or relink grace expired).
+            # patchbay off runs after any still-running switch, off the hot path.
+            grok_voice.stop_later(after=grok_switch_task)
         live_call.release()
         if abort_reason:
             LOG.info("WebSocket disconnected after watchdog: %s", abort_reason)
@@ -2249,8 +2529,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 "mode": current_mode,
                 "openclaw_talk": OPENCLAW_TALK_MODE,
                 "entrances": [item.describe() for item in _active_entrances],
+                "auto_mode": AUTO_MODE_ON_CALL or None,
                 "call": live_call.snapshot(),
             }
+            if GROKBOT_ON_CALL:
+                body["grokbot"] = get_grokbot_voice().snapshot()
             if last_call_tap:
                 body["last_call_tap"] = last_call_tap
             if OPENCLAW_TALK_MODE == "webrtc-ui" and get_talk_ui is not None:
@@ -2471,12 +2754,13 @@ async def main() -> None:
         for item in _active_entrances
     )
     LOG.info(
-        "listening on %s (sink=%s auto_mode=%s openclaw_talk=%s "
+        "listening on %s (sink=%s auto_mode=%s openclaw_talk=%s grokbot=%s "
         "call_watchdog=ws_idle=%s uplink_idle=%s max=%s relink_grace=%s)",
         described,
         GSM_SINK,
         AUTO_MODE_ON_CALL or "off",
         OPENCLAW_TALK_MODE,
+        GROKBOT_ON_CALL,
         CALL_WATCHDOG.ws_idle_s,
         CALL_WATCHDOG.uplink_idle_s,
         CALL_WATCHDOG.max_s,
@@ -2606,6 +2890,13 @@ async def shutdown() -> None:
             await asyncio.wait_for(bridge_ref.stop(), timeout=5.0)
         except Exception:
             LOG.warning("shutdown bridge stop failed", exc_info=True)
+    if GROKBOT_ON_CALL:
+        voice = get_grokbot_voice()
+        if voice.live or voice.switching:
+            try:
+                await asyncio.wait_for(voice.stop(), timeout=10.0)
+            except Exception:
+                LOG.warning("shutdown grokbot off failed", exc_info=True)
     live_call.release()
     raise SystemExit(0)
 

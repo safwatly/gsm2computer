@@ -53,6 +53,47 @@ when navigating. Do not put that token in git or systemd unit files.
 | `relay` | Legacy `OpenClawTalkBridge` / `talk.session.create` |
 | `off` / `0` | No OpenClaw; PipeWire gsm_bus only |
 
+### Stuck-call watchdog
+
+The GSM WebSocket claims the one-live-call slot (`live_call`, ADR 0004) before
+the 101 upgrade and releases it in that handler's `finally`. If the Pixel socket
+stays half-open, later dials get HTTP 409 until the hub process restarts.
+
+After `session.updated`, a watchdog aborts the live handler (close WS → existing
+cleanup of PipeWire helpers, Talk, taps → then release the lock). It does not
+clear the lock while orphans are still running.
+
+| Env | Default | 0 means |
+|---|---|---|
+| `GSM2COMPUTER_CALL_WATCHDOG` | `1` | `0`/`off` disables all checks |
+| `GSM2COMPUTER_CALL_WS_IDLE_S` | `60` | no inbound WS frames (incl. ping/pong) |
+| `GSM2COMPUTER_CALL_UPLINK_IDLE_S` | `120` | no `input_audio_buffer.append` |
+| `GSM2COMPUTER_CALL_UPLINK_GRACE_S` | `45` | wait this long after `session.updated` before requiring uplink |
+| `GSM2COMPUTER_CALL_MAX_S` | `2700` (45 min) | hard cap from slot claim; disable with `0` |
+| `GSM2COMPUTER_CALL_PING_S` | `20` | hub-initiated WS ping after the call is established |
+
+`GET /health` includes `call` (`busy`, `age_s`, `last_ws_s`, `last_uplink_s`).
+
+### Outbound alert webhook (optional)
+
+Stuck-call watchdog aborts POST a Grok Bot webhook when both env vars are set.
+Unset `GSM2COMPUTER_ALERT_WEBHOOK_URL` is a silent skip. This is **not** the
+Pixel SMS outbox (`/sms/outbox`).
+
+| Env | Default | Notes |
+|---|---|---|
+| `GSM2COMPUTER_ALERT_WEBHOOK_URL` | unset | Public HTTPS webhook URL. Empty = no-op |
+| `GSM2COMPUTER_ALERT_WEBHOOK_KEY` | unset | Sender key; sent as `Authorization: Bearer <key>` |
+
+Cup (file-copy deploy) — systemd user drop-in, then reload:
+
+```
+~/.config/systemd/user/gsm2computer-hub.service.d/alert-webhook.conf
+```
+
+Example: [docs/alert-webhook.conf.example](../docs/alert-webhook.conf.example).
+`systemctl --user daemon-reload && systemctl --user restart gsm2computer-hub`
+
 ## Commands
 
 ```bash
@@ -67,3 +108,24 @@ pactl list sources short | grep phone_uplink
 # CDP health
 python3 hub/talk_chromium.py health
 ```
+
+## OpenClaw e2e self-test
+
+`hub/openclaw_e2e.py` injects known TTS over `/e2e-test` (Pixel-shaped PCM
+WebSocket). Pass requires an *unforced* OpenClaw reply (no `response.create`),
+non-silent `openclaw-spk` + `gsm-downlink`, and a non-empty transcript.
+
+- systemd: `gsm2computer-openclaw-e2e.timer` (every 30 min) + oneshot service
+- Hub also starts the oneshot after a real call &gt;10s with silent reply peaks
+- `/e2e-test` is preempted by a real Pixel path so Safwat never sees line-busy
+  from a self-test (exception to ADR 0004 for synthetic holders only)
+- Logs: `~/gsm2computer-e2e/e2e.log` (rotated); taps under `~/gsm2computer-e2e-calls/`
+
+### Talk mic (PipeWire)
+
+`phone_uplink.monitor` can be silent on PipeWire 1.4 null sinks. Talk uses
+`openclaw_phone_mic` (pw-loopback sink-capture of `phone_uplink`), selected by
+label in the Control UI gUM hook. Unit: `gsm2computer-openclaw-phone-mic.service`.
+After Talk binds, the hub **pw-link**s `phone_uplink` → `input.openclaw_phone_mic`
+without restarting the loopback unit or reloading Control UI (a unit restart
+while Chromium holds the source was an audible cut at call start).

@@ -21,6 +21,7 @@ from typing import Any, Optional
 @dataclass
 class WsRead:
     text: str = ""
+    binary: bytes = b""
     ended: bool = False
     close_code: Optional[int] = None
     close_reason: str = ""

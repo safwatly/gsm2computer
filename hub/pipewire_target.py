@@ -110,7 +110,7 @@ _SINK_CAPTURE_BASES = frozenset(
     x.strip()
     for x in os.environ.get(
         "GSM2COMPUTER_PW_SINK_CAPTURE",
-        "openclaw_bus,gsm_bus",
+        "openclaw_bus,gsm_bus,grok_bus,patchbay_mic",
     ).split(",")
     if x.strip()
 )

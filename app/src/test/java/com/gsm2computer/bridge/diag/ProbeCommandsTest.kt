@@ -17,8 +17,8 @@ class ProbeCommandsTest {
     @Test
     fun hubPingFollowsTheRoutingTable() {
         assertEquals(
-            listOf("/system/bin/ping", "-n", "-c", "1", "-W", "1", "100.119.126.42"),
-            ProbeCommands.ping("100.119.126.42", null),
+            listOf("/system/bin/ping", "-n", "-c", "1", "-W", "1", "192.0.2.42"),
+            ProbeCommands.ping("192.0.2.42", null),
         )
     }
 

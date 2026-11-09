@@ -1,0 +1,16 @@
+[Unit]
+Description=gsm2computer virtual mic (sink-capture phone_uplink → openclaw_phone_mic)
+After=pipewire.service gsm2computer-audio-bus.service
+Wants=gsm2computer-audio-bus.service
+PartOf=pipewire.service
+
+[Service]
+Type=simple
+# phone_uplink.monitor is silent on current PipeWire (monitor.passthrough);
+# capture the sink itself and expose Audio/Source openclaw_phone_mic for Talk.
+ExecStart=%h/gsm2computer-hub/start-openclaw-phone-mic.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

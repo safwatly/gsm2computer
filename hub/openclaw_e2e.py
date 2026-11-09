@@ -1,0 +1,1293 @@
+#!/usr/bin/env python3
+"""OpenClaw end-to-end self-test + self-heal ladder (runs on safwat-cup).
+
+Connects like the Pixel (Bearer token, /e2e-test, client.audio + PCM append),
+injects a short known TTS clip, and requires OpenClaw to reply *without* a
+forced ``response.create``. Pass = unforced trigger + non-silent openclaw-spk
+and gsm-downlink + non-empty transcript.
+
+On failure, a one-shot ladder runs while idle:
+  (a) soft reload Control UI Talk page
+  (b) restart openclaw-gateway
+  (c) restart talk-chromium
+  (d) setup-audio-bus.sh (+ sink-capture sanity)
+then re-tests after each step. All steps failing → alert webhook (wakes Cup).
+
+A live Pixel call always wins: hub preempts /e2e-test; this client aborts if
+/health shows a non-e2e busy slot.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
+import wave
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+import websockets
+from websockets.exceptions import ConnectionClosed
+
+from call_slot import disruptive_heal_blocked
+from alert_webhook import post_system_alert
+
+LOG = logging.getLogger("gsm2computer-e2e")
+
+HUB_HTTP = os.environ.get("GSM2COMPUTER_E2E_HUB", "http://127.0.0.1:8787")
+# Cup binds the hub on the Tailscale IP; prefer explicit env / health URL.
+if HUB_HTTP.endswith("/"):
+    HUB_HTTP = HUB_HTTP[:-1]
+CDP_LIST = os.environ.get("GSM2COMPUTER_TALK_CDP_LIST", "http://127.0.0.1:9222/json/list")
+PROMPT = os.environ.get(
+    "GSM2COMPUTER_E2E_PROMPT",
+    "Hi, this is a test. What is two plus two?",
+)
+PEAK_MIN = float(os.environ.get("GSM2COMPUTER_E2E_PEAK_MIN", "0.02"))
+BUDGET_S = float(os.environ.get("GSM2COMPUTER_E2E_BUDGET_S", "28"))
+PCM_RATE = int(os.environ.get("GSM2COMPUTER_E2E_PCM_RATE", "48000"))
+GAIN = float(os.environ.get("GSM2COMPUTER_E2E_GAIN", "4.0"))
+LOG_PATH = Path(
+    os.environ.get(
+        "GSM2COMPUTER_E2E_LOG",
+        str(Path.home() / "gsm2computer-e2e" / "e2e.log"),
+    )
+)
+STATE_PATH = Path(
+    os.environ.get(
+        "GSM2COMPUTER_E2E_STATE",
+        str(Path.home() / "gsm2computer-e2e" / "last-run.json"),
+    )
+)
+HUB_DIR = Path(os.environ.get("GSM2COMPUTER_HUB_DIR", Path(__file__).resolve().parent))
+
+
+@dataclass
+class E2EResult:
+    ok: bool
+    step: str
+    latency_s: float
+    spk_peak: float = 0.0
+    downlink_peak: float = 0.0
+    mic_peak: float = 0.0
+    transcript: str = ""
+    triggered_unforced: bool = False
+    forced_used: bool = False
+    aborted_for_real_call: bool = False
+    tap_id: Optional[str] = None
+    error: Optional[str] = None
+    dc_types: list[str] = field(default_factory=list)
+    responses: int = 0  # distinct replies with transcript
+    responses_created: int = 0
+    truncations: int = 0  # conversation.item.truncated (barge-in)
+    speech_stops: int = 0  # input_audio_buffer.speech_stopped (user turns)
+
+    def summary(self) -> str:
+        status = "PASS" if self.ok else "FAIL"
+        return (
+            f"{status} step={self.step} lat={self.latency_s:.1f}s "
+            f"spk={self.spk_peak:.3f} dl={self.downlink_peak:.3f} "
+            f"unforced={self.triggered_unforced} replies={self.responses_created} "
+            f"truncated={self.truncations} turns={self.speech_stops} "
+            f"transcript={self.transcript[:80]!r} "
+            f"err={self.error!r}"
+        )
+
+
+def setup_logging() -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LOG.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    LOG.handlers.clear()
+    LOG.addHandler(sh)
+    fh = RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=8)
+    fh.setFormatter(fmt)
+    LOG.addHandler(fh)
+
+
+def _http_json(method: str, url: str, body: Optional[bytes] = None, timeout: float = 8.0) -> Any:
+    req = Request(url, data=body, method=method)
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    with urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    if not raw:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def health(*, retries: int = 8, delay_s: float = 0.5) -> dict[str, Any]:
+    last: Exception | None = None
+    for i in range(max(1, retries)):
+        try:
+            return _http_json("GET", f"{HUB_HTTP}/health")
+        except Exception as exc:  # noqa: BLE001 — transient during hub restart
+            last = exc
+            if i + 1 < retries:
+                time.sleep(delay_s)
+    assert last is not None
+    raise last
+
+
+def line_idle(h: Optional[dict[str, Any]] = None) -> bool:
+    h = h or health()
+    return not disruptive_heal_blocked(h)
+
+
+def real_call_holding(h: Optional[dict[str, Any]] = None) -> bool:
+    """True when a non-e2e call owns the slot (Pixel / production)."""
+    h = h or health()
+    call = h.get("call") or {}
+    if not call.get("busy"):
+        return False
+    return not bool(call.get("e2e"))
+
+
+async def wait_until_idle(*, timeout_s: float = 20.0, poll_s: float = 0.25) -> bool:
+    """Wait until hub reports no busy call and talk inactive (post-e2e teardown)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            h = health()
+        except Exception:
+            await asyncio.sleep(poll_s)
+            continue
+        if not disruptive_heal_blocked(h):
+            return True
+        # Never touch /admin/call/release — close our own WS and wait.
+        await asyncio.sleep(poll_s)
+    return line_idle()
+
+
+def get_token() -> str:
+    data = _http_json("POST", f"{HUB_HTTP}/token", body=b"")
+    if not isinstance(data, dict) or not data.get("value"):
+        raise RuntimeError(f"token failed: {data!r}")
+    return str(data["value"])
+
+
+def synthesize_prompt_pcm(text: str, rate: int = PCM_RATE) -> bytes:
+    """espeak-ng → wav → mono s16le at ``rate``, with gain for VAD."""
+    out_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "gsm2-e2e"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    wav_path = out_dir / "prompt.wav"
+    pcm_path = out_dir / "prompt.s16"
+    subprocess.run(
+        [
+            "espeak-ng",
+            "-v",
+            "en-us",
+            "-s",
+            "150",
+            "-w",
+            str(wav_path),
+            text,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(wav_path),
+            "-ac",
+            "1",
+            "-ar",
+            str(rate),
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            str(pcm_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    raw = pcm_path.read_bytes()
+    # Apply gain (clip).
+    import array
+
+    samples = array.array("h")
+    samples.frombytes(raw)
+    g = GAIN
+    for i, s in enumerate(samples):
+        v = int(s * g)
+        if v > 32767:
+            v = 32767
+        elif v < -32768:
+            v = -32768
+        samples[i] = v
+    return samples.tobytes()
+
+
+UPLINK_FRAME_S = 0.02
+UPLINK_TAIL_S = float(os.environ.get("GSM2COMPUTER_E2E_TAIL_SILENCE_S", "0.3"))
+REAL_CALL_CHECK_S = 0.5
+REPLY_DONE_WAIT_S = float(os.environ.get("GSM2COMPUTER_E2E_REPLY_DONE_WAIT_S", "10"))
+
+
+def trailing_silence(rate: int, seconds: float = UPLINK_TAIL_S) -> list[bytes]:
+    """~300 ms of zero frames so pw-cat/VAD see a clean end of speech."""
+    frame = b"\x00\x00" * max(1, int(rate * UPLINK_FRAME_S))
+    return [frame] * max(0, int(round(seconds / UPLINK_FRAME_S)))
+
+
+async def _real_call_holding_async() -> bool:
+    try:
+        return bool(await asyncio.to_thread(real_call_holding))
+    except Exception:
+        return False
+
+
+async def paced_uplink(
+    ws: Any,
+    chunks: list[bytes],
+    *,
+    rate: int = PCM_RATE,
+    frame_s: float = UPLINK_FRAME_S,
+    check_s: float = REAL_CALL_CHECK_S,
+    holding=_real_call_holding_async,
+    clock=time.monotonic,
+    sleep=asyncio.sleep,
+) -> bool:
+    """Send 20 ms frames against a fixed clock. Returns True if a real call preempted.
+
+    The real-call check runs in a background thread every ``check_s`` and is
+    never awaited inside the frame loop.
+    """
+    t0 = clock()
+    check: Optional[asyncio.Task] = None
+    last_check = -1e9
+    try:
+        for i, chunk in enumerate(chunks):
+            now = clock()
+            if check is not None and check.done():
+                if check.result():
+                    return True
+                check = None
+            if check is None and now - last_check >= check_s:
+                last_check = now
+                check = asyncio.ensure_future(holding())
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(chunk).decode("ascii"),
+                        "format": "audio/pcm",
+                        "rate": rate,
+                    }
+                )
+            )
+            delay = t0 + (i + 1) * frame_s - clock()
+            if delay > 0:
+                await sleep(delay)
+        return False
+    finally:
+        if check is not None and not check.done():
+            check.cancel()
+
+
+def _pcm_chunks(pcm: bytes, rate: int, frame_ms: int = 20) -> list[bytes]:
+    frame = rate * 2 * frame_ms // 1000
+    if frame <= 0:
+        frame = rate * 2 // 50
+    return [pcm[i : i + frame] for i in range(0, len(pcm), frame) if pcm[i : i + frame]]
+
+
+async def _cdp_call(ws, nid_box: list[int], method: str, params: Optional[dict] = None) -> dict:
+    nid_box[0] += 1
+    my = nid_box[0]
+    await ws.send(json.dumps({"id": my, "method": method, "params": params or {}}))
+    while True:
+        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+        if msg.get("id") == my:
+            return msg
+
+
+async def _cdp_page_ws() -> str:
+    targets = _http_json("GET", CDP_LIST)
+    if not isinstance(targets, list):
+        raise RuntimeError("cdp list failed")
+    page = next(
+        (
+            t
+            for t in targets
+            if t.get("type") == "page" and "chat" in (t.get("url") or "")
+        ),
+        None,
+    )
+    if not page or not page.get("webSocketDebuggerUrl"):
+        raise RuntimeError("no Control UI chat page on CDP")
+    return str(page["webSocketDebuggerUrl"])
+
+
+DC_HOOK_JS = r"""
+(() => {
+  // v2 state lives under a new global: listeners installed by an older hook in
+  // this long-lived page keep writing to the legacy sink below, not to v2.
+  window.__gsm2E2E = {types: [], transcripts: [], responseCreated: 0, forced: false};
+  window.__gsm2E2Ev2 = {types: [], byResp: {}, order: [], responseCreated: 0, forced: false};
+  const push = (j) => {
+    try {
+      const t = j.type || "?";
+      window.__gsm2E2Ev2.types.push(t);
+      if (t === "response.created") window.__gsm2E2Ev2.responseCreated += 1;
+      // One entry per response: deltas accumulate, .done replaces them
+      // (pushing both double-counted every reply: "Hi Modi!Hi Modi!").
+      const E = window.__gsm2E2Ev2;
+      E.byResp = E.byResp || {};
+      E.order = E.order || [];
+      const key = String(j.response_id || j.item_id || "_");
+      if (t === "response.output_audio_transcript.delta" && j.delta) {
+        if (!(key in E.byResp)) { E.byResp[key] = ""; E.order.push(key); }
+        E.byResp[key] += String(j.delta);
+      }
+      if (t === "response.output_audio_transcript.done" && j.transcript) {
+        if (!(key in E.byResp)) E.order.push(key);
+        E.byResp[key] = String(j.transcript);
+      }
+    } catch (e) {}
+  };
+  window.__gsm2E2Ev2Push = push;
+  const attach = (ch) => {
+    if (!ch || ch.__gsm2E2EAttachedV2) return;
+    ch.__gsm2E2EAttachedV2 = true;
+    window.__gsm2E2Ev2.dc = ch;
+    ch.addEventListener("message", (ev) => {
+      if (typeof ev.data !== "string") return;
+      try { (window.__gsm2E2Ev2Push || push)(JSON.parse(ev.data)); } catch (e) {}
+    });
+  };
+  const Orig = window.RTCPeerConnection;
+  if (!Orig || window.__gsm2E2EHookedV2) {
+    // still attach to any existing DC
+    if (window.__gsm2Dc) attach(window.__gsm2Dc);
+    return "already";
+  }
+  function Wrapped(...args) {
+    const pc = new Orig(...args);
+    const cdc = pc.createDataChannel.bind(pc);
+    pc.createDataChannel = (...x) => {
+      const ch = cdc(...x);
+      attach(ch);
+      return ch;
+    };
+    pc.addEventListener("datachannel", (ev) => attach(ev.channel));
+    return pc;
+  }
+  Wrapped.prototype = Orig.prototype;
+  Object.setPrototypeOf(Wrapped, Orig);
+  window.RTCPeerConnection = Wrapped;
+  window.__gsm2E2EHookedV2 = true;
+  return "hooked";
+})()
+"""
+
+DC_SNAP_JS = r"""
+(() => {
+  const e = window.__gsm2E2Ev2 || {};
+  return {
+    types: (e.types || []).slice(-80),
+    transcript: (e.order || []).map((k) => (e.byResp || {})[k] || "").join(" | "),
+    responses: (e.order || []).length,
+    responseCreated: e.responseCreated || 0,
+    dcState: e.dc ? e.dc.readyState : null,
+  };
+})()
+"""
+
+
+
+async def _attach_existing_dc() -> None:
+    """Attach e2e DC listener to Talk datachannels created before the e2e hook."""
+    ws_url = await _cdp_page_ws()
+    import websockets
+
+    js = r"""
+(() => {
+  if (!window.__gsm2E2Ev2) return {ok:false, reason:"no-e2e-hook"};
+  const push = (j) => {
+    try {
+      const t = j.type || "?";
+      window.__gsm2E2Ev2.types.push(t);
+      if (t === "response.created") window.__gsm2E2Ev2.responseCreated += 1;
+      // One entry per response: deltas accumulate, .done replaces them
+      // (pushing both double-counted every reply: "Hi Modi!Hi Modi!").
+      const E = window.__gsm2E2Ev2;
+      E.byResp = E.byResp || {};
+      E.order = E.order || [];
+      const key = String(j.response_id || j.item_id || "_");
+      if (t === "response.output_audio_transcript.delta" && j.delta) {
+        if (!(key in E.byResp)) { E.byResp[key] = ""; E.order.push(key); }
+        E.byResp[key] += String(j.delta);
+      }
+      if (t === "response.output_audio_transcript.done" && j.transcript) {
+        if (!(key in E.byResp)) E.order.push(key);
+        E.byResp[key] = String(j.transcript);
+      }
+    } catch (e) {}
+  };
+  window.__gsm2E2Ev2Push = push;
+  const attach = (ch) => {
+    if (!ch || ch.__gsm2E2EAttachedV2) return false;
+    ch.__gsm2E2EAttachedV2 = true;
+    window.__gsm2E2Ev2.dc = ch;
+    ch.addEventListener("message", (ev) => {
+      if (typeof ev.data !== "string") return;
+      try { (window.__gsm2E2Ev2Push || push)(JSON.parse(ev.data)); } catch (e) {}
+    });
+    return true;
+  };
+  let n = 0;
+  if (window.__gsm2Dc && attach(window.__gsm2Dc)) n++;
+  for (const ch of (window.__gsm2DataChannels || [])) {
+    if (attach(ch)) n++;
+  }
+  for (const pc of (window.__gsm2TalkPcs || [])) {
+    pc.addEventListener("datachannel", (ev) => attach(ev.channel));
+  }
+  return {ok:true, attached:n, hasDc:!!window.__gsm2E2Ev2.dc};
+})()
+"""
+    async with websockets.connect(ws_url, max_size=8_000_000, open_timeout=5) as ws:
+        nid = 1
+        await ws.send(
+            json.dumps(
+                {
+                    "id": nid,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": js, "returnByValue": True},
+                }
+            )
+        )
+        while True:
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+            if msg.get("id") == nid:
+                LOG.info("dc attach existing: %s", ((msg.get("result") or {}).get("result") or {}).get("value"))
+                return
+
+
+async def install_dc_hook() -> None:
+    url = await _cdp_page_ws()
+    async with websockets.connect(url, max_size=50_000_000) as ws:
+        nid = [0]
+        await _cdp_call(ws, nid, "Runtime.enable")
+        r = await _cdp_call(
+            ws, nid, "Runtime.evaluate", {"expression": DC_HOOK_JS, "returnByValue": True}
+        )
+        LOG.info("cdp dc hook: %s", (r.get("result") or {}).get("result", {}).get("value"))
+
+
+async def snap_dc() -> dict[str, Any]:
+    url = await _cdp_page_ws()
+    async with websockets.connect(url, max_size=50_000_000) as ws:
+        nid = [0]
+        await _cdp_call(ws, nid, "Runtime.enable")
+        r = await _cdp_call(
+            ws, nid, "Runtime.evaluate", {"expression": DC_SNAP_JS, "returnByValue": True}
+        )
+        val = ((r.get("result") or {}).get("result") or {}).get("value") or {}
+        return val if isinstance(val, dict) else {}
+
+
+def _ws_url() -> str:
+    base = HUB_HTTP.replace("https://", "wss://").replace("http://", "ws://")
+    return f"{base}/e2e-test"
+
+
+
+def ensure_phone_mic_preflight() -> None:
+    """Ensure virtual mic unit is running. Post-Talk re-link is pw-link, not unit restart."""
+    import subprocess
+    unit = "gsm2computer-openclaw-phone-mic.service"
+    try:
+        st = subprocess.run(["systemctl", "--user", "is-active", unit], capture_output=True, text=True, timeout=5)
+        if st.returncode != 0 or "active" not in (st.stdout or ""):
+            LOG.warning("preflight: starting %s (was %r)", unit, (st.stdout or "").strip())
+            subprocess.run(["systemctl", "--user", "restart", unit], check=False, timeout=10)
+            time.sleep(0.8)
+    except Exception as exc:
+        LOG.warning("preflight phone mic: %s", exc)
+
+
+async def run_once(step: str = "initial", *, allow_force: bool = False) -> E2EResult:
+    """Run one e2e attempt. Never sends response.create unless allow_force (debug only)."""
+    ensure_phone_mic_preflight()
+    t0 = time.monotonic()
+    result = E2EResult(ok=False, step=step, latency_s=0.0)
+    try:
+        h0 = health()
+        if real_call_holding(h0):
+            result.aborted_for_real_call = True
+            result.error = "real call in progress"
+            result.latency_s = time.monotonic() - t0
+            return result
+        if not line_idle(h0) and not (h0.get("call") or {}).get("e2e"):
+            # busy with something else
+            result.error = f"line not idle: {h0.get('call')}"
+            result.latency_s = time.monotonic() - t0
+            return result
+
+        from talk_chromium import page_ready
+        if not page_ready((h0.get("talk") or {}).get("page")):
+            result.error = "Talk page not ready on expected origin /chat/main"
+            result.latency_s = time.monotonic() - t0
+            return result
+        pcm = synthesize_prompt_pcm(PROMPT, PCM_RATE)
+        chunks = _pcm_chunks(pcm, PCM_RATE)
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        async with websockets.connect(
+            _ws_url(), additional_headers=headers, max_size=8_000_000, open_timeout=10
+        ) as ws:
+            # session.updated
+            while time.monotonic() - t0 < 12:
+                if real_call_holding():
+                    result.aborted_for_real_call = True
+                    result.error = "preempted before session"
+                    break
+                raw = await asyncio.wait_for(ws.recv(), timeout=12)
+                if isinstance(raw, (bytes, bytearray)):
+                    continue
+                msg = json.loads(raw)
+                if msg.get("type") == "session.updated":
+                    sess = msg.get("session") or {}
+                    if not sess.get("e2e"):
+                        result.error = "hub did not tag session e2e"
+                    LOG.info("session.updated e2e=%s", sess.get("e2e"))
+                    break
+            if result.aborted_for_real_call:
+                result.latency_s = time.monotonic() - t0
+                return result
+
+            # wait webrtc
+            for _ in range(40):
+                if real_call_holding():
+                    result.aborted_for_real_call = True
+                    result.error = "preempted waiting webrtc"
+                    break
+                h = health()
+                if (h.get("talk") or {}).get("webrtc_connected"):
+                    break
+                await asyncio.sleep(0.25)
+            if result.aborted_for_real_call:
+                result.latency_s = time.monotonic() - t0
+                return result
+
+            # Hook AFTER Talk WebRTC (PC exists). start_talk no longer reloads
+            # the page, but the hook still has to run after the peer is created.
+            await install_dc_hook()
+            # Attach to any DataChannel already open on the live PC.
+            await _attach_existing_dc()
+
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "client.audio",
+                        "input": {"format": "audio/pcm", "rate": PCM_RATE},
+                        "output": {"format": "audio/pcm", "rate": PCM_RATE},
+                    }
+                )
+            )
+            # uplink TTS at 1x real time. The old loop did a blocking /health
+            # call + sleep(0.02) per 20 ms chunk (~2.2x slow), so pw-cat
+            # underran every other quantum and OpenClaw heard a stretched,
+            # choppy prompt (early turn end, truncation, double replies).
+            if await paced_uplink(ws, chunks + trailing_silence(PCM_RATE)):
+                result.aborted_for_real_call = True
+                result.error = "preempted during uplink"
+            if result.aborted_for_real_call:
+                result.latency_s = time.monotonic() - t0
+                return result
+
+            # linger for VAD end-of-speech + reply (no force)
+            deadline = min(t0 + BUDGET_S - 3.0, time.monotonic() + 16.0)
+            triggered = False
+            transcript = ""
+            responses = 0
+            types: list[str] = []
+            while time.monotonic() < deadline:
+                if real_call_holding():
+                    result.aborted_for_real_call = True
+                    result.error = "preempted while waiting reply"
+                    break
+                snap = await snap_dc()
+                types = list(snap.get("types") or [])
+                transcript = str(snap.get("transcript") or "")
+                if int(snap.get("responseCreated") or 0) > 0:
+                    triggered = True
+                    # Let the reply finish (response.done) so we can judge one
+                    # clean reply vs truncation/double replies; bounded wait.
+                    done_by = time.monotonic() + REPLY_DONE_WAIT_S
+                    while time.monotonic() < done_by:
+                        await asyncio.sleep(0.4)
+                        snap = await snap_dc()
+                        types = list(snap.get("types") or [])
+                        transcript = str(snap.get("transcript") or "")
+                        if "response.done" in types:
+                            break
+                    responses = int(snap.get("responses") or 0)
+                    await asyncio.sleep(0.8)
+                    snap = await snap_dc()
+                    types = list(snap.get("types") or [])
+                    transcript = str(snap.get("transcript") or "")
+                    responses = int(snap.get("responses") or responses)
+                    break
+                await asyncio.sleep(0.4)
+
+            if allow_force and not triggered and not result.aborted_for_real_call:
+                result.forced_used = True
+                result.error = "unforced trigger failed (force not used in prod pass)"
+
+            # close ws so tap finalizes
+            await ws.close()
+
+        await asyncio.sleep(1.2)
+        h = health()
+        tap = h.get("last_call_tap") or {}
+        streams = tap.get("streams") or {}
+        result.tap_id = tap.get("id")
+        result.spk_peak = float((streams.get("openclaw-spk-48k-stereo") or {}).get("peak") or 0.0)
+        result.downlink_peak = float((streams.get("gsm-downlink-8k-mono") or {}).get("peak") or 0.0)
+        result.mic_peak = float((streams.get("openclaw-mic-48k-stereo") or {}).get("peak") or 0.0)
+        result.transcript = transcript.strip()
+        result.triggered_unforced = triggered and not result.forced_used
+        result.dc_types = types[-40:]
+        result.responses = responses
+        result.responses_created = types.count("response.created")
+        result.truncations = types.count("conversation.item.truncated")
+        result.speech_stops = types.count("input_audio_buffer.speech_stopped")
+        result.latency_s = time.monotonic() - t0
+
+        if result.aborted_for_real_call:
+            return result
+
+        reasons = []
+        if not result.triggered_unforced:
+            reasons.append("no unforced OpenClaw response.created")
+        if result.spk_peak < PEAK_MIN:
+            reasons.append(f"openclaw-spk peak {result.spk_peak:.4f} < {PEAK_MIN}")
+        if result.downlink_peak < PEAK_MIN:
+            reasons.append(f"gsm-downlink peak {result.downlink_peak:.4f} < {PEAK_MIN}")
+        if not result.transcript:
+            reasons.append("empty transcript")
+        if reasons:
+            result.error = "; ".join(reasons)
+            result.ok = False
+        else:
+            result.ok = True
+            result.error = None
+        return result
+    except Exception as exc:
+        result.error = f"{type(exc).__name__}: {exc}"
+        result.latency_s = time.monotonic() - t0
+        LOG.exception("e2e run failed")
+        return result
+
+
+# ---------------------------------------------------------------- grokbot
+# AUTO_MODE=grokbot: calls are answered by Grok Bot live voice via patchbay.
+# Timer runs stay non-invasive (patchbay selftest). A live voice test runs
+# only with --live or when the hub left a live-request after a silent call.
+GROK_LINGER_S = float(os.environ.get("GSM2COMPUTER_E2E_GROK_LINGER_S", "14"))
+GROK_SWITCH_WAIT_S = float(os.environ.get("GSM2COMPUTER_E2E_GROK_SWITCH_WAIT_S", "65"))
+GROK_LIVE_REQUEST = Path(
+    os.environ.get(
+        "GSM2COMPUTER_E2E_LIVE_REQUEST",
+        str(Path.home() / "gsm2computer-e2e" / "live-request"),
+    )
+)
+PATCHBAY_BIN = os.environ.get("GSM2COMPUTER_PATCHBAY_BIN", str(Path.home() / "bin" / "patchbay"))
+# A short arithmetic question gets a one-word reply ("Four.") that is too short
+# to tell from an app chime; ask for a few seconds of speech instead.
+GROK_PROMPT = os.environ.get(
+    "GSM2COMPUTER_E2E_GROK_PROMPT",
+    "Hi Suzie, this is an automated test call. Please count slowly from one to five.",
+)
+
+
+def hub_grokbot_mode(h: Optional[dict[str, Any]] = None) -> bool:
+    h = h or health()
+    return str(h.get("auto_mode") or "").lower() == "grokbot"
+
+
+def wav_tail_loud_s(path: Path, tail_s: float, thresh: float = PEAK_MIN) -> tuple[float, float]:
+    """(loud seconds in the last tail_s, total seconds) using 100 ms RMS windows."""
+    import array
+
+    with wave.open(str(path), "rb") as w:
+        rate = w.getframerate() or 48000
+        ch = w.getnchannels() or 1
+        n = w.getnframes()
+        total = n / float(rate)
+        start = max(0, n - int(tail_s * rate))
+        w.setpos(start)
+        frames = w.readframes(n - start)
+    samples = array.array("h")
+    samples.frombytes(frames[: len(frames) - (len(frames) % 2)])
+    win = max(1, int(rate * ch * 0.1))
+    loud = 0
+    for i in range(0, len(samples), win):
+        seg = samples[i : i + win]
+        if not seg:
+            continue
+        rms = (sum(x * x for x in seg) / len(seg)) ** 0.5 / 32768.0
+        if rms >= thresh / 2:
+            loud += 1
+    return loud * 0.1, total
+
+
+async def _wait_grok_live(t_connect_wall: float, ws: Any) -> tuple[bool, dict[str, Any]]:
+    """Feed uplink silence while the hub's patchbay switch runs; return (live, grokbot)."""
+    deadline = time.monotonic() + GROK_SWITCH_WAIT_S
+    silence = trailing_silence(PCM_RATE, 0.5)
+    grok: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        if await paced_uplink(ws, silence):
+            return False, {"preempted": True}
+        h = await asyncio.to_thread(health)
+        grok = h.get("grokbot") or {}
+        last = grok.get("last_switch") or {}
+        if not grok.get("switching") and (last.get("at") or 0) >= t_connect_wall - 1:
+            return bool(last.get("ok")), grok
+    return False, grok
+
+
+async def run_once_grokbot(step: str = "grok_live") -> E2EResult:
+    t0 = time.monotonic()
+    result = E2EResult(ok=False, step=step, latency_s=0.0)
+    try:
+        h0 = health()
+        if real_call_holding(h0):
+            result.aborted_for_real_call = True
+            result.error = "real call in progress"
+            return result
+        if not line_idle(h0):
+            result.error = f"line not idle: {h0.get('call')}"
+            return result
+        pcm = synthesize_prompt_pcm(GROK_PROMPT, PCM_RATE)
+        chunks = _pcm_chunks(pcm, PCM_RATE)
+        token = get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        t_connect_wall = time.time()
+        live = False
+        async with websockets.connect(
+            _ws_url(), additional_headers=headers, max_size=8_000_000, open_timeout=10
+        ) as ws:
+            # Downlink deltas can arrive before session.updated; skip them.
+            msg: dict[str, Any] = {}
+            ack_deadline = time.monotonic() + 15
+            while time.monotonic() < ack_deadline:
+                raw = await asyncio.wait_for(ws.recv(), timeout=15)
+                msg = json.loads(raw) if isinstance(raw, str) else {}
+                if msg.get("type") == "session.updated":
+                    break
+            sess = msg.get("session") or {}
+            if msg.get("type") != "session.updated" or sess.get("talk") != "grokbot":
+                result.error = f"hub session not grokbot: {msg.get('type')} talk={sess.get('talk')}"
+                await ws.close()
+                return result
+
+            async def _drain() -> None:
+                # Read downlink like the Pixel so the hub never sees backpressure.
+                try:
+                    async for _ in ws:
+                        pass
+                except Exception:
+                    pass
+
+            drain_task = asyncio.create_task(_drain())
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "client.audio",
+                        "input": {"format": "audio/pcm", "rate": PCM_RATE},
+                        "output": {"format": "audio/pcm", "rate": PCM_RATE},
+                    }
+                )
+            )
+            live, grok = await _wait_grok_live(t_connect_wall, ws)
+            if grok.get("preempted"):
+                result.aborted_for_real_call = True
+                result.error = "preempted waiting for Grok live"
+                return result
+            if not live:
+                last = grok.get("last_switch") or {}
+                result.error = f"Grok live voice did not start: rc={last.get('rc')} {last.get('meaning')}"
+            else:
+                # Let any greeting settle, then speak, then listen.
+                if await paced_uplink(ws, trailing_silence(PCM_RATE, 2.0)):
+                    result.aborted_for_real_call = True
+                if not result.aborted_for_real_call and await paced_uplink(
+                    ws, chunks + trailing_silence(PCM_RATE)
+                ):
+                    result.aborted_for_real_call = True
+                if not result.aborted_for_real_call and await paced_uplink(
+                    ws, trailing_silence(PCM_RATE, GROK_LINGER_S)
+                ):
+                    result.aborted_for_real_call = True
+            await ws.close()
+            drain_task.cancel()
+        if result.aborted_for_real_call:
+            result.error = result.error or "preempted during grok e2e"
+            return result
+        await asyncio.sleep(1.5)
+        h = health()
+        tap = h.get("last_call_tap") or {}
+        streams = tap.get("streams") or {}
+        result.tap_id = tap.get("id")
+        result.spk_peak = float((streams.get("grok-spk-48k-stereo") or {}).get("peak") or 0.0)
+        result.downlink_peak = float((streams.get("gsm-downlink-8k-mono") or {}).get("peak") or 0.0)
+        result.mic_peak = float((streams.get("grok-mic-48k-stereo") or {}).get("peak") or 0.0)
+        reply_s = 0.0
+        spk = streams.get("grok-spk-48k-stereo") or {}
+        if tap.get("dir") and spk.get("file"):
+            try:
+                reply_s, _ = wav_tail_loud_s(Path(tap["dir"]) / spk["file"], GROK_LINGER_S)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("grok spk tail read failed: %s", exc)
+        result.triggered_unforced = reply_s >= 0.5
+        result.transcript = f"(audio only) Suzie spoke {reply_s:.1f}s after the prompt"
+        if not live:
+            return result
+        reasons = []
+        if result.mic_peak < PEAK_MIN:
+            reasons.append(f"grok-mic peak {result.mic_peak:.4f} < {PEAK_MIN} (caller audio not reaching bot)")
+        if result.spk_peak < PEAK_MIN:
+            reasons.append(f"grok-spk peak {result.spk_peak:.4f} < {PEAK_MIN}")
+        if result.downlink_peak < PEAK_MIN:
+            reasons.append(f"gsm-downlink peak {result.downlink_peak:.4f} < {PEAK_MIN}")
+        if not result.triggered_unforced:
+            reasons.append(f"no Suzie audio after prompt ({reply_s:.1f}s loud)")
+        result.ok = not reasons
+        result.error = "; ".join(reasons) or None
+        return result
+    except Exception as exc:  # noqa: BLE001
+        result.error = f"{type(exc).__name__}: {exc}"
+        LOG.exception("grok e2e failed")
+        return result
+    finally:
+        result.latency_s = time.monotonic() - t0
+
+
+def grok_selftest() -> E2EResult:
+    """Non-invasive: patchbay selftest (CDP, devices, routing rule). No live voice."""
+    t0 = time.monotonic()
+    r = E2EResult(ok=False, step="grok_selftest", latency_s=0.0)
+    try:
+        p = subprocess.run(
+            [PATCHBAY_BIN, "selftest", "--json"],
+            capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL,
+        )
+        out = p.stdout or ""
+        data = json.loads(out[out.index("{"):]) if "{" in out else {}
+        r.ok = p.returncode == 0 and bool(data.get("ok"))
+        if not r.ok:
+            r.error = f"patchbay selftest rc={p.returncode} checks={data.get('checks')}"
+        r.transcript = f"checks={data.get('checks')}"
+    except Exception as exc:  # noqa: BLE001
+        r.error = f"{type(exc).__name__}: {exc}"
+    r.latency_s = time.monotonic() - t0
+    return r
+
+
+async def run_grokbot(*, live: bool = False) -> E2EResult:
+    if real_call_holding():
+        r = E2EResult(ok=False, step="skipped", latency_s=0.0, aborted_for_real_call=True,
+                      error="real call in progress")
+        persist(r)
+        return r
+    if not line_idle():
+        r = E2EResult(ok=False, step="skipped", latency_s=0.0, error="line not idle")
+        persist(r)
+        return r
+    requested = GROK_LIVE_REQUEST.is_file()
+    if live or requested:
+        if requested:
+            try:
+                GROK_LIVE_REQUEST.unlink()
+            except OSError:
+                pass
+        r = await run_once_grokbot()
+        await wait_until_idle(timeout_s=30.0)
+    else:
+        r = await asyncio.to_thread(grok_selftest)
+    persist(r, {"mode": "grokbot", "live": bool(live or requested)})
+    if not r.ok and not r.aborted_for_real_call and os.environ.get(
+        "GSM2COMPUTER_E2E_ALERT", "0"
+    ).lower() in ("1", "true", "yes", "on"):
+        post_system_alert(f"Grok Bot e2e FAILED ({r.step}): {r.error}", e2e=True)
+    return r
+
+
+async def soft_reload_talk() -> None:
+    LOG.info("heal(a): soft reload Control UI")
+    if disruptive_heal_blocked(health()):
+        raise RuntimeError("refusing soft reload: live call or talk active")
+    if not await wait_until_idle(timeout_s=20.0):
+        raise RuntimeError("refusing soft reload: line not idle")
+    if disruptive_heal_blocked(health()):
+        raise RuntimeError("refusing soft reload: line became live")
+    sys.path.insert(0, str(HUB_DIR))
+    from talk_chromium import get_talk_ui  # type: ignore
+
+    ui = get_talk_ui()
+    ui.idle_check = lambda: line_idle(health())
+    await ui.reload_control_ui()
+    await wait_until_idle(timeout_s=15.0)
+
+
+async def _systemctl_restart(unit: str) -> None:
+    if unit.startswith("gsm2computer-hub") or unit.startswith("hub"):
+        raise RuntimeError(f"refusing to restart {unit}: hub restart is never a heal step")
+    if disruptive_heal_blocked(health()):
+        raise RuntimeError(f"refusing to restart {unit}: live call or talk active")
+    LOG.info("systemctl --user restart %s", unit)
+    if disruptive_heal_blocked(health()):
+        raise RuntimeError(f"refusing to restart {unit}: line became live")
+    subprocess.run(
+        ["systemctl", "--user", "restart", unit],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # wait healthy
+    deadline = time.monotonic() + 45.0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(1.0)
+        try:
+            h = health()
+        except Exception:
+            continue
+        talk = h.get("talk") or {}
+        if real_call_holding(h) or talk.get("talk_active"):
+            LOG.warning("heal wait stopped: live path after %s restart", unit)
+            return
+        if unit.startswith("talk-chromium"):
+            from talk_chromium import page_ready
+            if talk.get("cdp") and page_ready(talk.get("page")) and line_idle(h):
+                return
+        elif unit.startswith("openclaw-gateway"):
+            # gateway: just ensure hub still idle and process active
+            st = subprocess.run(
+                ["systemctl", "--user", "is-active", unit],
+                capture_output=True,
+                text=True,
+            )
+            if st.stdout.strip() == "active" and line_idle(h):
+                await asyncio.sleep(2.0)
+                return
+        else:
+            if line_idle(h):
+                return
+    raise RuntimeError(f"{unit} did not become healthy in time")
+
+
+async def heal_restart_gateway() -> None:
+    LOG.info("heal(b): restart openclaw-gateway")
+    await _systemctl_restart("openclaw-gateway.service")
+
+
+async def heal_restart_talk_chromium() -> None:
+    LOG.info("heal(c): restart talk-chromium")
+    await _systemctl_restart("talk-chromium.service")
+
+
+async def heal_audio_bus() -> None:
+    LOG.info("heal(d): setup-audio-bus + sink-capture check")
+    if disruptive_heal_blocked(health()):
+        raise RuntimeError("refusing audio bus heal: live call or talk active")
+    script = HUB_DIR / "setup-audio-bus.sh"
+    subprocess.run(["bash", str(script)], check=True, capture_output=True, text=True)
+    # quick sink-capture sanity on openclaw_bus
+    tone = Path("/tmp/gsm2-e2e-tone.wav")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=f=440:d=1",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            str(tone),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    play = subprocess.Popen(["paplay", "--device=openclaw_bus", str(tone)])
+    await asyncio.sleep(0.2)
+    env = {**os.environ, "PIPEWIRE_PROPS": "stream.capture.sink=true"}
+    rec = Path("/tmp/gsm2-e2e-sinkcap.wav")
+    try:
+        subprocess.run(
+            ["timeout", "0.8", "pw-record", "--target", "openclaw_bus", str(rec)],
+            env=env,
+            check=False,
+            capture_output=True,
+        )
+    finally:
+        play.wait(timeout=5)
+    if not rec.is_file() or rec.stat().st_size < 1000:
+        raise RuntimeError("sink-capture record missing/empty")
+    with wave.open(str(rec), "rb") as w:
+        frames = w.readframes(w.getnframes())
+    import array
+
+    samples = array.array("h")
+    samples.frombytes(frames)
+    peak = max(abs(x) for x in samples) / 32768.0 if samples else 0.0
+    LOG.info("sink-capture peak=%.4f", peak)
+    if peak < 0.01:
+        raise RuntimeError(f"openclaw_bus sink-capture still silent peak={peak}")
+
+
+HEAL_STEPS = [
+    ("soft_reload", soft_reload_talk),
+    ("restart_gateway", heal_restart_gateway),
+    ("restart_talk_chromium", heal_restart_talk_chromium),
+    ("audio_bus", heal_audio_bus),
+]
+
+
+def persist(result: E2EResult, extra: Optional[dict] = None) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "result": asdict(result),
+        "extra": extra or {},
+    }
+    STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    LOG.info("e2e %s", result.summary())
+
+
+async def run_with_ladder(*, simulate_fail_check: bool = False) -> E2EResult:
+    if real_call_holding():
+        r = E2EResult(
+            ok=False,
+            step="skipped",
+            latency_s=0.0,
+            aborted_for_real_call=True,
+            error="real call in progress",
+        )
+        persist(r)
+        return r
+    if not line_idle():
+        r = E2EResult(ok=False, step="skipped", latency_s=0.0, error="line not idle")
+        persist(r)
+        return r
+
+    result = await run_once("initial")
+    await wait_until_idle(timeout_s=25.0)
+    if simulate_fail_check and result.ok:
+        # Force the ladder to exercise by treating the first pass as fail once.
+        LOG.warning("simulate_fail_check: flipping initial PASS to FAIL to exercise ladder")
+        result.ok = False
+        result.error = (result.error or "") + " simulated_fail_for_ladder"
+    if result.ok or result.aborted_for_real_call:
+        persist(result)
+        return result
+
+    used: set[str] = set()
+    for name, fn in HEAL_STEPS:
+        if name in used:
+            continue
+        # Prior test session must be fully torn down before any heal restart.
+        if not await wait_until_idle(timeout_s=25.0):
+            if real_call_holding():
+                result.error = f"aborted ladder at {name}: real call holding"
+                result.aborted_for_real_call = True
+                persist(result, {"ladder_stop": name})
+                return result
+            result.error = f"aborted ladder at {name}: prior session not idle"
+            persist(result, {"ladder_stop": name})
+            return result
+        if real_call_holding():
+            result.error = f"aborted ladder at {name}: line busy"
+            result.aborted_for_real_call = True
+            persist(result, {"ladder_stop": name})
+            return result
+        try:
+            await fn()
+            used.add(name)
+        except Exception as exc:
+            LOG.warning("heal step %s failed: %s", name, exc)
+            used.add(name)
+            continue
+        await wait_until_idle(timeout_s=45.0)
+        if real_call_holding() or not line_idle():
+            result.error = f"line busy after heal {name}"
+            persist(result)
+            return result
+        result = await run_once(name)
+        await wait_until_idle(timeout_s=25.0)
+        if result.ok or result.aborted_for_real_call:
+            persist(result, {"healed_by": name})
+            return result
+
+    persist(result, {"ladder_exhausted": True})
+    # Alerts off until ladder is validated (GSM2COMPUTER_E2E_ALERT=1 to enable).
+    if os.environ.get("GSM2COMPUTER_E2E_ALERT", "0").lower() in ("1", "true", "yes", "on"):
+        post_system_alert(
+            "OpenClaw e2e FAILED after heal ladder: "
+            f"spk={result.spk_peak:.3f} dl={result.downlink_peak:.3f} "
+            f"unforced={result.triggered_unforced} "
+            f"transcript={result.transcript[:60]!r} err={result.error}",
+            e2e=True,
+        )
+    else:
+        LOG.warning("e2e ladder exhausted (alert suppressed): %s", result.summary())
+    return result
+
+
+async def verify_yield() -> dict[str, Any]:
+    """Hold /e2e-test briefly, then connect a 'real' path and expect preempt."""
+    if not line_idle():
+        return {"ok": False, "error": "not idle"}
+    token = get_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    out: dict[str, Any] = {"ok": False}
+    async with websockets.connect(
+        _ws_url(), additional_headers=headers, max_size=8_000_000, open_timeout=10
+    ) as e2e_ws:
+        # drain session.updated
+        await asyncio.wait_for(e2e_ws.recv(), timeout=15)
+        h = health()
+        if not (h.get("call") or {}).get("e2e"):
+            out["error"] = f"expected e2e busy, got {h.get('call')}"
+            return out
+        out["e2e_held"] = True
+        # second connection as real path /
+        token2 = get_token()
+        headers2 = {"Authorization": f"Bearer {token2}"}
+        real_url = HUB_HTTP.replace("https://", "wss://").replace("http://", "ws://") + "/"
+        try:
+            async with websockets.connect(
+                real_url, additional_headers=headers2, max_size=8_000_000, open_timeout=15
+            ) as real_ws:
+                msg = json.loads(await asyncio.wait_for(real_ws.recv(), timeout=20))
+                out["real_session"] = msg.get("type")
+                out["real_accepted"] = msg.get("type") == "session.updated"
+                # stop talk quickly
+                await real_ws.close()
+        except Exception as exc:
+            out["real_error"] = f"{type(exc).__name__}: {exc}"
+        # e2e should have been aborted
+        await asyncio.sleep(0.5)
+        try:
+            await e2e_ws.recv()
+        except ConnectionClosed:
+            out["e2e_closed"] = True
+        except Exception:
+            out["e2e_closed"] = False
+    await asyncio.sleep(1.0)
+    out["idle_after"] = line_idle()
+    out["ok"] = bool(out.get("real_accepted")) and bool(out.get("idle_after"))
+    return out
+
+
+async def simulate_gateway_failure_ladder() -> E2EResult:
+    """Stop gateway briefly while idle, then run ladder (should heal via restart_gateway)."""
+    if not line_idle():
+        return E2EResult(ok=False, step="sim", latency_s=0.0, error="not idle")
+    LOG.warning("simulate: stopping openclaw-gateway to force ladder heal")
+    subprocess.run(
+        ["systemctl", "--user", "stop", "openclaw-gateway.service"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    await asyncio.sleep(1.0)
+    try:
+        # initial run should fail (no OpenClaw); ladder should restart gateway
+        return await run_with_ladder()
+    finally:
+        # ensure gateway is up even if ladder skipped
+        st = subprocess.run(
+            ["systemctl", "--user", "is-active", "openclaw-gateway.service"],
+            capture_output=True,
+            text=True,
+        )
+        if st.stdout.strip() != "active":
+            LOG.warning("simulate cleanup: starting openclaw-gateway")
+            subprocess.run(
+                ["systemctl", "--user", "start", "openclaw-gateway.service"],
+                check=False,
+            )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--once", action="store_true", help="single attempt, no ladder")
+    parser.add_argument("--ladder", action="store_true", help="run with self-heal ladder")
+    parser.add_argument("--verify-yield", action="store_true", help="preempt e2e for real path")
+    parser.add_argument("--live", action="store_true", help="grokbot mode: run a live Suzie voice test")
+    parser.add_argument(
+        "--simulate-gateway-fail",
+        action="store_true",
+        help="stop gateway then run ladder (idle only)",
+    )
+    parser.add_argument(
+        "--hub",
+        default=None,
+        help="hub http base (default env GSM2COMPUTER_E2E_HUB or 127.0.0.1:8787)",
+    )
+    args = parser.parse_args()
+    global HUB_HTTP
+    if args.hub:
+        HUB_HTTP = args.hub.rstrip("/")
+    setup_logging()
+    try:
+        health()
+    except Exception:
+        alt = os.environ.get("GSM2COMPUTER_HUB_URL", "").strip()
+        if not alt:
+            LOG.error("hub %s unreachable and GSM2COMPUTER_HUB_URL is unset", HUB_HTTP)
+            return 2
+        LOG.warning("hub %s unreachable, trying %s", HUB_HTTP, alt)
+        HUB_HTTP = alt.rstrip("/")
+
+    try:
+        grok_mode = hub_grokbot_mode()
+    except Exception:
+        grok_mode = False
+    if grok_mode and not args.verify_yield:
+        r = asyncio.run(run_grokbot(live=args.live))
+        return 0 if r.ok else 1
+    if args.verify_yield:
+        out = asyncio.run(verify_yield())
+        LOG.info("yield verify: %s", json.dumps(out))
+        return 0 if out.get("ok") else 2
+    if args.simulate_gateway_fail:
+        r = asyncio.run(simulate_gateway_failure_ladder())
+        return 0 if r.ok else 1
+    if args.once:
+        r = asyncio.run(run_once("once"))
+        persist(r)
+        return 0 if r.ok else 1
+    # default: ladder
+    r = asyncio.run(run_with_ladder())
+    return 0 if r.ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

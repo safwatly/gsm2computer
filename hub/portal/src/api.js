@@ -1,4 +1,5 @@
-const HUB_ORIGIN = (import.meta.env.VITE_HUB_ORIGIN || "").replace(/\/$/, "");
+const env = import.meta.env || {};
+const HUB_ORIGIN = (env.VITE_HUB_ORIGIN || "").replace(/\/$/, "");
 const API = `${HUB_ORIGIN}/portal/api`;
 
 async function jsonGet(path) {
@@ -59,6 +60,10 @@ export async function getMessages(peer) {
 export async function getCalls() {
   const { data, mock } = await fetchOrMock(`${API}/calls`, () => import("./mocks/calls.json"));
   return { data, mock };
+}
+
+export function callRecordingUrl(callId) {
+  return `${API}/calls/${encodeURIComponent(callId)}/recording`;
 }
 
 export async function sendMessage(to, body) {

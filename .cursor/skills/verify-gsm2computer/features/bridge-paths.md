@@ -9,6 +9,8 @@ Default order, when the phone has no saved list:
 
 Each attempt is `POST {origin}/token` then the WebSocket on that same origin. Both requests send `X-Gsm-Device-Token` from the device config. After `session.updated`, the bridge keeps `session.id` and sends it as `X-Gsm-Call-Session` on the next attempt, so the hub can relink instead of admitting a second call. A 409 without that session id stops the walk. A 409 with it waits and tries the list again.
 
+`session.updated` includes `session.entrance` and `session.id`. In grokbot mode it also sets `talk` to `grokbot`. G2 binary uplink frames are accepted on the public socket. That half is `hub.tests.test_reconcile_interactions`.
+
 ## How to tell which path a call used
 
 All of these agree while the socket is up, and the stored call row keeps the entrance after hangup:
