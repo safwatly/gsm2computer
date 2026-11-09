@@ -59,10 +59,10 @@ Put each key on the unit that owns it (`~/.config/systemd/user/<unit>.d/cup-priv
 | Hub | `~/.config/systemd/user/gsm2computer-hub.service` | Installed `HOST`, `PORT`, and `TALK`. Do not overwrite from the repo unit. |
 | Grok Bot drop-in | `gsm2computer-hub.service.d/grokbot.conf` (source `hub/ops/grokbot/grokbot.conf`) | `AUTO_MODE=grokbot`, `BOT=suzie` |
 | Hub call watcher | `gsm2computer-hub-call-watch.service` (source `hub/gsm2computer-hub-call-watch.service`) | Phone address only in `cup-private.conf`, moved off the old unit file. `WorkingDirectory=%h/gsm2computer-hub`. Restarted with the hub on apply and rollback. |
-| Watcher webhook drop-in | `gsm2computer-hub-call-watch.service.d/alert-webhook.conf` | `GSM2COMPUTER_ALERT_WEBHOOK_URL` and `GSM2COMPUTER_ALERT_WEBHOOK_KEY`. Not in git. |
+| Watcher webhook drop-in | `gsm2computer-hub-call-watch.service.d/alert-webhook.conf` | `GSM2COMPUTER_ALERT_WEBHOOK_URL` and `GSM2COMPUTER_ALERT_WEBHOOK_KEY`. Not in git. The adb call-end unit needs the same drop-in when it is the process that posts `call_ended` (see below). |
 | Watcher phone drop-in | `gsm2computer-hub-call-watch.service.d/cup-private.conf` | `GSM2COMPUTER_CALL_END_ADB` and, if used, `MOTO_TS_IP`. Not in git. |
 | Watchdog | `cup-watchdog.service` + `.timer` | `CUP_WATCHDOG_HUB`, `CUP_WATCHDOG_PIXEL_IP` |
-| Adb call-end watch | `gsm2computer-call-end-watch.service` (runs `call_end_watch.py` from `~/gsm2computer-hub`) | `GSM2COMPUTER_CALL_END_ADB`, `GSM2COMPUTER_HUB_HTTP`. Restarted with the hub on apply and rollback. |
+| Adb call-end watch | `gsm2computer-call-end-watch.service` (runs `call_end_watch.py` from `~/gsm2computer-hub`) | `GSM2COMPUTER_CALL_END_ADB`, `GSM2COMPUTER_HUB_HTTP`. Also `GSM2COMPUTER_ALERT_WEBHOOK_URL` and `KEY` when this unit posts `call_ended`. Restarted with the hub on apply and rollback. |
 | E2E | `gsm2computer-openclaw-e2e.service` + `.timer` | `GSM2COMPUTER_E2E_HUB`. Every 30 minutes, grokbot profile |
 | Portal Tailscale | `tailscale-portal.service` | `--port=41642`. The host filter must keep UDP 41642. |
 | Device token | `device-tokens.json` next to `hub.py` | Not in git. The phone and the hub share it. |
@@ -70,6 +70,8 @@ Put each key on the unit that owns it (`~/.config/systemd/user/<unit>.d/cup-priv
 The drop-ins live under `~/.config/systemd/user/` and are outside the code directory, so Grok Bot, the alert webhook, the e2e timer, and both call watchers do not move with the tree. `auto_mode` stays `grokbot` because `grokbot.conf` is still installed. `entrances` lists `tailscale` until the public socket is enabled.
 
 `gsm2computer-hub-call-watch.service` is the process that runs `hub_call_watch.py`. After the move, `cup-private.conf` sets `GSM2COMPUTER_CALL_END_ADB` to the phone (`host:5555`). `MOTO_TS_IP` in that same drop-in is the other accepted form. The hub unit does not carry the phone address, and neither does the call-watch unit file in this repo. `alert-webhook.conf` only supplies the webhook; an unset URL makes alerts a no-op.
+
+`call_transcript` is posted by the process that posted `call_ended`, with that process's URL, key, and the shared spool (`~/.local/state/gsm2computer/alert-webhook/outbox.sqlite3`). The hub unit does not post it and must not grow its own webhook drop-in. On a normal hangup the poster is `gsm2computer-call-end-watch.service`. It waits for `transcript.json` (about 25s) without delaying `call_ended`. When adb did not fire, `gsm2computer-hub-call-watch.service` posts both events and already has this drop-in. If `call_ended` alerts already arrive from the call-end unit, no cup change is required. If that unit's environment has no webhook URL, copy `alert-webhook.conf` onto `gsm2computer-call-end-watch.service.d/` (the same URL and key, not a second secret) and reload that unit.
 
 ## What rsync --delete removes
 

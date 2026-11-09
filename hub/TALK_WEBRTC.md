@@ -85,14 +85,12 @@ Pixel SMS outbox (`/sms/outbox`).
 | `GSM2COMPUTER_ALERT_WEBHOOK_URL` | unset | Public HTTPS webhook URL. Empty = no-op |
 | `GSM2COMPUTER_ALERT_WEBHOOK_KEY` | unset | Sender key; sent as `Authorization: Bearer <key>` |
 
-Cup (file-copy deploy) — systemd user drop-in, then reload:
-
-```
-~/.config/systemd/user/gsm2computer-hub.service.d/alert-webhook.conf
-```
-
-Example: [docs/alert-webhook.conf.example](../docs/alert-webhook.conf.example).
-`systemctl --user daemon-reload && systemctl --user restart gsm2computer-hub`
+The URL and key belong on the process that posts `call_ended` and
+`call_transcript`, not on `gsm2computer-hub.service`. On cup that is
+`gsm2computer-call-end-watch.service` for a normal hangup, and
+`gsm2computer-hub-call-watch.service` when adb did not fire. See
+[docs/CUP_HUB_CUTOVER.md](../docs/CUP_HUB_CUTOVER.md). Do not add a second
+copy of the drop-in on the hub unit.
 
 ## Commands
 

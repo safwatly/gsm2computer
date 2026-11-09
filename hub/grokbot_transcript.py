@@ -11,6 +11,9 @@ import asyncio
 import json
 import logging
 import os
+import secrets
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -21,8 +24,15 @@ LOG = logging.getLogger("gsm2computer-hub.grokbot")
 
 TRANSCRIPT_NAME = "transcript.json"
 READ_TIMEOUT_S = float(os.environ.get("GSM2COMPUTER_GROKBOT_TRANSCRIPT_TIMEOUT_S", "12"))
-# Session start may be stamped a little outside the hub's call clock.
+# A session stamped slightly after hangup can still be this call. Slack does
+# not extend before the call, and a link with no start time is not a match.
 CALL_WINDOW_SLACK_S = float(os.environ.get("GSM2COMPUTER_GROKBOT_TRANSCRIPT_SLACK_S", "30"))
+# How long the call_ended process waits for transcript.json before posting
+# call_transcript. The read itself is capped near 12s, after patchbay off.
+FOLLOWUP_WAIT_S = float(os.environ.get("GSM2COMPUTER_GROKBOT_TRANSCRIPT_FOLLOWUP_S", "25"))
+# The click expression is already on the wire before abort can run. It only
+# clicks if this page token is still the one the reader armed.
+CLICK_GUARD_MS = 150
 _KEPT_STATUSES = {"unmatched", "ambiguous", "aborted", "no_cdp", "error", "off_failed", "empty", "pending"}
 
 # Runs in the Grok page. ``root`` defaults to document so tests can pass a fake tree.
@@ -158,13 +168,15 @@ def select_voice_session(
 ) -> dict[str, Any]:
     """Pick the newest voice session that started during this call.
 
-    No unlabeled ``/c/`` fallback. Zero matches are ``unmatched``. Two sessions
-    that share the newest in-window start are ``ambiguous``.
+    No unlabeled ``/c/`` fallback. A link with no parseable start is ignored,
+    including one that would otherwise fall in the pre-call slack. Slack applies
+    only after hangup. Zero matches are ``unmatched``. Two sessions that share
+    the newest in-window start are ``ambiguous``.
     """
     if started_at is None:
         return {"status": "unmatched", "error": "call start time is unknown"}
     end = time_now() if ended_at is None else float(ended_at)
-    window_start = float(started_at) - CALL_WINDOW_SLACK_S
+    window_start = float(started_at)
     window_end = end + CALL_WINDOW_SLACK_S
     rows = sessions if isinstance(sessions, list) else []
     chosen: list[tuple[float, str]] = []
@@ -545,11 +557,26 @@ def _same_session(page_url: str, href: str) -> bool:
     return path == target
 
 
-def _click_js(href: str) -> str:
+def _click_js(href: str, token: str) -> str:
+    """Schedule the click. An already-sent eval does not click if the token was cleared."""
     return (
-        "(function(){const href=%s;const link=Array.from(document.querySelectorAll('a[href]')).find("
-        "(el)=>el.getAttribute('href')===href);if(!link)return false;link.click();return true;})()"
-    ) % json.dumps(href)
+        "(function(){const href=%s;const token=%s;"
+        "setTimeout(function(){"
+        "if(window.__gsm2TranscriptToken!==token)return;"
+        "const link=Array.from(document.querySelectorAll('a[href]')).find("
+        "(el)=>el.getAttribute('href')===href);"
+        "if(!link||window.__gsm2TranscriptToken!==token)return;"
+        "link.click();"
+        "},%d);return true;})()"
+    ) % (json.dumps(href), json.dumps(token), CLICK_GUARD_MS)
+
+
+def _arm_click_js(token: str) -> str:
+    return "window.__gsm2TranscriptToken=%s" % json.dumps(token)
+
+
+def _clear_click_js() -> str:
+    return "window.__gsm2TranscriptToken=null"
 
 
 async def read_voice_turns(
@@ -595,7 +622,26 @@ async def read_voice_turns(
             if _same_session(str(page.get("url") or ""), href):
                 return await _turns_from(ws, nid)
             _raise_if_abort(abort)
-            await _cdp_eval(ws, nid, _click_js(href))
+            token = secrets.token_hex(8)
+            await _cdp_eval(ws, nid, _arm_click_js(token))
+            try:
+                _raise_if_abort(abort)
+                await _cdp_eval(ws, nid, _click_js(href, token))
+                if abort is None:
+                    await asyncio.sleep(CLICK_GUARD_MS / 1000)
+                else:
+                    try:
+                        await asyncio.wait_for(abort.wait(), timeout=CLICK_GUARD_MS / 1000)
+                    except asyncio.TimeoutError:
+                        pass
+                    else:
+                        raise asyncio.CancelledError()
+            except asyncio.CancelledError:
+                try:
+                    await _cdp_eval(ws, nid, _clear_click_js())
+                except Exception:
+                    LOG.debug("could not clear transcript click token", exc_info=True)
+                raise
         await asyncio.sleep(0.6)
         _raise_if_abort(abort)
         targets = await asyncio.to_thread(_http_json, list_url, 4)
@@ -680,7 +726,12 @@ async def capture_call_transcript(
 
 
 def announce_transcript(pointer: dict[str, Any]) -> None:
-    """Tell ops the transcript landed. Does not run on the live-call path."""
+    """Post ``call_transcript`` with the same webhook helper as ``call_ended``.
+
+    The hub process does not call this. The process that already posted
+    ``call_ended`` does, so the URL, key, and spool are the ones that process
+    already has. An unset URL stays a no-op inside ``post_alert_event``.
+    """
     try:
         from alert_webhook import post_alert_event
 
@@ -702,6 +753,77 @@ def announce_transcript(pointer: dict[str, Any]) -> None:
         post_alert_event(payload)
     except Exception:
         LOG.warning("call_transcript alert failed", exc_info=True)
+
+
+def _timeout_pointer(pointer: dict[str, Any]) -> dict[str, Any]:
+    timed = dict(pointer)
+    timed["status"] = "timeout"
+    timed["error"] = "transcript.json was not written before the follow-up wait ended"
+    return timed
+
+
+def wait_for_transcript(
+    directory: Path,
+    timeout_s: float,
+    *,
+    poll_s: float = 0.25,
+) -> Optional[dict[str, Any]]:
+    """Poll ``transcript.json`` until it has a status other than ``pending``."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    found: Optional[dict[str, Any]] = None
+    while True:
+        found = load_saved_pointer(directory)
+        if found and str(found.get("status") or "") != "pending":
+            return found
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return found
+        time.sleep(min(poll_s, remaining))
+
+
+def post_transcript_followup(
+    pointer: dict[str, Any],
+    *,
+    directory: Optional[Path] = None,
+    timeout_s: Optional[float] = None,
+    poll_s: float = 0.25,
+) -> None:
+    """Block until the transcript file is final, then post ``call_transcript``.
+
+    Callers run this off the hangup path. ``call_ended`` has already been posted.
+    """
+    limit = FOLLOWUP_WAIT_S if timeout_s is None else timeout_s
+    final = pointer
+    if str(pointer.get("status") or "") == "pending":
+        folder = directory
+        if folder is None and pointer.get("path"):
+            folder = Path(str(pointer["path"])).parent
+        found = wait_for_transcript(folder, limit, poll_s=poll_s) if folder is not None else None
+        final = found if found else _timeout_pointer(pointer)
+    announce_transcript(final)
+
+
+def schedule_transcript_followup(
+    pointer: dict[str, Any],
+    *,
+    directory: Optional[Path] = None,
+    timeout_s: Optional[float] = None,
+    poll_s: float = 0.25,
+) -> threading.Thread:
+    """Post ``call_transcript`` in the background so ``call_ended`` is not delayed."""
+    thread = threading.Thread(
+        target=post_transcript_followup,
+        kwargs={
+            "pointer": pointer,
+            "directory": directory,
+            "timeout_s": timeout_s,
+            "poll_s": poll_s,
+        },
+        name="call-transcript",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def pointer_or_aborted(directory: Path, call_id: str) -> dict[str, Any]:

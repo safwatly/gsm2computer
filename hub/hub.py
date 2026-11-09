@@ -58,7 +58,6 @@ from call_slot import (
 )
 from link_gap_log import append_link_gap
 from grokbot_transcript import (
-    announce_transcript,
     attach_levels,
     capture_call_transcript,
     cdp_base_from_status,
@@ -1618,8 +1617,9 @@ async def _finish_grok_transcript(
     """After patchbay off: read the voice transcript. Failures stay off the call.
 
     A new call sets ``voice.transcript_abort``. This read checks that flag and
-    does not click the Grok page once it is set. ``call_ended`` is not delayed;
-    ops get a ``call_transcript`` event when the file is written.
+    does not click the Grok page once it is set. ``call_ended`` is not delayed.
+    The process that posts ``call_ended`` posts ``call_transcript`` after this
+    file is written. The hub does not post that alert.
     """
     pointer: Optional[dict[str, Any]] = None
     abort = getattr(voice, "transcript_abort", None)
@@ -1668,10 +1668,6 @@ async def _finish_grok_transcript(
     except Exception:
         LOG.warning("grok transcript levels update failed", exc_info=True)
     _remember_transcript(call_id, pointer)
-    try:
-        announce_transcript(pointer)
-    except Exception:
-        LOG.warning("grok transcript announce failed", exc_info=True)
     setattr(voice, "_transcript_announced", True)
 
 
@@ -2521,7 +2517,6 @@ async def handle_websocket(
                     except Exception:
                         LOG.warning("grok transcript levels update failed", exc_info=True)
                     _remember_transcript(call_id, pointer)
-                    announce_transcript(pointer)
                     voice._transcript_announced = True
 
                 grok_voice._transcript_announced = False

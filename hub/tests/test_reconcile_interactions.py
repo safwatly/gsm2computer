@@ -204,8 +204,8 @@ class ReconcileInteractionTests(unittest.IsolatedAsyncioTestCase):
             voice.live = False
             return {"ok": True, "rc": 0, "meaning": "ok", "ms": 0}
 
-        def fake_stop_later(voice, after=None):
-            del voice, after
+        def fake_stop_later(voice, after=None, on_stopped=None):
+            del voice, after, on_stopped
 
             async def _done() -> None:
                 return None

@@ -675,6 +675,7 @@ def fire_call_ended(
     payload = build_payload(st=st, duration_s=duration_s, test=test, health=health, now_ts=now_ts)
     if post:
         post_alert_event(payload)
+        _schedule_transcript_followup(payload)
     st.last_fired_call_id = st.call_id or f"anon-{payload['ended_at_utc']}"
     st.last_fired_at = payload["ended_at_utc"]
     if not test:
@@ -693,6 +694,25 @@ def fire_call_ended(
         payload["hub_gap_max_s"],
     )
     return payload
+
+
+def _schedule_transcript_followup(payload: dict[str, Any]) -> None:
+    """Watch transcript.json from this process, which already posted call_ended.
+
+    Dry-run ``test: true`` payloads do not follow up. The wait runs in a daemon
+    thread so the phone state machine is not held for the transcript read.
+    """
+    if payload.get("test") is True:
+        return
+    transcript = payload.get("transcript")
+    if not isinstance(transcript, dict) or not transcript.get("status"):
+        return
+    try:
+        from grokbot_transcript import schedule_transcript_followup
+
+        schedule_transcript_followup(transcript)
+    except Exception:
+        LOG.warning("call_transcript follow-up failed to start", exc_info=True)
 
 
 def on_snapshot(st: WatchState, snap: PhoneSnapshot) -> None:

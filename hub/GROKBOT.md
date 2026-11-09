@@ -51,13 +51,16 @@ that remains for every mode, including loopback.
 
 After `patchbay off` (never during the live session), the hub reads the Grok
 page over a loopback CDP debugger URL. It accepts only a voice-session link
-whose start time falls in this call's window (30s of slack on either side) and
-clicks that link only when it is not already open. An unlabeled `/c/` chat is
-not opened. Zero matches are `unmatched`. Two sessions that share the newest
-in-window start are `ambiguous`. Turns that are not clearly the caller or the
-assistant are dropped. The page host must be `grok.com`, `grok.x.ai`, or
-`x.com/i/grok` — a host that merely contains the name is ignored — and
-`webSocketDebuggerUrl` must be loopback.
+whose start time is during this call, or up to 30s after hangup. A link with
+no start time is not a match, and neither is a session that started before the
+call. The click is armed with a page token and does not run if that token was
+cleared after the click expression was sent, which is how a new call aborts
+an in-flight open. An unlabeled `/c/` chat is not opened. Zero matches are
+`unmatched`. Two sessions that share the newest in-window start are
+`ambiguous`. Turns that are not clearly the caller or the assistant are
+dropped. The page host must be `grok.com`, `grok.x.ai`, or `x.com/i/grok` — a
+host that merely contains the name is ignored — and `webSocketDebuggerUrl`
+must be loopback.
 
 The read gives up after about 12 seconds. A new call does not wait that out:
 it aborts the reader (about 1 second) and then runs `patchbay switch`, so the
@@ -66,9 +69,22 @@ records `transcript_status` (`no_cdp`, `off_failed`, `empty`, `unmatched`,
 `ambiguous`, `aborted`, `error`), and does not fail the call.
 
 `call_ended` is posted on the existing path and is not held for this read. If
-the file is not ready yet the alert says `transcript_status=pending`. When the
-file is written the hub posts a follow-up `call_transcript` event with the
-pointer.
+the file is not ready yet the alert says `transcript_status=pending`. The same
+process then waits up to 25s for `transcript.json` and posts `call_transcript`
+with the same `post_alert_event` helper, webhook URL, key, and spool. The hub
+process does not post that event: `gsm2computer-hub.service` has no webhook
+URL, and adding one would be a second copy of the secret.
+
+On a normal hangup that process is `gsm2computer-call-end-watch.service`
+(`call_end_watch.py`). When adb did not fire within 25s,
+`gsm2computer-hub-call-watch.service` (`hub_call_watch.py`) posts both events
+and already loads `alert-webhook.conf`. No cup config change is required when
+`call_ended` alerts already arrive, because `call_transcript` leaves from that
+same unit. If a machine's call-end unit does not have the webhook env, copy
+the existing `alert-webhook.conf` onto
+`~/.config/systemd/user/gsm2computer-call-end-watch.service.d/` and
+`systemctl --user daemon-reload` that unit. Do not also install it on
+`gsm2computer-hub.service`.
 
 `patchbay status --json` must expose a loopback CDP base (`cdp_http`,
 `cdp_url`, or `cdp_port`). Otherwise set `GSM2COMPUTER_GROKBOT_CDP` to
@@ -107,7 +123,8 @@ that pointer from the bundle `hub/portal/dist/index.html` loads.
 | GSM2COMPUTER_GROKBOT_CDP | unset; loopback URL from `patchbay status --json` |
 | GSM2COMPUTER_GROKBOT_TRANSCRIPT_TIMEOUT_S | 12 |
 | GSM2COMPUTER_GROKBOT_TRANSCRIPT_ABORT_S | 1 (max extra wait before the next switch) |
-| GSM2COMPUTER_GROKBOT_TRANSCRIPT_SLACK_S | 30 (call window around the voice-session start) |
+| GSM2COMPUTER_GROKBOT_TRANSCRIPT_SLACK_S | 30 (only after hangup; no pre-call match, and no match without a start time) |
+| GSM2COMPUTER_GROKBOT_TRANSCRIPT_FOLLOWUP_S | 25 (how long the call_ended process waits before posting call_transcript) |
 | GSM2COMPUTER_CALL_RECORD_KEEP | 20 call directories, including the downlink and transcript |
 
 ## Deploy / rollback (only while /health idle)

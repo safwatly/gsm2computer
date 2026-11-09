@@ -84,6 +84,22 @@ def on_end(start, tap, reason):
         post_alert_event(p); log("posted", p)
     except Exception as e:
         log("post failed", e)
+        return
+    transcript = p.get("transcript")
+    if not isinstance(transcript, dict):
+        return
+    # This process posted call_ended, so it posts call_transcript with the same
+    # webhook env and spool. When adb already fired, call_end_watch owns both.
+    folder = None
+    if tap and "/" not in tap and "\\" not in tap and tap not in {".", ".."}:
+        root = Path(os.environ.get("GSM2COMPUTER_CALL_RECORD_DIR", str(Path.home() / "gsm2computer-calls")))
+        folder = root / tap
+    try:
+        from grokbot_transcript import post_transcript_followup
+
+        post_transcript_followup(transcript, directory=folder)
+    except Exception as e:
+        log("transcript follow-up failed", e)
 
 def ts_monitor():
     if not PEER:

@@ -364,23 +364,34 @@ class CallTap:
                 await asyncio.to_thread(self.write_s16, PHONE_DOWNLINK, chunk, PHONE_DOWNLINK_RATE, 1)
         finally:
             self._down_scheduled = False
-            if self._down_q and not self._closed:
+            if self._down_q and not self._closed and not self._down_stop:
                 self._down_scheduled = True
                 self._down_task = asyncio.create_task(self._drain_phone_downlink())
 
+    async def _join_downlink_writer(self, task: "asyncio.Task[None]") -> None:
+        """Wait until the writer task finishes, even if this flush was cancelled."""
+        current = asyncio.current_task()
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if current is not None and hasattr(current, "uncancel"):
+                    while current.uncancel() > 0:
+                        pass
+                continue
+
     async def flush_phone_downlink(self) -> None:
-        """Write queued phone-downlink frames before the WAV is closed."""
-        for _ in range(20):
+        """Join the downlink writer, then the caller may close the WAV."""
+        self._down_stop = True
+        while True:
             task = self._down_task
-            if not self._down_q and (task is None or task.done()):
-                return
             if task is not None and not task.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    return
-            else:
-                await asyncio.sleep(0)
+                await self._join_downlink_writer(task)
+                continue
+            if not self._down_q:
+                return
+            chunk = self._down_q.pop(0)
+            await asyncio.to_thread(self.write_s16, PHONE_DOWNLINK, chunk, PHONE_DOWNLINK_RATE, 1)
 
     def write_ulaw(self, name: str, ulaw: bytes, rate: int = 8000) -> None:
         if self._closed or not ulaw:

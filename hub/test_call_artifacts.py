@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import wave
@@ -391,6 +392,21 @@ class SessionMatchTests(unittest.TestCase):
         ]
         self.assertEqual(gt.select_voice_session(tied, start, end)["status"], "ambiguous")
         self.assertEqual(gt.select_voice_session(tied, None, end)["status"], "unmatched")
+        # Slack is only after hangup. A session from before the call, and a
+        # voice link with no start time, are not this call.
+        early = datetime.fromtimestamp(start - 10, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual(
+            gt.select_voice_session([{"href": "/c/early", "started": early}], start, end)["status"],
+            "unmatched",
+        )
+        self.assertEqual(
+            gt.select_voice_session([{"href": "/c/nostart", "label": "Voice call"}], start, end)["status"],
+            "unmatched",
+        )
+        at = datetime.fromtimestamp(start, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        chosen = gt.select_voice_session([{"href": "/c/at", "started": at}], start, end)
+        self.assertEqual(chosen["status"], "chosen")
+        self.assertEqual(chosen["href"], "/c/at")
 
     def test_unmatched_is_saved_not_ok(self) -> None:
         async def reader(_url: str) -> dict:
@@ -427,6 +443,40 @@ class SessionMatchTests(unittest.TestCase):
         self.assertEqual(payload["event"], "call_transcript")
         self.assertEqual(payload["transcript_status"], "ok")
         self.assertEqual(payload["call_id"], "20261109T120000Z-grokbot")
+
+    def test_followup_waits_without_being_the_hub(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            pending = gt.transcript_for_alert(
+                {"id": "20261109T120000Z-grokbot", "dir": tmp, "meta": {"mode": "grokbot"}}
+            )
+            posts: list[dict] = []
+
+            def later() -> None:
+                time.sleep(0.15)
+                gt.save_transcript_result(
+                    folder,
+                    "20261109T120000Z-grokbot",
+                    "ok",
+                    [{"speaker": "assistant", "text": "Here", "timestamp": None}],
+                )
+
+            threading.Thread(target=later, daemon=True).start()
+            t0 = time.monotonic()
+            with patch("alert_webhook.post_alert_event", side_effect=posts.append):
+                gt.post_transcript_followup(pending, directory=folder, timeout_s=2, poll_s=0.05)
+            self.assertGreaterEqual(time.monotonic() - t0, 0.1)
+            self.assertEqual(posts[0]["event"], "call_transcript")
+            self.assertEqual(posts[0]["transcript_status"], "ok")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = gt.transcript_for_alert(
+                {"id": "20261109T120100Z-grokbot", "dir": tmp, "meta": {"mode": "grokbot"}}
+            )
+            posts = []
+            with patch("alert_webhook.post_alert_event", side_effect=posts.append):
+                gt.post_transcript_followup(missing, directory=Path(tmp), timeout_s=0.05, poll_s=0.02)
+            self.assertEqual(posts[0]["transcript_status"], "timeout")
 
 
 class LevelMergeTests(unittest.TestCase):
@@ -497,6 +547,74 @@ class QueuedDownlinkTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_flush_joins_the_writer_before_the_wav_closes(self) -> None:
+        release = threading.Event()
+        order: list[str] = []
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                tap = CallTap("id", {}, record_dir=Path(tmp))
+                original = tap.write_s16
+
+                def wrapped(name: str, pcm: bytes, rate: int, channels: int = 1) -> None:
+                    order.append("write-start")
+                    release.wait(timeout=2)
+                    original(name, pcm, rate, channels)
+                    order.append("write-end")
+
+                tap.write_s16 = wrapped  # type: ignore[method-assign]
+                tap.write_phone_downlink(b"\x00\x10" * 8, 8000)
+                flush_task = asyncio.create_task(tap.flush_phone_downlink())
+                for _ in range(50):
+                    if "write-start" in order:
+                        break
+                    await asyncio.sleep(0.02)
+                self.assertIn("write-start", order)
+                self.assertFalse(flush_task.done())
+                release.set()
+                await asyncio.wait_for(flush_task, timeout=2)
+                order.append("flush-done")
+                tap._streams[PHONE_DOWNLINK].close()
+                order.append("closed")
+
+        asyncio.run(scenario())
+        self.assertEqual(order, ["write-start", "write-end", "flush-done", "closed"])
+
+    def test_cancelled_flush_still_joins_the_writer(self) -> None:
+        release = threading.Event()
+        order: list[str] = []
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                tap = CallTap("id", {}, record_dir=Path(tmp))
+                original = tap.write_s16
+
+                def wrapped(name: str, pcm: bytes, rate: int, channels: int = 1) -> None:
+                    order.append("write-start")
+                    release.wait(timeout=2)
+                    original(name, pcm, rate, channels)
+                    order.append("write-end")
+
+                tap.write_s16 = wrapped  # type: ignore[method-assign]
+                tap.write_phone_downlink(b"\x00\x10" * 8, 8000)
+                flush_task = asyncio.create_task(tap.flush_phone_downlink())
+                for _ in range(50):
+                    if "write-start" in order:
+                        break
+                    await asyncio.sleep(0.02)
+                flush_task.cancel()
+                await asyncio.sleep(0.05)
+                self.assertFalse(flush_task.done())
+                release.set()
+                await asyncio.wait_for(flush_task, timeout=2)
+                order.append("flush-done")
+                self.assertFalse(tap._closed)
+                await tap.stop_capture()
+                order.append("closed")
+
+        asyncio.run(scenario())
+        self.assertEqual(order, ["write-start", "write-end", "flush-done", "closed"])
+
 
 class ServedBundleTests(unittest.TestCase):
     def test_entry_bundle_has_the_transcript_label(self) -> None:
@@ -513,11 +631,43 @@ class ServedBundleTests(unittest.TestCase):
             blob += path.read_text(encoding="utf-8")
         self.assertIn("meta transcript", blob)
         self.assertIn("transcript ${", blob)
+        self.assertIn("SMS failed", blob)
+        self.assertIn("SMS timed out", blob)
         # calls-*.js is the offline mock list, not the calls page. The hub serves
         # the script named by dist/index.html, and that bundle has the label.
         mock = list((dist / "assets").glob("calls-*.js"))
         self.assertTrue(mock)
         self.assertNotIn("meta transcript", mock[0].read_text(encoding="utf-8"))
+
+    def test_inflight_click_checks_the_page_token(self) -> None:
+        script = r"""
+const assert = require('assert');
+const clicks = [];
+const timers = [];
+global.window = global;
+global.document = {
+  querySelectorAll() {
+    return [{
+      getAttribute(name) { return name === 'href' ? '/c/voice' : null; },
+      click() { clicks.push('clicked'); },
+    }];
+  },
+};
+global.setTimeout = (fn) => { timers.push(fn); return 1; };
+const click = %s;
+window.__gsm2TranscriptToken = 'tok';
+eval(click);
+assert.strictEqual(timers.length, 1);
+window.__gsm2TranscriptToken = null;
+timers.shift()();
+assert.deepStrictEqual(clicks, []);
+window.__gsm2TranscriptToken = 'tok';
+eval(click);
+timers.shift()();
+assert.deepStrictEqual(clicks, ['clicked']);
+""" % json.dumps(gt._click_js("/c/voice", "tok"))
+        proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
 
 
 class StopLaterHookTests(unittest.TestCase):
