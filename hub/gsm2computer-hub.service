@@ -7,6 +7,9 @@ Wants=network-online.target gsm2computer-audio-bus.service
 Type=simple
 WorkingDirectory=%h/gsm2computer-hub
 ExecStart=/usr/bin/python3 %h/gsm2computer-hub/hub.py
+# The Oct 2026 live unit still set GSM2COMPUTER_HUB_HOST=100.101.181.110.
+# That address is not cup. 100.113.222.47 is the Tailscale address.
+# Do not copy this file over a running unit without checking HOST.
 Environment=GSM2COMPUTER_HUB_HOST=100.113.222.47
 Environment=GSM2COMPUTER_HUB_PORT=8787
 Environment=GSM2COMPUTER_AUTO_MODE=openclaw

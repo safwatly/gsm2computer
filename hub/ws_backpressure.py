@@ -15,6 +15,7 @@ Policy here:
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from typing import Any, Callable, Optional
@@ -32,6 +33,30 @@ DOWNLINK_BACKLOG_S = _env_float("GSM2COMPUTER_WS_DOWNLINK_BACKLOG_S", 0.3)
 DOWNLINK_DEAD_S = _env_float("GSM2COMPUTER_WS_DOWNLINK_DEAD_S", 45.0)
 FRAME_S = 0.02
 MIN_BACKLOG_BYTES = 4096
+# Half a second of 20 ms frames. Older audio is dropped, not allowed to grow.
+UPLINK_QUEUE_FRAMES = 25
+# ~0.7 s of 48 kHz mono s16. Past this, pw-cat is not reading; don't write more.
+UPLINK_BACKLOG_BYTES = 64 * 1024
+UPLINK_WRITE_TIMEOUT_S = 0.5
+
+
+def offer_nowait(queue: asyncio.Queue, item: Any) -> int:
+    """Enqueue item, dropping the oldest entries if the queue is full.
+
+    Never waits. Returns how many older items were discarded. The WebSocket
+    read loop uses this so a stalled pw-cat cannot stop us reading pings.
+    """
+    dropped = 0
+    while True:
+        try:
+            queue.put_nowait(item)
+            return dropped
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return dropped
+            dropped += 1
 
 
 def transport_buffered(writer: Any) -> int:

@@ -1,59 +1,100 @@
-import { connectEvents, getCalls, getHealth, getMessages, getThreads, sendMessage } from "./api.js";
-import { href, navigate } from "./router.js";
+import { getHealth, getMessages, getThreads, sendMessage } from "./api.js";
+import { clearUnread, deskState, paintUnreadBadge, unreadTotal } from "./desk-state.js";
+import { href, navigate, replaceLocation } from "./router.js";
 import { formatFixturePeer, shellHtml } from "./shell.js";
 
+export { unreadTotal };
+
 const state = {
-  tab: "messages",
   peer: null,
   threads: [],
   messages: [],
-  calls: [],
   error: "",
   sending: false,
   mock: false,
+  suppressAutoOpen: false,
 };
 
-let events = null;
+let boundApp = null;
+
+export function pickLatestThreadPeer(threads) {
+  if (!Array.isArray(threads) || threads.length === 0) return null;
+  const sorted = [...threads].sort((a, b) => String(b.lastAt || "").localeCompare(String(a.lastAt || "")));
+  return sorted[0].peer;
+}
+
+export function resolveMessagingPeer({ peer, suppressAutoOpen, threads }) {
+  if (peer) return peer;
+  if (suppressAutoOpen) return null;
+  return pickLatestThreadPeer(threads);
+}
+
+export function scrollThreadToLatest(scroller) {
+  if (!scroller) return;
+  const run = () => {
+    scroller.scrollTop = scroller.scrollHeight;
+  };
+  run();
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(run);
+  }
+}
 
 export function parseMessagingRest(rest) {
   if (rest.startsWith("/thread/")) {
-    state.tab = "messages";
     state.peer = decodeURIComponent(rest.slice("/thread/".length));
+    state.suppressAutoOpen = false;
     return;
   }
-  if (rest === "/calls") {
-    state.tab = "calls";
-    state.peer = null;
-    return;
-  }
-  state.tab = "messages";
   state.peer = null;
+}
+
+export function getMessagingContext() {
+  return { peer: state.peer };
+}
+
+export function resetMessagingSuppress() {
+  state.suppressAutoOpen = false;
+}
+
+export function openMessagingPeer(peer) {
+  if (!peer) return;
+  state.suppressAutoOpen = false;
+  state.peer = peer;
+  clearUnread(peer);
+  paintUnreadBadge();
+  navigate(`/messaging/thread/${encodeURIComponent(peer)}`);
 }
 
 function setMessagingPath() {
   if (state.peer) {
     navigate(`/messaging/thread/${encodeURIComponent(state.peer)}`);
-  } else if (state.tab === "calls") {
-    navigate("/messaging/calls");
   } else {
     navigate("/messaging");
   }
 }
 
 export async function renderMessaging(app) {
+  boundApp = app;
   try {
     state.error = "";
     const healthRes = await getHealth();
     state.mock = Boolean(healthRes.mock);
-    if (state.tab === "calls") {
-      const res = await getCalls();
-      state.calls = Array.isArray(res.data) ? res.data : [];
-      state.mock = state.mock || Boolean(res.mock);
+    state.threads = await getThreads();
+    const nextPeer = resolveMessagingPeer({
+      peer: state.peer,
+      suppressAutoOpen: state.suppressAutoOpen,
+      threads: state.threads,
+    });
+    if (!state.peer && nextPeer) {
+      replaceLocation(`/messaging/thread/${encodeURIComponent(nextPeer)}`);
+    }
+    state.peer = nextPeer;
+    if (state.peer) {
+      clearUnread(state.peer);
+      state.messages = await getMessages(state.peer);
     } else {
-      state.threads = await getThreads();
-      if (state.peer) {
-        state.messages = await getMessages(state.peer);
-      }
+      state.messages = [];
     }
   } catch (err) {
     state.error = err.message || String(err);
@@ -64,26 +105,23 @@ export async function renderMessaging(app) {
 function paint(app) {
   app.innerHTML = `
     ${shellHtml({ page: "messaging", mock: state.mock })}
-    <nav class="tabs">
-      <a class="${state.tab === "messages" ? "active" : ""}" data-tab="messages" href="${href("/messaging")}">Messages</a>
-      <a class="${state.tab === "calls" ? "active" : ""}" data-tab="calls" href="${href("/messaging/calls")}">Calls</a>
-    </nav>
     ${state.error ? `<div class="error">${escapeHtml(state.error)}</div>` : ""}
-    <main>${state.tab === "calls" ? renderCalls() : renderMessagesLayout()}</main>
+    <main>${renderMessagesLayout()}</main>
   `;
-  app.querySelectorAll("[data-tab]").forEach((el) => {
-    el.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      state.tab = el.getAttribute("data-tab");
-      state.peer = null;
+  paintUnreadBadge();
+  app.querySelectorAll("[data-peer]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.suppressAutoOpen = false;
+      state.peer = btn.getAttribute("data-peer");
+      clearUnread(state.peer);
       setMessagingPath();
     });
   });
-  app.querySelectorAll("[data-peer]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      state.peer = btn.getAttribute("data-peer");
-      setMessagingPath();
-    });
+  app.querySelector("[data-threads-back]")?.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    state.suppressAutoOpen = true;
+    state.peer = null;
+    setMessagingPath();
   });
   bindThread(app);
 }
@@ -103,48 +141,18 @@ function renderThreads() {
   return `<ul class="list">${state.threads
     .map((t) => {
       const on = t.peer === state.peer ? " on" : "";
+      const unread = deskState.unread[t.peer] || 0;
+      const mark = unread ? `<span class="thread-unread">${unread}</span>` : "";
       return `
       <li>
         <button class="row${on}" data-peer="${escapeAttr(t.peer)}">
-          <strong>${escapeHtml(formatFixturePeer(t.peer) || t.peer)}</strong>
+          <span class="row-head"><strong>${escapeHtml(formatFixturePeer(t.peer) || t.peer)}</strong>${mark}</span>
           <span>${escapeHtml(t.lastBody || "")}</span>
           <span class="meta">${escapeHtml(fmtTime(t.lastAt))}</span>
         </button>
       </li>`;
     })
     .join("")}</ul>`;
-}
-
-function renderCalls() {
-  if (!state.calls.length) {
-    return `<div class="empty">Mixer idle. No GSM or simulator legs bridged.</div>`;
-  }
-  return `<div class="call-list">${state.calls
-    .map((c) => {
-      const incoming = c.direction !== "out";
-      const dir = incoming ? "Incoming" : "Outgoing";
-      const mode = c.switchboard_mode || "idle";
-      const entrance = c.path === "public" || c.path === "tailscale" ? c.path : "";
-      const session = c.session_id
-        ? `<div class="meta session-id">${escapeHtml(c.session_id)}</div>`
-        : "";
-      const entranceChip = entrance
-        ? `<span class="preset-chip" data-entrance="${escapeAttr(entrance)}">${escapeHtml(entrance)}</span>`
-        : "";
-      return `<article class="call-card">
-        <div class="call-card-head">
-          <span class="lamp ${incoming ? "good" : "warn"}"></span>
-          <h2>${escapeHtml(dir)}</h2>
-          <span class="preset-chip">${escapeHtml(mode)}</span>
-          ${entranceChip}
-        </div>
-        <p class="fixture-num">${escapeHtml(formatFixturePeer(c.number) || c.number || "")}</p>
-        <div class="call-dur">${escapeHtml(fmtDuration(c.duration_sec))}</div>
-        <div class="meta">${escapeHtml(fmtTime(c.started_at))}</div>
-        ${session}
-      </article>`;
-    })
-    .join("")}</div>`;
 }
 
 function renderThreadInner() {
@@ -162,7 +170,7 @@ function renderThreadInner() {
   return `
     <div class="thread">
       <div class="thread-head">
-        <a class="back" href="${href("/messaging")}">‹ Threads</a>
+        <a class="back" data-threads-back href="${href("/messaging")}">‹ Threads</a>
         <span class="thread-peer">${escapeHtml(peerLabel)}</span>
       </div>
       ${state.error ? `<div class="error">${escapeHtml(state.error)}</div>` : ""}
@@ -176,8 +184,7 @@ function renderThreadInner() {
 }
 
 function bindThread(app) {
-  const scroller = app.querySelector("#messages");
-  if (scroller) scroller.scrollTop = scroller.scrollHeight;
+  scrollThreadToLatest(app.querySelector("#messages"));
   const form = app.querySelector("#compose");
   if (!form) return;
   form.addEventListener("submit", async (ev) => {
@@ -200,12 +207,14 @@ function bindThread(app) {
   });
 }
 
-export function startMessagingEvents(app) {
-  if (events) return;
-  events = connectEvents((type) => {
-    if (type === "call" && state.tab === "calls") renderMessaging(app);
-    if (type === "message" || type === "outbox") renderMessaging(app);
-  });
+export async function handleMessagingEvent(app, type) {
+  const target = app || boundApp;
+  if (!target) return;
+  if (type === "message" || type === "outbox") await renderMessaging(target);
+}
+
+export function bindMessagingApp(app) {
+  boundApp = app;
 }
 
 function fmtTime(iso) {
@@ -213,13 +222,6 @@ function fmtTime(iso) {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-}
-
-function fmtDuration(sec) {
-  const n = Number(sec) || 0;
-  const m = Math.floor(n / 60);
-  const s = n % 60;
-  return m ? `${m}m ${s}s` : `${s}s`;
 }
 
 function escapeHtml(value) {

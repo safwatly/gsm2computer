@@ -17,7 +17,12 @@ os.environ.setdefault(
 
 from portal_http import EventBus, PortalApp  # noqa: E402
 from portal_sms import GSM7_PART_BODY_LIMIT, UCS2_PART_BODY_LIMIT, split_outbound_sms  # noqa: E402
-from portal_store import OUTBOUND_SMS_GAP_SECONDS, PortalStore, normalize_e164  # noqa: E402
+from portal_store import (  # noqa: E402
+    OUTBOUND_SMS_GAP_SECONDS,
+    PortalStore,
+    normalize_e164,
+    resolve_call_recording,
+)
 
 
 class FakeWriter:
@@ -104,7 +109,7 @@ class PortalStoreTests(unittest.TestCase):
         parts = split_outbound_sms(body)
         self.assertGreater(len(parts), 1)
         self.assertEqual(parts[0][:6], f"(1/{len(parts)}) ")
-        self.assertEqual(parts[-1][:len(f"({len(parts)}/{len(parts)}) ")], f"({len(parts)}/{len(parts)}) ")
+        self.assertEqual(parts[-1][: len(f"({len(parts)}/{len(parts)}) ")], f"({len(parts)}/{len(parts)}) ")
         self.assertTrue(all(len(part.split(" ", 1)[1]) <= GSM7_PART_BODY_LIMIT for part in parts))
         self.assertEqual(" ".join(part.split(" ", 1)[1] for part in parts), body)
 
@@ -122,11 +127,51 @@ class PortalStoreTests(unittest.TestCase):
         self.assertEqual(len(self.store.claim_outbox_for_send()), 1)
         self.assertEqual(self.store.claim_outbox_for_send(), [])
         from datetime import datetime
+
         parsed = [datetime.fromisoformat(value.replace("Z", "+00:00")) for value in times]
         self.assertEqual(
             [(right - left).total_seconds() for left, right in zip(parsed, parsed[1:])],
             [OUTBOUND_SMS_GAP_SECONDS, OUTBOUND_SMS_GAP_SECONDS],
         )
+
+    def test_resolve_call_recording_session_tap_then_started_at(self) -> None:
+        root = Path(self._tmp.name) / "taps"
+        session_dir = root / "tap-session"
+        session_dir.mkdir(parents=True)
+        (session_dir / "openclaw.mp3").write_bytes(b"ID3session")
+        tap_dir = root / "tap-from-summary"
+        tap_dir.mkdir()
+        (tap_dir / "openclaw.mp3").write_bytes(b"ID3summary")
+        started_dir = root / "20260919T151500Z-openclaw"
+        started_dir.mkdir()
+        (started_dir / "openclaw.mp3").write_bytes(b"ID3started")
+
+        by_session = resolve_call_recording(
+            {"session_id": "tap-session", "tap_summary": json.dumps({"id": "tap-from-summary"}), "started_at": "2026-09-19T15:15:00Z"},
+            root,
+        )
+        self.assertEqual(by_session.read_bytes(), b"ID3session")
+
+        by_tap = resolve_call_recording(
+            {"session_id": None, "tap_summary": json.dumps({"id": "tap-from-summary"}), "started_at": "2026-09-19T15:15:00Z"},
+            root,
+        )
+        self.assertEqual(by_tap.read_bytes(), b"ID3summary")
+
+        by_time = resolve_call_recording(
+            {"session_id": None, "tap_summary": None, "started_at": "2026-09-19T15:15:00Z"},
+            root,
+        )
+        self.assertEqual(by_time.read_bytes(), b"ID3started")
+
+        traversal = resolve_call_recording({"session_id": "../secret"}, root)
+        self.assertIsNone(traversal)
+
+    def test_get_call_by_id(self) -> None:
+        item = self.store.add_call("in", "+15550001111", "2026-09-19T15:15:00Z", 12, session_id="tap-1")
+        found = self.store.get_call(item["id"])
+        self.assertEqual(found["session_id"], "tap-1")
+        self.assertIsNone(self.store.get_call("missing"))
 
 
 class PortalHttpTests(unittest.IsolatedAsyncioTestCase):
@@ -143,6 +188,7 @@ class PortalHttpTests(unittest.IsolatedAsyncioTestCase):
             dist_dir=dist,
             mode_getter=lambda: "openclaw",
             tap_getter=lambda: {"id": "tap-1", "streams": {"gsm": {"seconds": 3}}},
+            record_dir=root / "taps",
         )
 
     async def asyncTearDown(self) -> None:
@@ -223,6 +269,53 @@ class PortalHttpTests(unittest.IsolatedAsyncioTestCase):
         await self.app.dispatch("GET", "/portal/api/messages", {}, b"", writer)
         status, _, body = _parse_http(bytes(writer.buf))
         self.assertEqual(status, 400)
+        self.assertFalse(json.loads(body)["ok"])
+
+    async def test_call_recording_bytes_and_range(self) -> None:
+        taps = Path(self._tmp.name) / "taps"
+        tap_id = "20260919T151500Z-openclaw"
+        (taps / tap_id).mkdir(parents=True)
+        payload = b"ID3" + bytes(range(32))
+        (taps / tap_id / "openclaw.mp3").write_bytes(payload)
+
+        writer = FakeWriter()
+        call_body = json.dumps(
+            {
+                "direction": "in",
+                "number": "5550001111",
+                "started_at": "2026-09-19T15:15:00Z",
+                "duration_sec": 9,
+                "session_id": tap_id,
+            }
+        ).encode()
+        await self.app.dispatch("POST", "/calls", {}, call_body, writer)
+        call_id = json.loads(_parse_http(bytes(writer.buf))[2])["call"]["id"]
+
+        writer = FakeWriter()
+        await self.app.dispatch("GET", f"/portal/api/calls/{call_id}/recording", {}, b"", writer)
+        status, headers, body = _parse_http(bytes(writer.buf))
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["content-type"], "audio/mpeg")
+        self.assertEqual(headers["accept-ranges"], "bytes")
+        self.assertEqual(body, payload)
+
+        writer = FakeWriter()
+        await self.app.dispatch(
+            "GET",
+            f"/portal/api/calls/{call_id}/recording",
+            {"range": "bytes=0-1"},
+            b"",
+            writer,
+        )
+        status, headers, body = _parse_http(bytes(writer.buf))
+        self.assertEqual(status, 206)
+        self.assertEqual(body, payload[:2])
+        self.assertEqual(headers["content-range"], f"bytes 0-1/{len(payload)}")
+
+        writer = FakeWriter()
+        await self.app.dispatch("GET", "/portal/api/calls/missing/recording", {}, b"", writer)
+        status, _, body = _parse_http(bytes(writer.buf))
+        self.assertEqual(status, 404)
         self.assertFalse(json.loads(body)["ok"])
 
 

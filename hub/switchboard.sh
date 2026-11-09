@@ -38,6 +38,12 @@ case "${1:-status}" in
     link_stereo openclaw_bus gsm_bus
     echo "mode: gsm uplink (hub) + openclaw downlink -> gsm"
     ;;
+  grokbot)
+    # Grok Bot live voice: hub writes caller audio to patchbay_mic and reads
+    # grok_bus itself; no openclaw_bus/gsm_bus links may stay up.
+    unlink_all
+    echo "mode: gsm uplink -> patchbay_mic (grok_mic), grok_bus -> gsm downlink (hub-owned, no OpenClaw)"
+    ;;
   loopback)
     unlink_all
     echo "mode: gsm loopback (uplink -> gsm_bus.monitor downlink, no OpenClaw)"
@@ -50,5 +56,5 @@ case "${1:-status}" in
     link_stereo openclaw_bus gsm_bus
     echo "mode: gsm + openclaw + whatsapp + telegram (partial mesh)"
     ;;
-  *) echo "usage: $0 {status|clear|openclaw|loopback|conference}"; exit 1 ;;
+  *) echo "usage: $0 {status|clear|openclaw|grokbot|loopback|conference}"; exit 1 ;;
 esac
