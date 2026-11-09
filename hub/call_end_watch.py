@@ -587,7 +587,28 @@ def build_payload(
     drop = assess_drop(st, health, now=now_ts)
     dropped = drop["dropped_suspected"]
 
-    return {
+    transcript = None
+    try:
+        from grokbot_transcript import transcript_for_alert
+
+        tap = health.get("last_call_tap")
+        transcript = transcript_for_alert(tap if isinstance(tap, dict) else None)
+    except Exception:
+        LOG.debug("transcript pointer failed", exc_info=True)
+    text = (
+        f"call_ended duration_s={duration_s:.0f} "
+        f"dropped_suspected={dropped} "
+        f"hub_end_lead_s={drop['hub_end_lead_s']} "
+        f"hub_gap_max_s={drop['hub_gap_max_s']} "
+        f"call_id={st.call_id or '-'}"
+        + (
+            f" transcript_status={transcript.get('status')} transcript={transcript.get('path') or '-'}"
+            if transcript
+            else ""
+        )
+        + (" TEST" if test else "")
+    )
+    payload = {
         "event": "call_ended",
         "test": bool(test),
         "call_id": st.call_id,
@@ -635,15 +656,11 @@ def build_payload(
         },
         "call_summary": summary,
         "link_gaps": _safe_link_gaps(),
-        "text": (
-            f"call_ended duration_s={duration_s:.0f} "
-            f"dropped_suspected={dropped} "
-            f"hub_end_lead_s={drop['hub_end_lead_s']} "
-            f"hub_gap_max_s={drop['hub_gap_max_s']} "
-            f"call_id={st.call_id or '-'}"
-            + (" TEST" if test else "")
-        ),
+        "text": text,
     }
+    if transcript:
+        payload["transcript"] = transcript
+    return payload
 
 
 def fire_call_ended(

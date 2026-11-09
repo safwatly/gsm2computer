@@ -6,6 +6,7 @@ import {
   getCallsPlaybackState,
   resetCallPlayback,
   toggleCallPlayback,
+  transcriptLabel,
 } from "./calls.js";
 
 function mockAudio({ play } = {}) {
@@ -71,6 +72,16 @@ test("play rejection clears the fake playing state", async () => {
   await new Promise((resolve) => queueMicrotask(resolve));
   assert.equal(getCallsPlaybackState().playingId, null);
   assert.equal(getCallsPlaybackState().playError, "No OpenClaw recording for this call.");
+});
+
+test("transcriptLabel points at the saved file", () => {
+  assert.equal(transcriptLabel(null), "");
+  assert.equal(
+    transcriptLabel({ status: "ok", turns: 2, file: "transcript.json", path: "/calls/x/transcript.json" }),
+    "transcript ok · 2 turns · transcript.json",
+  );
+  assert.equal(transcriptLabel({ status: "empty", turns: 0, file: "transcript.json" }), "transcript empty · 0 turns · transcript.json");
+  assert.equal(transcriptLabel({ status: "no_cdp", turns: 1, file: "transcript.json" }), "transcript no_cdp · 1 turn · transcript.json");
 });
 
 test("second tap on the playing card pauses", () => {

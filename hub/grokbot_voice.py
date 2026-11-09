@@ -188,8 +188,13 @@ class GrokBotVoice:
                 LOG.error("grokbot off FAILED rc=%s (%s) err=%s", res["rc"], res["meaning"], res.get("error"))
             return res
 
-    def stop_later(self, after: Optional[asyncio.Task] = None) -> asyncio.Task:
-        """End live voice in the background (after a still-running switch)."""
+    def stop_later(self, after: Optional[asyncio.Task] = None, on_stopped: Optional[Any] = None) -> asyncio.Task:
+        """End live voice in the background (after a still-running switch).
+
+        ``on_stopped`` runs only after ``off`` returns, so a transcript read
+        cannot click the Grok page while the voice session is still live.
+        The next ``start`` waits for this task, including ``on_stopped``.
+        """
 
         async def _go() -> None:
             if after is not None and not after.done():
@@ -197,7 +202,12 @@ class GrokBotVoice:
                     await asyncio.wait_for(asyncio.shield(after), timeout=self.switch_timeout_s + 5)
                 except Exception:
                     after.cancel()
-            await self.stop()
+            res = await self.stop()
+            if on_stopped is not None:
+                try:
+                    await on_stopped(res)
+                except Exception:
+                    LOG.warning("grokbot post-off hook failed", exc_info=True)
 
         task = asyncio.create_task(_go())
         self._pending_off = task

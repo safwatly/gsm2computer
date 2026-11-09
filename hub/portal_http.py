@@ -107,6 +107,20 @@ def _tap_summary_text(tap: Optional[dict[str, Any]]) -> Optional[str]:
     return json.dumps(tap, ensure_ascii=False)
 
 
+def _annotate_call(call: dict[str, Any], record_dir: Path) -> dict[str, Any]:
+    """Add a transcript pointer when transcript.json sits beside the recordings."""
+    item = dict(call)
+    try:
+        from grokbot_transcript import pointer_for_saved_call
+
+        pointer = pointer_for_saved_call(item, record_dir)
+    except Exception:
+        pointer = None
+    if pointer:
+        item["transcript"] = pointer
+    return item
+
+
 def _default_record_dir() -> Path:
     return Path(
         os.environ.get(
@@ -201,7 +215,7 @@ class PortalApp:
             return "handled"
 
         if method == "GET" and route == "/portal/api/calls":
-            writer.write(json_response(200, self.store.list_calls()))
+            writer.write(json_response(200, [_annotate_call(item, self.record_dir) for item in self.store.list_calls()]))
             return "handled"
 
         recording = CALL_RECORDING_RE.match(route)
@@ -346,6 +360,7 @@ class PortalApp:
             tap_summary=tap_summary,
             path=path,
         )
+        item = _annotate_call(item, self.record_dir)
         self.events.publish("call", item)
         return json_response(201, {"ok": True, "call": item})
 

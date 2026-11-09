@@ -6,6 +6,8 @@
 - `session.updated` uses model `gsm2computer-hub-grokbot` and `talk=grokbot`, and `session.entrance` is still the socket that accepted the call.
 - Build 338 keeps a drop-oldest downlink queue. Phone builds send G2 binary uplink frames (`G2`, version 1, s16le mono). The public entrance accepts those frames when `X-Gsm-Device-Token` is valid.
 - `call_slot.disruptive_heal_blocked` treats grokbot `live` or `switching` as busy.
+- After `patchbay off`, the hub writes `transcript.json` beside that call's recordings (`caller` / `assistant` turns). `call_ended` and `GET /portal/api/calls` point at it. A missed read sets `transcript.status` and does not fail the call.
+- Every mode also writes `phone-downlink-8k-mono.wav` in the call directory (audio handed to the phone). How to read both files is in [hub/GROKBOT.md](../../../../hub/GROKBOT.md).
 
 ## How an operator does it
 

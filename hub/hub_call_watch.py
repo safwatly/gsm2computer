@@ -44,14 +44,32 @@ def adb_fired_since(t0):
     except Exception:
         return False
 
+def transcript_pointer(tap):
+    """Read transcript.json next to the call recordings. Missing file is not an error."""
+    if not tap or "/" in tap or "\\" in tap or tap in {".", ".."}:
+        return None
+    try:
+        from grokbot_transcript import load_saved_pointer
+
+        root = Path(os.environ.get("GSM2COMPUTER_CALL_RECORD_DIR", str(Path.home() / "gsm2computer-calls")))
+        return load_saved_pointer(root / tap)
+    except Exception as exc:
+        log("transcript pointer failed", exc)
+        return None
+
+
 def on_end(start, tap, reason):
     time.sleep(GRACE_S)
     if adb_fired_since(start):
         log("adb watcher already fired; skip"); return
     now = time.time()
+    pointer = transcript_pointer(tap)
     p = {"event": "call_ended", "source": "hub_call_watch", "call_id": tap or f"hub-{int(start)}",
          "tap_dir": tap, "duration_s": round(now - GRACE_S - start, 1), "close": reason,
          "ended_at_utc": datetime.now(timezone.utc).isoformat(), "note": "adb watcher did not fire (adb offline?)"}
+    if pointer:
+        p["transcript"] = pointer
+        p["transcript_status"] = pointer.get("status")
     try:
         post_alert_event(p); log("posted", p)
     except Exception as e:

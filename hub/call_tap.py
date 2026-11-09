@@ -18,6 +18,17 @@ Internal stem names are unchanged:
 
 relay graph also writes openclaw-append-24k-mono.wav and openclaw-tts-24k-mono.wav.
 
+Every call, in every mode, also writes phone-downlink-8k-mono.wav: the mono PCM
+handed to the phone, resampled to 8 kHz. That file is not part of a room mix,
+so close() leaves it in place. Listen with any WAV player, or
+``ffprobe <call-dir>/phone-downlink-8k-mono.wav``.
+
+Grok Bot calls may also contain transcript.json. Read it with
+``jq -r '.turns[] | [.speaker, (.timestamp // "-"), .text] | @tsv' <call-dir>/transcript.json``.
+
+Directories are pruned to GSM2COMPUTER_CALL_RECORD_KEEP (default 20), oldest
+name first, including the downlink and the transcript.
+
 Disable with GSM2COMPUTER_CALL_RECORD=0.
 """
 from __future__ import annotations
@@ -56,6 +67,8 @@ RECORD_DIR = Path(
     )
 )
 KEEP_CALLS = int(os.environ.get("GSM2COMPUTER_CALL_RECORD_KEEP", "20"))
+PHONE_DOWNLINK = "phone-downlink-8k-mono"
+PHONE_DOWNLINK_RATE = 8000
 MIX_TIMEOUT_S = 30.0
 
 # out name, left stem, right stem, mix sample rate
@@ -247,6 +260,8 @@ class CallTap:
         self._procs: list[asyncio.subprocess.Process] = []
         self._tasks: list[asyncio.Task] = []
         self._closed = False
+        self._downlink_ratecv: Any = None
+        self._downlink_src_rate: Optional[int] = None
         LOG.info("call tap dir %s", self.dir)
 
     @classmethod
@@ -292,6 +307,32 @@ class CallTap:
             stream = _Stream(path, rate, channels)
             self._streams[name] = stream
         stream.write(pcm)
+
+    def write_phone_downlink(self, pcm: bytes, rate: int) -> None:
+        """Record mono s16 that the hub is handing to the phone, at 8 kHz.
+
+        Used for every mode, including loopback. Existing stems are unchanged.
+        """
+        if self._closed or not pcm or rate <= 0:
+            return
+        extra = len(pcm) % 2
+        if extra:
+            pcm = pcm[:-extra]
+        if not pcm:
+            return
+        if rate != PHONE_DOWNLINK_RATE:
+            if self._downlink_src_rate != rate:
+                self._downlink_ratecv = None
+                self._downlink_src_rate = rate
+            pcm, self._downlink_ratecv = audioop.ratecv(
+                pcm, 2, 1, rate, PHONE_DOWNLINK_RATE, self._downlink_ratecv
+            )
+        else:
+            self._downlink_ratecv = None
+            self._downlink_src_rate = rate
+        if not pcm:
+            return
+        self.write_s16(PHONE_DOWNLINK, pcm, PHONE_DOWNLINK_RATE, 1)
 
     def write_ulaw(self, name: str, ulaw: bytes, rate: int = 8000) -> None:
         if self._closed or not ulaw:
@@ -392,6 +433,14 @@ class CallTap:
         summary = self.summary()
         summary["meta"] = self.meta
         summary["mixes"] = mixes
+        try:
+            from grokbot_transcript import load_saved_pointer
+
+            pointer = load_saved_pointer(self.dir)
+        except Exception:
+            pointer = None
+        if pointer:
+            summary["transcript"] = pointer
         (self.dir / "levels.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         LOG.info("call tap closed %s mixes=%s", json.dumps(summary["streams"]), json.dumps(mixes))
         return summary
