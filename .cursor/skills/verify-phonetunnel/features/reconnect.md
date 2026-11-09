@@ -43,6 +43,10 @@ Evidence: `/opt/cursor/artifacts/verify-phonetunnel/reconnect.txt`.
 
 - The stand-in keepalive is 2 seconds so the drop test finishes quickly.
   Production is 45 seconds. Do not copy the stand-in `config.env` to the phone.
+- That drop still has a live client until its own keepalive expires.
+  A reboot that leaves no FIN is `drive-rebind`: cup's Match
+  `ClientAliveInterval 15` / `ClientAliveCountMax 3` reaps the orphan,
+  and the phone's `ExitOnForwardFailure` retry binds the ports again.
 - An iptables DROP on loopback is not a radio change. The phone path
   (Wi-Fi, mobile data, carrier NAT) is unverified.
 - Killing the stand-in sshd is not a reboot of the Netcup VPS. Host

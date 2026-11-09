@@ -182,6 +182,8 @@ EOF
         --keepalive 2 \
         --backoff-initial 1 \
         --backoff-max 4 \
+        --client-alive-interval 4 \
+        --client-alive-count 2 \
         > "$run/setup.out"
 
     # Install the cup authorized_keys into the real account home so
@@ -1029,6 +1031,48 @@ EOF
         }
         policy_fail_closed
 
+        # An earlier Match that disables probes wins, so setup must
+        # refuse it and leave the file untouched.
+        local alive_work before after
+        alive_work=/run/phonetunnel-policy/alive0
+        sudo rm -rf "$alive_work"
+        sudo mkdir -p "$alive_work/etc/ssh" "$alive_work/inc"
+        sudo ssh-keygen -t ed25519 -f "$alive_work/etc/ssh/ssh_host_ed25519_key" -N "" -C alive0 >/dev/null
+        sudo chmod 600 "$alive_work/etc/ssh/ssh_host_ed25519_key"
+        sudo tee "$alive_work/inc/early.conf" >/dev/null << 'EOF'
+Match User phonetunnel
+    ClientAliveInterval 0
+    ClientAliveCountMax 3
+EOF
+        sudo tee "$alive_work/etc/ssh/sshd_config" >/dev/null << EOF
+Include $alive_work/inc/early.conf
+Port 1
+ListenAddress 127.0.0.1
+HostKey $alive_work/etc/ssh/ssh_host_ed25519_key
+UsePAM no
+PasswordAuthentication no
+PubkeyAuthentication yes
+EOF
+        before=$(sudo sha256sum "$alive_work/etc/ssh/sshd_config")
+        if sudo "$SETUP" --root "$alive_work" --cup-host 127.0.0.1 --cup-port 1 \
+            --ssh-port 2222 --adb-port 5556 >"$plog/alive0.out" 2>"$plog/alive0.err"; then
+            echo "ClientAliveInterval 0 was accepted"
+            cat "$plog/alive0.err"
+            die "earlier Match disabled client alive probes"
+        fi
+        after=$(sudo sha256sum "$alive_work/etc/ssh/sshd_config")
+        echo "earlier ClientAliveInterval 0 refused"
+        cat "$plog/alive0.err"
+        [ "$before" = "$after" ]
+        if sudo grep -q 'BEGIN gsm2computer-phonetunnel' "$alive_work/etc/ssh/sshd_config"; then
+            die "refused ClientAlive setup wrote a Match block"
+        fi
+        if "$SETUP" --dry-run --client-alive-interval 0 >/dev/null 2>"$plog/zero.err"; then
+            die "client alive interval 0 was accepted"
+        fi
+        grep -q '1..120' "$plog/zero.err"
+        echo "client alive interval 0 rejected"
+
         local work port ssh_r adb_r
         work=/run/phonetunnel-policy/ok
         port=$(free_port)
@@ -1351,7 +1395,14 @@ echo "shell=$shell shadow=$shadow"
 begins=$(grep -c 'BEGIN gsm2computer-phonetunnel' "$root/etc/ssh/sshd_config")
 [ "$begins" -eq 1 ]
 chroot "$root" /usr/sbin/sshd -T -C user=phonetunnel,host=127.0.0.1,addr=127.0.0.1 \
-    -f /etc/ssh/sshd_config | awk '$1=="allowtcpforwarding" || $1=="forcecommand"'
+    -f /etc/ssh/sshd_config | awk '$1=="allowtcpforwarding" || $1=="forcecommand" || $1=="clientaliveinterval" || $1=="clientalivecountmax"'
+alive=$(chroot "$root" /usr/sbin/sshd -T -C user=phonetunnel,host=127.0.0.1,addr=127.0.0.1 \
+    -f /etc/ssh/sshd_config | awk '$1=="clientaliveinterval"{print $2}')
+alive_n=$(chroot "$root" /usr/sbin/sshd -T -C user=phonetunnel,host=127.0.0.1,addr=127.0.0.1 \
+    -f /etc/ssh/sshd_config | awk '$1=="clientalivecountmax"{print $2}')
+echo "fresh clientalive=$alive count=$alive_n"
+[ "$alive" = 15 ]
+[ "$alive_n" = 3 ]
 pub1=$(awk '{print $2}' "$root/root/phonetunnel-install/id_ed25519.pub")
 if compgen -G "$root/etc/ssh/sshd_config.tmp.*" >/dev/null; then
     echo "sshd temp file left behind after a successful install" >&2
@@ -1468,7 +1519,18 @@ grep -q 'rolling back' "$root/adopt.err"
 [ "$(sha256sum "$root/etc/ssh/sshd_config")" = "$sshd_before" ]
 echo "adopt failure restored the password, shell, and home mode"
 
-echo "---- second run ----"
+echo "---- second run updates an old Match in place ----"
+python3 - << PY
+from pathlib import Path
+p = Path("$root/etc/ssh/sshd_config")
+lines = [ln for ln in p.read_text().splitlines(True)
+         if "ClientAlive" not in ln and "vanished phone" not in ln]
+p.write_text("".join(lines))
+PY
+if grep -q 'ClientAlive' "$root/etc/ssh/sshd_config"; then
+    echo "old block still has ClientAlive" >&2
+    exit 1
+fi
 printf 'kept-phone-hostkey\n' > "$root/root/phonetunnel-install/phone_known_hosts"
 printf 'operator-note\n' > "$root/root/phonetunnel-install/operator-note.txt"
 chmod 600 "$root/root/phonetunnel-install/phone_known_hosts" \
@@ -1484,6 +1546,18 @@ pub2=$(awk '{print $2}' "$root/root/phonetunnel-install/id_ed25519.pub")
 [ "$pub1" = "$pub2" ]
 begins=$(grep -c 'BEGIN gsm2computer-phonetunnel' "$root/etc/ssh/sshd_config")
 [ "$begins" -eq 1 ]
+intervals=$(grep -c 'ClientAliveInterval 15' "$root/etc/ssh/sshd_config")
+counts=$(grep -c 'ClientAliveCountMax 3' "$root/etc/ssh/sshd_config")
+echo "rewritten intervals=$intervals counts=$counts begins=$begins"
+[ "$intervals" -eq 1 ]
+[ "$counts" -eq 1 ]
+alive=$(chroot "$root" /usr/sbin/sshd -T -C user=phonetunnel,host=127.0.0.1,addr=127.0.0.1 \
+    -f /etc/ssh/sshd_config | awk '$1=="clientaliveinterval"{print $2}')
+alive_n=$(chroot "$root" /usr/sbin/sshd -T -C user=phonetunnel,host=127.0.0.1,addr=127.0.0.1 \
+    -f /etc/ssh/sshd_config | awk '$1=="clientalivecountmax"{print $2}')
+echo "second-run clientalive=$alive count=$alive_n"
+[ "$alive" = 15 ]
+[ "$alive_n" = 3 ]
 [ "$(cat "$root/root/phonetunnel-install/phone_known_hosts")" = "kept-phone-hostkey" ]
 [ "$(cat "$root/root/phonetunnel-install/operator-note.txt")" = "operator-note" ]
 [ "$(stat -c %a "$root/home/phonetunnel")" = 750 ]
@@ -1619,6 +1693,280 @@ exec qemu-aarch64-static '$MULTI' dropbear -F \
     grep -q 'nopasswd ok' "$out"
 }
 
+cmd_drive_rebind() {
+    local out="$EVIDENCE/rebind.txt"
+    if ! id phonetunnel >/dev/null 2>&1; then
+        die "phonetunnel user is missing; run launch once so the account exists"
+    fi
+    if ! command -v ip >/dev/null 2>&1; then
+        die "ip is missing; cannot simulate a netns drop"
+    fi
+    {
+        echo "drive rebind $(date -Is)"
+        local work cup ssh_r adb_r phone_ssh phone_adb
+        work=/run/phonetunnel-rebind
+        cup=$(free_port)
+        ssh_r=$(free_port)
+        adb_r=$(free_port)
+        phone_ssh=$(free_port)
+        phone_adb=$(free_port)
+        rebind_cleanup() {
+            if [ -f "$work/state/new.pid" ]; then
+                kill "$(cat "$work/state/new.pid")" 2>/dev/null || true
+            fi
+            if [ -f "$work/sshd.pid" ]; then
+                sudo kill "$(cat "$work/sshd.pid")" 2>/dev/null || true
+            fi
+            if [ -f "$work/state/cup.port" ]; then
+                local cport
+                cport=$(cat "$work/state/cup.port")
+                sudo iptables -D INPUT -s 10.89.0.2/32 -d 10.88.0.1/32 -p tcp --dport "$cport" -j DROP 2>/dev/null || true
+            fi
+            sudo ip netns del pt-rebind 2>/dev/null || true
+            sudo ip link del pt-rebind-veth 2>/dev/null || true
+            sudo ip addr del 10.88.0.1/32 dev lo 2>/dev/null || true
+            if [ -d "$work" ]; then
+                local leftover n
+                for n in 1 2 3 4 5; do
+                    leftover=$(ps -eo pid,args | awk -v r="$work" 'index($0, r) && !/awk/ {print $1}')
+                    if [ -z "$leftover" ]; then
+                        break
+                    fi
+                    # shellcheck disable=SC2086
+                    sudo kill $leftover 2>/dev/null || true
+                    sleep 0.2
+                done
+            fi
+            # A dying watchdog rewrites its streak file. Remove the tree
+            # only after those processes are gone.
+            if [ ! -f "$work/state/keep" ]; then
+                sudo rm -rf "$work"
+            fi
+        }
+        trap rebind_cleanup EXIT
+        rebind_cleanup || true
+        # /run/phonetunnel-rebind stays root-owned. A parent owned by this
+        # user makes sshd StrictModes reject phonetunnel's authorized_keys.
+        sudo mkdir -p "$work/etc/ssh" "$work/bin" "$work/state"
+        sudo chown "$(id -u):$(id -g)" "$work/bin" "$work/state"
+        sudo chmod 755 "$work" "$work/bin" "$work/state"
+        sudo ssh-keygen -t ed25519 -f "$work/etc/ssh/ssh_host_ed25519_key" -N "" -q
+        sudo chown root:root "$work/etc/ssh/ssh_host_ed25519_key"
+        sudo chmod 600 "$work/etc/ssh/ssh_host_ed25519_key"
+        sudo tee "$work/etc/ssh/sshd_config" >/dev/null << EOF
+Port $cup
+ListenAddress 10.88.0.1
+HostKey $work/etc/ssh/ssh_host_ed25519_key
+PidFile $work/sshd.pid
+LogLevel VERBOSE
+UsePAM no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile $work/home/phonetunnel/.ssh/authorized_keys
+EOF
+        sudo "$SETUP" --root "$work" \
+            --cup-host 10.88.0.1 \
+            --cup-port "$cup" \
+            --ssh-port "$ssh_r" \
+            --adb-port "$adb_r" \
+            --phone-ssh-port "$phone_ssh" \
+            --phone-adb-port "$phone_adb" \
+            --keepalive 45 \
+            --backoff-initial 1 \
+            --backoff-max 4 \
+            >"$work/state/setup.out"
+        echo "setup wrote the Match; effective client alive:"
+        sudo sshd -T -C user=phonetunnel,host=10.88.0.1,addr=10.88.0.1 \
+            -f "$work/etc/ssh/sshd_config" | awk '$1=="clientaliveinterval" || $1=="clientalivecountmax"'
+        local alive alive_n begins
+        alive=$(sudo sshd -T -C user=phonetunnel,host=10.88.0.1,addr=10.88.0.1 \
+            -f "$work/etc/ssh/sshd_config" | awk '$1=="clientaliveinterval"{print $2}')
+        alive_n=$(sudo sshd -T -C user=phonetunnel,host=10.88.0.1,addr=10.88.0.1 \
+            -f "$work/etc/ssh/sshd_config" | awk '$1=="clientalivecountmax"{print $2}')
+        begins=$(grep -c 'BEGIN gsm2computer-phonetunnel' "$work/etc/ssh/sshd_config")
+        [ "$alive" = 15 ]
+        [ "$alive_n" = 3 ]
+        [ "$begins" -eq 1 ]
+        sudo chown -R phonetunnel:phonetunnel "$work/home/phonetunnel"
+        sudo chmod 755 "$work" "$work/home"
+        sudo chmod 750 "$work/home/phonetunnel"
+        sudo chmod 700 "$work/home/phonetunnel/.ssh"
+        sudo chmod 600 "$work/home/phonetunnel/.ssh/authorized_keys"
+
+        local bundle state
+        bundle="$work/root/phonetunnel-install"
+        state="$work/state"
+        mkdir -p "$state/home/.ssh" "$work/bin"
+        sudo cp "$bundle/id_ed25519" "$state/id_ed25519"
+        sudo cp "$bundle/known_hosts" "$state/home/.ssh/known_hosts"
+        sudo cp "$bundle/authorized_keys" "$state/authorized_keys"
+        sudo cp "$bundle/config.env" "$state/config.env"
+        sudo cp "$bundle/phone_shell_ed25519" "$work/phone_shell"
+        sudo chown -R "$(id -u):$(id -g)" "$state" "$work/phone_shell" "$work/bin"
+        chmod 700 "$state" "$state/home" "$state/home/.ssh"
+        chmod 600 "$state/id_ed25519" "$state/authorized_keys" "$state/config.env" "$work/phone_shell"
+        chmod 644 "$state/home/.ssh/known_hosts"
+        cat > "$work/bin/dbclient" << EOF
+#!/bin/sh
+exec qemu-aarch64-static "$MULTI" dbclient "\$@"
+EOF
+        cat > "$work/bin/dropbear" << EOF
+#!/bin/sh
+exec qemu-aarch64-static "$MULTI" dropbear "\$@"
+EOF
+        cat > "$work/bin/dropbearkey" << EOF
+#!/bin/sh
+exec qemu-aarch64-static "$MULTI" dropbearkey "\$@"
+EOF
+        chmod 755 "$work/bin/dbclient" "$work/bin/dropbear" "$work/bin/dropbearkey"
+
+        sudo ip addr add 10.88.0.1/32 dev lo
+        sudo ip netns add pt-rebind
+        sudo ip link add pt-rebind-veth type veth peer name pt-rebind-peer
+        sudo ip link set pt-rebind-peer netns pt-rebind
+        sudo ip addr add 10.89.0.1/30 dev pt-rebind-veth
+        sudo ip link set pt-rebind-veth up
+        sudo ip netns exec pt-rebind ip addr add 10.89.0.2/30 dev pt-rebind-peer
+        sudo ip netns exec pt-rebind ip link set pt-rebind-peer up
+        sudo ip netns exec pt-rebind ip link set lo up
+        sudo ip netns exec pt-rebind ip route add 10.88.0.1/32 via 10.89.0.1
+        # The supervisor waits until /proc/net/route shows a default route.
+        sudo ip netns exec pt-rebind ip route add default via 10.89.0.1
+        sudo mkdir -p /run/sshd
+        sudo /usr/sbin/sshd -E "$work/sshd.log" -f "$work/etc/ssh/sshd_config"
+        sleep 0.3
+        [ -f "$work/sshd.pid" ]
+
+        echo "$cup" > "$work/state/cup.port"
+        sudo ip netns exec pt-rebind \
+            env PATH="$work/bin:$PATH" \
+            PHONETUNNEL_STATE="$state" \
+            PHONETUNNEL_MODDIR="$MODULE" \
+            PHONETUNNEL_CONFIG="$state/config.env" \
+            PHONETUNNEL_LOG="$state/old.log" \
+            PHONETUNNEL_DBCLIENT="$work/bin/dbclient" \
+            PHONETUNNEL_DROPBEAR="$work/bin/dropbear" \
+            PHONETUNNEL_DROPBEARKEY="$work/bin/dropbearkey" \
+            sh "$MODULE/bin/supervisor.sh" >>"$state/old.service" 2>&1 &
+        echo $! > "$work/state/old.pid"
+        local i
+        for i in $(seq 1 40); do
+            if tcp_open "$ssh_r"; then
+                break
+            fi
+            sleep 1
+        done
+        tcp_open "$ssh_r" || {
+            echo "---- old log ----"
+            cat "$state/old.log" 2>/dev/null || true
+            echo "---- old service ----"
+            cat "$state/old.service" 2>/dev/null || true
+            die "first tunnel did not bind $ssh_r"
+        }
+        echo "first tunnel bound 127.0.0.1:$ssh_r"
+
+        # Silence the vanished phone. Drop what it sends, including its
+        # reset, and let sshd's own ClientAlive probes leave. Dropping
+        # those probes fills the send buffer and the server loop never
+        # reaches the timeout.
+        sudo iptables -I INPUT -s 10.89.0.2/32 -d 10.88.0.1/32 -p tcp --dport "$cup" -j DROP
+        local t0 oldpid
+        t0=$(date +%s)
+        # Deleting the name does not kill processes that still hold the
+        # namespace. Kill them after the drop so their reset is discarded.
+        oldpid=$(cat "$work/state/old.pid")
+        sudo kill -- -"$oldpid" 2>/dev/null || sudo kill "$oldpid" 2>/dev/null || true
+        # qemu children are not always in sudo's process group. Repeat
+        # so a supervisor that respawns dbclient is gone before the path is.
+        local stale n
+        for n in 1 2 3; do
+            stale=$(ps -eo pid,args | awk -v r="$work" 'index($0, r) && ($0 ~ /dropbearmulti/ || $0 ~ /supervisor\.sh/) {print $1}')
+            if [ -z "$stale" ]; then
+                break
+            fi
+            # shellcheck disable=SC2086
+            sudo kill $stale 2>/dev/null || true
+            sleep 0.2
+        done
+        # Leave the veth up so sshd can transmit ClientAlive probes.
+        # The phone processes are dead and their packets are dropped,
+        # which is the silence after a reboot that does not deliver FIN.
+        sleep 0.5
+        if ! tcp_open "$ssh_r"; then
+            die "stale listener was gone immediately; the vanish sent a reset"
+        fi
+        echo "after the phone vanished the reverse port is still held"
+
+        # The rebooted phone. The old supervisor ran as root and left the
+        # host key unreadable. The new one is the phone user.
+        sudo chown -R "$(id -u):$(id -g)" "$state"
+        chmod -R u+rwX "$state"
+        : > "$state/new.log"
+        env PATH="$work/bin:$PATH" \
+            PHONETUNNEL_STATE="$state" \
+            PHONETUNNEL_MODDIR="$MODULE" \
+            PHONETUNNEL_CONFIG="$state/config.env" \
+            PHONETUNNEL_LOG="$state/new.log" \
+            PHONETUNNEL_DBCLIENT="$work/bin/dbclient" \
+            PHONETUNNEL_DROPBEAR="$work/bin/dropbear" \
+            PHONETUNNEL_DROPBEARKEY="$work/bin/dropbearkey" \
+            sh "$MODULE/bin/supervisor.sh" >>"$state/new.service" 2>&1 &
+        echo $! > "$work/state/new.pid"
+
+        local nonce elapsed ok
+        nonce="rebind-$(date +%s)"
+        ok=0
+        elapsed=0
+        # Do not connect to the stale listener while the old session is
+        # up. sshd only runs ClientAlive when ppoll times out. A connect
+        # to the reverse port queues channel data, the socket stays
+        # writable, and the probe never happens.
+        while [ $(( $(date +%s) - t0 )) -lt 90 ]; do
+            if sudo ss -H -tn state established "src" "10.88.0.1:$cup" | grep -q '10\.89\.0\.2:'; then
+                sleep 1
+                continue
+            fi
+            if timeout 5 ssh -i "$work/phone_shell" \
+                -p "$ssh_r" \
+                -o IdentitiesOnly=yes \
+                -o StrictHostKeyChecking=accept-new \
+                -o UserKnownHostsFile="$state/phone_known" \
+                -o BatchMode=yes \
+                -o ConnectTimeout=2 \
+                "$(id -un)@127.0.0.1" "printf '%s\n' '$nonce'" 2>/dev/null | grep -q "$nonce"; then
+                ok=1
+                elapsed=$(( $(date +%s) - t0 ))
+                break
+            fi
+            sleep 1
+        done
+        echo "rebind_ok=$ok elapsed_sec=${elapsed}"
+        if [ "$ok" -ne 1 ]; then
+            echo "---- established ----"
+            sudo ss -tn state established "src" "10.88.0.1:$cup" || true
+            echo "---- sshd log (timeouts) ----"
+            sudo awk '/Timeout|Alive|disconnect|error/ {print}' "$work/sshd.log" || true
+            echo "---- new log (tail) ----"
+            tail -n 20 "$state/new.log" 2>/dev/null || true
+        fi
+        [ "$ok" -eq 1 ]
+        [ "$elapsed" -ge 30 ]
+        [ "$elapsed" -le 90 ]
+        if ! grep -q 'Remote TCP forward request failed' "$state/new.log"; then
+            echo "---- new log ----"
+            cat "$state/new.log"
+            die "new client never saw the stale forward"
+        fi
+        echo "new client refused the held port, then rebound in ${elapsed}s"
+        echo "rebind ok"
+        touch "$work/state/keep"
+        cp "$state/new.log" "$EVIDENCE/rebind-new.log" || true
+        rm -f "$work/state/keep"
+    } | tee "$out"
+    grep -q 'rebind ok' "$out"
+}
+
 cmd_drive_all() {
     cmd_drive_tunnel
     cmd_drive_shell
@@ -1629,6 +1977,7 @@ cmd_drive_all() {
     cmd_drive_nopasswd
     cmd_drive_policy
     cmd_drive_account
+    cmd_drive_rebind
     assert_system_sshd_untouched
     local run
     run=$(run_dir)
@@ -1704,10 +2053,11 @@ case "${1:-}" in
     drive-supervise) cmd_drive_supervise ;;
     drive-policy) cmd_drive_policy ;;
     drive-account) cmd_drive_account ;;
+    drive-rebind) cmd_drive_rebind ;;
     drive-all) cmd_drive_all ;;
     cleanup) cmd_cleanup ;;
     *)
-        echo "usage: harness.sh doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-supervise|drive-watchdog|drive-nopasswd|drive-policy|drive-account|drive-all|cleanup" >&2
+        echo "usage: harness.sh doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-supervise|drive-watchdog|drive-nopasswd|drive-policy|drive-account|drive-rebind|drive-all|cleanup" >&2
         exit 2
         ;;
 esac

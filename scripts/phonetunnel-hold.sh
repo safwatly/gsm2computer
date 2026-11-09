@@ -7,6 +7,9 @@
 # An empty SSH_ORIGINAL_COMMAND is an interactive session with no
 # command. Keep the process alive so the connection (and any forwards
 # on that session) is not a shell. A non-empty command is refused.
+# ssh -N never runs this script, so it cannot see the reverse-forward
+# session and it does not kill sshd processes. A dead phone is reaped
+# by ClientAliveInterval on the Match block.
 
 logger -t phonetunnel "session client=${SSH_CLIENT:-unknown} orig=${SSH_ORIGINAL_COMMAND:-none}" 2>/dev/null || true
 
