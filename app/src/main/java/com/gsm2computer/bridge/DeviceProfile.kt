@@ -601,6 +601,13 @@ data class DeviceProfile(
          *     which would also mute Incall_Music injection.
          *   - Capture caller-only via VOICE_DOWNLINK (incall-rec-downlink =
          *     MultiMedia9 Mixer VOC_REC_DL), so injected audio cannot echo back.
+         *   - `Voice Tx Mute` is a 3-value control (mute, VSID, ramp). The
+         *     one-value `0` write hits session 0. [VoiceTxUnmute] writes the
+         *     live session after it is RUNNING. Voice Rx/Tx Device Mute stay
+         *     untouched.
+         *   - Follow-up, not this build: stop the manual Incall_Music
+         *     MM1/MM2/MM9 toggles and the PhasedInjector raw resets, and let
+         *     the HAL own incall_music_uplink.
          */
         fun motoG84Holi() = DeviceProfile(
             name = "Moto g84 (holi)",
@@ -611,7 +618,6 @@ data class DeviceProfile(
                     append("tinymix 'EAR_RDAC Switch' 0 2>/dev/null; ")
                     for (i in 0..3) append("tinymix 'TX_DEC$i Volume' 0 2>/dev/null; ")
                     for (i in 1..3) append("tinymix 'ADC$i Volume' 0 2>/dev/null; ")
-                    append("tinymix 'Voice Tx Mute' 0 2>/dev/null; ")
                     append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
                     append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
                     // holi HAL: USECASE_INCALL_MUSIC_UPLINK = PCM 23 = MultiMedia9
@@ -631,8 +637,7 @@ data class DeviceProfile(
                 mixerIncallMusicCmd = buildString {
                     append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
                     append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
-                    append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 1 2>/dev/null; ")
-                    append("tinymix 'Voice Tx Mute' 0 2>/dev/null")
+                    append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 1 2>/dev/null")
                 },
                 mixerDiagGrep = "tinymix 2>&1 | grep -iE '(MultiMedia9 Mixer|VOC_REC|Incall_Music|" +
                     "Voice Tx Mute|Voice Rx|aw87xxx_profile|EAR_RDAC|TX_DEC[0-3] Vol|ADC[1-3] Vol|VoiceMMode1)'",
@@ -667,6 +672,7 @@ data class DeviceProfile(
                 appopsPropagationMs = 500,
                 isAbox = false,
                 muteMicrophoneAtApi = false,
+                sessionVoiceTxUnmute = true,
             ),
         )
 
@@ -887,6 +893,10 @@ data class HalRoutingProfile(
      *  Samsung Exynos must stay false (HAL treats it as full uplink mute).
      *  Pixel/Tensor: safe when SIP playback routes via INCALL_TX tinymix. */
     val muteMicrophoneAtApi: Boolean = false,
+
+    /** After the voice PCM is RUNNING, write `Voice Tx Mute` as mute/VSID/ramp.
+     *  Moto g84 only. Other profiles keep their existing one-value commands. */
+    val sessionVoiceTxUnmute: Boolean = false,
 )
 
 /**

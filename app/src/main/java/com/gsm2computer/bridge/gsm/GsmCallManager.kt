@@ -11,6 +11,7 @@ import android.telecom.InCallService
 import android.util.Log
 import com.gsm2computer.bridge.DeviceProfile
 import com.gsm2computer.bridge.RootShell
+import com.gsm2computer.bridge.TinymixTrace
 
 /**
  * GSM call manager: answers/makes/hangs up GSM calls, tracks state.
@@ -536,7 +537,8 @@ object GsmCallManager {
             }
             // Step 2: Run mixer setup commands (all ABOX controls on card 0)
             // Use execForOutput to capture discovery/diagnostic output from setup commands
-            val setupOutput = RootShell.execForOutput(resolvedSetup, timeoutMs = 8000)
+            val setupOutput = TinymixTrace.run(resolvedSetup, timeoutMs = 3000) { appLog(it) }
+                .joinToString("\n")
             if (setupOutput.isNotBlank()) appLog("Mixer setup: $setupOutput")
             mixerSetupCompletedAtMs = System.currentTimeMillis()
 
@@ -569,7 +571,7 @@ object GsmCallManager {
             return
         }
         try {
-            RootShell.exec(resolvedRestore)
+            TinymixTrace.run(resolvedRestore, timeoutMs = 3000) { appLog(it) }
             appLog("Mixer restored")
         } catch (e: Exception) {
             appLog("Mixer restore FAILED: ${e.message}")

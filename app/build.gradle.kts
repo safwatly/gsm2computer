@@ -38,11 +38,10 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        // versionCode 348: a loud frame clears the call-start silence watch. A stalled
-        // downlink keeps the newest 2s of speech, drops the quietest gap next, and
-        // crossfades every join. The inject marker stays off unless the property is set.
-        versionCode = 348
-        versionName = "0.2.9"
+        // versionCode 349: diagnostic. Moto Voice Tx Mute is mute/VSID/ramp after
+        // the voice PCM is RUNNING. The inject marker defaults on. 348 stays held.
+        versionCode = 349
+        versionName = "0.2.10"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

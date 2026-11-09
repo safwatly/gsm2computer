@@ -10,10 +10,10 @@ import java.io.OutputStream
 
 /**
  * Build 343 playback on the Moto g84: AudioTrack USAGE_MEDIA preferred onto
- * TYPE_TELEPHONY for the whole call. The start-of-call beep overwrote the
- * first 0.75 s, so it stays off unless `persist.gsm2computer.inject_marker`
- * is `1`. Builds 342's later phases (PCM 23 reorder, AFE-proxy, and the
- * post-45s decide) were never called from [start] and are not in this class.
+ * TYPE_TELEPHONY for the whole call. This diagnostic build plays the 0.75 s
+ * marker unless `persist.gsm2computer.inject_marker` is `0`. Builds 342's
+ * later phases (PCM 23 reorder, AFE-proxy, and the post-45s decide) were
+ * never called from [start] and are not in this class.
  * Mixers are reverted at stop / call end. Meta keys are inject_*.
  */
 class PhasedInjector(
@@ -164,7 +164,12 @@ class PhasedInjector(
     fun stop() {
         alive = false
         killInj()
-        val r = sh("tinymix 'Incall_Music Audio Mixer MultiMedia9' 0; tinymix 'Incall_Music_2 Audio Mixer MultiMedia9' 0; tail -3 /data/local/tmp/calldump/afeproxy.log", 4000)
+        val traced = com.gsm2computer.bridge.TinymixTrace.run(
+            "tinymix 'Incall_Music Audio Mixer MultiMedia9' 0; tinymix 'Incall_Music_2 Audio Mixer MultiMedia9' 0",
+            timeoutMs = 4000,
+        ).joinToString(" ")
+        val tail = sh("tail -3 /data/local/tmp/calldump/afeproxy.log", 2000)
+        val r = "$traced $tail"
         put("inject_bytes", bytes); put("inject_track_bytes", trackBytes)
         phaseMark("STOP reverted=[$r]")
     }
@@ -181,7 +186,7 @@ class PhasedInjector(
         val flag = try {
             val cls = Class.forName("android.os.SystemProperties")
             val get = cls.getMethod("get", String::class.java, String::class.java)
-            get.invoke(null, "persist.gsm2computer.inject_marker", "0") as? String
+            get.invoke(null, "persist.gsm2computer.inject_marker", "1") as? String
         } catch (_: Throwable) {
             null
         }

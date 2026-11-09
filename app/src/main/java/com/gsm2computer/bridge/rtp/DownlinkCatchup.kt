@@ -147,8 +147,8 @@ internal class DownlinkRxGaps(private val stallMs: Long = 250L) {
     }
 }
 
-/** `1` enables the 0.75 s inject marker. Anything else, including null, leaves the greeting alone. */
-internal fun injectMarkerBeeps(flag: String?): Int = if (flag == "1") 1 else 0
+/** Diagnostic build: the 0.75 s marker is on unless the property is exactly `0`. */
+internal fun injectMarkerBeeps(flag: String?): Int = if (flag == "0") 0 else 1
 
 /**
  * 4 ms linear crossfade at a join where a frame was removed.

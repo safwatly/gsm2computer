@@ -77,6 +77,11 @@ class DeviceProfileTest {
         assertEquals(DeviceProfile.motoG84Holi().name, p.name)
         assertEquals(false, p.routing.requireSpeakerMode)
         assertEquals(false, p.mixer.mixerSetupCmd.contains("Voice Rx Device Mute"))
+        assertEquals(false, p.mixer.mixerSetupCmd.contains("Voice Tx Mute"))
+        assertEquals(false, p.mixer.mixerIncallMusicCmd.contains("Voice Tx Mute"))
+        assertEquals(false, p.mixer.mixerSetupCmd.contains("Voice Tx Device Mute"))
+        assertTrue(p.routing.sessionVoiceTxUnmute)
+        assertTrue(p.routing.playbackToTelephony)
     }
 
     @Test

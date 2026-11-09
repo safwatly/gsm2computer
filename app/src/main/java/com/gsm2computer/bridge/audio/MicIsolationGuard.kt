@@ -6,7 +6,7 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Log
 import com.gsm2computer.bridge.DeviceProfile
-import com.gsm2computer.bridge.RootShell
+import com.gsm2computer.bridge.TinymixTrace
 
 /**
  * Enforces the gateway's core invariant: the physical mic must NEVER be
@@ -81,7 +81,7 @@ class MicIsolationGuard(
             return
         }
         try {
-            val out = RootShell.execForOutput(resolved, timeoutMs = 8000)
+            val out = TinymixTrace.run(resolved, timeoutMs = 3000).joinToString("\n")
             if (out.isNotBlank()) Log.i(TAG, "Mic-mute mixer: $out")
         } catch (e: Exception) {
             Log.w(TAG, "Mic-mute mixer ops failed: ${e.message}")

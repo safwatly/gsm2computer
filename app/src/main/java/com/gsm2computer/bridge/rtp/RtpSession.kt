@@ -16,6 +16,8 @@ import com.gsm2computer.bridge.DeviceProfile
 import com.gsm2computer.bridge.diag.BridgeLog
 import com.gsm2computer.bridge.realtime.UplinkWire
 import com.gsm2computer.bridge.RootShell
+import com.gsm2computer.bridge.TinymixTrace
+import com.gsm2computer.bridge.VoiceTxUnmute
 import com.gsm2computer.bridge.gsm.GsmCallManager
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -1007,7 +1009,7 @@ class RtpSession(
                 if (micMuteCmd.isNotEmpty()) {
                     try {
                         val resolved = DeviceProfile.resolveCmd(micMuteCmd)
-                        if (resolved.isNotEmpty()) RootShell.execForOutput(resolved, timeoutMs = 3000)
+                        if (resolved.isNotEmpty()) TinymixTrace.run(resolved, timeoutMs = 3000)
                     } catch (_: Exception) {}
                 }
                 reAssertCaptureRoute()
@@ -1433,7 +1435,10 @@ class RtpSession(
         // the HAL routes through deep-buffer-playback instead of incall-music,
         // and the audio never reaches the voice TX (uplink).
         if (trackPlaying && phased == null) enableIncallMusic()
-        // Set mixer controls via root — also handles Voice Tx Mute=0.
+        // Moto: Voice Tx Mute is mute/VSID/ramp, after the voice PCM is RUNNING.
+        unmuteVoiceTxForActiveSession()
+        // Set mixer controls via root. The Moto profile no longer writes a
+        // one-value Voice Tx Mute here.
         // No separate ensureVoiceTxOpen() call here: the mixer thread below
         // already issues that command, and waiting for su -c was blocking
         // the playback thread for ~100ms.
@@ -1798,6 +1803,68 @@ class RtpSession(
     }
 
     /**
+     * Moto only. Waits until a voice PCM is RUNNING, then writes
+     * `Voice Tx Mute` as `[0, vsid, 0]`. A second write a second later covers
+     * the kernel storing the mute before `VOC_RUN` sends it to the DSP.
+     * Does not touch Voice Rx Device Mute or Voice Tx Device Mute.
+     */
+    private fun unmuteVoiceTxForActiveSession() {
+        if (!profile.routing.sessionVoiceTxUnmute) return
+        Thread({
+            val deadline = System.currentTimeMillis() + 8_000
+            var attempts = 0
+            var lastProbeLog = ""
+            while (running.get() && System.currentTimeMillis() < deadline && attempts < 2) {
+                val probe = try {
+                    RootShell.execForOutput(VoiceTxUnmute.probeScript, 2000)
+                } catch (e: Exception) {
+                    Log.w(TAG, "voice tx unmute probe failed: ${e.message}")
+                    ""
+                }
+                val parsed = VoiceTxUnmute.parseProbe(probe)
+                val probeLine = VoiceTxUnmute.summary(parsed)
+                if (probeLine != lastProbeLog) {
+                    lastProbeLog = probeLine
+                    Log.i(TAG, probeLine)
+                    listener?.onRtpStats(probeLine)
+                }
+                if (parsed.active.isEmpty()) {
+                    try { Thread.sleep(250) } catch (_: InterruptedException) { return@Thread }
+                    continue
+                }
+                val binOk = DeviceProfile.tinymixBin.isNotEmpty()
+                if (!binOk) {
+                    Log.e(TAG, "voice tx unmute: tinymix not found")
+                    return@Thread
+                }
+                for (session in parsed.active) {
+                    val cmd = DeviceProfile.resolveCmd(VoiceTxUnmute.unmuteCommand(session.vsid))
+                    val lines = TinymixTrace.run(cmd, timeoutMs = 3000) { listener?.onRtpStats(it) }
+                    val summary = "voice tx unmute session=${session.id} vsid=${session.vsid} " +
+                        lines.joinToString(" | ")
+                    Log.i(TAG, summary)
+                    listener?.onRtpStats(summary)
+                }
+                attempts++
+                if (attempts < 2) {
+                    try { Thread.sleep(1_000) } catch (_: InterruptedException) { return@Thread }
+                }
+            }
+            if (attempts == 0) {
+                Log.w(TAG, "voice tx unmute: voice session never became RUNNING")
+                listener?.onRtpStats("voice tx unmute: voice session never became RUNNING")
+            }
+            try {
+                val dmesg = RootShell.execForOutput(
+                    "dmesg | grep -F voice_get_idx_for_session | tail -n 3",
+                    2000,
+                )
+                if (dmesg.isNotBlank()) Log.i(TAG, "voice tx unmute dmesg: $dmesg")
+            } catch (_: Exception) {}
+        }, "voice-tx-unmute").apply { isDaemon = true }.start()
+    }
+
+    /**
      * Fallback: use root (Magisk) to set incall_music mixer controls
      * directly via tinymix.  Device-specific commands from the profile.
      *
@@ -1830,7 +1897,8 @@ class RtpSession(
                 } else {
                     resolvedMixerCmd
                 }
-                val output = RootShell.execForOutput(cmd, timeoutMs = 8000)
+                val output = TinymixTrace.run(cmd, timeoutMs = 3000) { listener?.onRtpStats(it) }
+                    .joinToString(" | ")
                 val msg = "Mixer incall_music: $output"
                 Log.i(TAG, msg)
                 listener?.onRtpStats(msg)
@@ -1964,8 +2032,7 @@ class RtpSession(
         )
         if (resolved.isEmpty()) return
         try {
-            val out = RootShell.execForOutput(resolved, timeoutMs = 3000)
-            if (out.isNotBlank()) Log.d(TAG, "Capture route re-assert: $out")
+            TinymixTrace.run(resolved, timeoutMs = 3000).forEach { Log.d(TAG, "Capture route re-assert: $it") }
         } catch (_: Exception) {}
     }
 
