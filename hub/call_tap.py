@@ -38,6 +38,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +72,8 @@ PHONE_DOWNLINK = "phone-downlink-8k-mono"
 PHONE_DOWNLINK_RATE = 8000
 # About two seconds of 20 ms frames. A stalled disk drops audio instead of stalling the pump.
 _DOWNLINK_QUEUE_MAX = 100
+# Shorter than the hub's 5s stop_capture cap. A stuck write returns so the call slot can be released.
+DOWNLINK_FLUSH_S = float(os.environ.get("GSM2COMPUTER_DOWNLINK_FLUSH_S", "1"))
 MIX_TIMEOUT_S = 30.0
 
 # out name, left stem, right stem, mix sample rate
@@ -368,30 +371,56 @@ class CallTap:
                 self._down_scheduled = True
                 self._down_task = asyncio.create_task(self._drain_phone_downlink())
 
-    async def _join_downlink_writer(self, task: "asyncio.Task[None]") -> None:
-        """Wait until the writer task finishes, even if this flush was cancelled."""
-        current = asyncio.current_task()
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                if current is not None and hasattr(current, "uncancel"):
-                    while current.uncancel() > 0:
-                        pass
-                continue
+    async def _join_downlink_writer(self, task: "asyncio.Task[None]", timeout_s: float) -> bool:
+        """Wait up to timeout_s. Cancellation stays in place; this never calls uncancel."""
+        if task.done() or timeout_s <= 0:
+            return task.done()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     async def flush_phone_downlink(self) -> None:
-        """Join the downlink writer, then the caller may close the WAV."""
+        """Join the downlink writer for a bounded time, then the caller may close the WAV.
+
+        A stuck ``write_s16`` returns so ``stop_capture`` can finish and the hub
+        can release the call slot. An outer ``wait_for`` cancellation is not cleared.
+        """
         self._down_stop = True
+        deadline = time.monotonic() + DOWNLINK_FLUSH_S
         while True:
             task = self._down_task
             if task is not None and not task.done():
-                await self._join_downlink_writer(task)
+                remaining = deadline - time.monotonic()
+                if not await self._join_downlink_writer(task, remaining):
+                    LOG.warning(
+                        "phone downlink writer still running after %.1fs; leaving it",
+                        DOWNLINK_FLUSH_S,
+                    )
+                    return
                 continue
             if not self._down_q:
                 return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                LOG.warning(
+                    "phone downlink writer still running after %.1fs; leaving it",
+                    DOWNLINK_FLUSH_S,
+                )
+                return
             chunk = self._down_q.pop(0)
-            await asyncio.to_thread(self.write_s16, PHONE_DOWNLINK, chunk, PHONE_DOWNLINK_RATE, 1)
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self.write_s16, PHONE_DOWNLINK, chunk, PHONE_DOWNLINK_RATE, 1),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "phone downlink write still running after %.1fs; leaving it",
+                    DOWNLINK_FLUSH_S,
+                )
+                return
 
     def write_ulaw(self, name: str, ulaw: bytes, rate: int = 8000) -> None:
         if self._closed or not ulaw:
@@ -537,6 +566,7 @@ class CallTap:
             return
         self._down_stop = True
         await self.flush_phone_downlink()
+        writer_busy = self._down_task is not None and not self._down_task.done()
         self._closed = True
         for proc in self._procs:
             if proc.returncode is None:
@@ -563,7 +593,9 @@ class CallTap:
                 pass
         self._tasks = []
         self._procs = []
-        for stream in self._streams.values():
+        for name, stream in self._streams.items():
+            if writer_busy and name == PHONE_DOWNLINK:
+                continue
             try:
                 stream.close()
             except Exception:

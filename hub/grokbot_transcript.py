@@ -558,17 +558,15 @@ def _same_session(page_url: str, href: str) -> bool:
 
 
 def _click_js(href: str, token: str) -> str:
-    """Schedule the click. An already-sent eval does not click if the token was cleared."""
+    """Click now. The Python side waits first, then this checks the token at click time."""
     return (
         "(function(){const href=%s;const token=%s;"
-        "setTimeout(function(){"
-        "if(window.__gsm2TranscriptToken!==token)return;"
+        "if(window.__gsm2TranscriptToken!==token)return false;"
         "const link=Array.from(document.querySelectorAll('a[href]')).find("
         "(el)=>el.getAttribute('href')===href);"
-        "if(!link||window.__gsm2TranscriptToken!==token)return;"
-        "link.click();"
-        "},%d);return true;})()"
-    ) % (json.dumps(href), json.dumps(token), CLICK_GUARD_MS)
+        "if(!link||window.__gsm2TranscriptToken!==token)return false;"
+        "link.click();return true;})()"
+    ) % (json.dumps(href), json.dumps(token))
 
 
 def _arm_click_js(token: str) -> str:
@@ -577,6 +575,22 @@ def _arm_click_js(token: str) -> str:
 
 def _clear_click_js() -> str:
     return "window.__gsm2TranscriptToken=null"
+
+
+async def _wait_then_click(ws: Any, nid: list[int], href: str, token: str, abort: Optional[asyncio.Event]) -> Any:
+    """Wait the guard in Python, then click. Abort during the wait does not send the click."""
+    _raise_if_abort(abort)
+    if abort is None:
+        await asyncio.sleep(CLICK_GUARD_MS / 1000)
+    else:
+        try:
+            await asyncio.wait_for(abort.wait(), timeout=CLICK_GUARD_MS / 1000)
+        except asyncio.TimeoutError:
+            pass
+        else:
+            raise asyncio.CancelledError()
+    _raise_if_abort(abort)
+    return await _cdp_eval(ws, nid, _click_js(href, token))
 
 
 async def read_voice_turns(
@@ -625,17 +639,7 @@ async def read_voice_turns(
             token = secrets.token_hex(8)
             await _cdp_eval(ws, nid, _arm_click_js(token))
             try:
-                _raise_if_abort(abort)
-                await _cdp_eval(ws, nid, _click_js(href, token))
-                if abort is None:
-                    await asyncio.sleep(CLICK_GUARD_MS / 1000)
-                else:
-                    try:
-                        await asyncio.wait_for(abort.wait(), timeout=CLICK_GUARD_MS / 1000)
-                    except asyncio.TimeoutError:
-                        pass
-                    else:
-                        raise asyncio.CancelledError()
+                await _wait_then_click(ws, nid, href, token, abort)
             except asyncio.CancelledError:
                 try:
                     await _cdp_eval(ws, nid, _clear_click_js())

@@ -306,9 +306,12 @@ class AlertAndCallLogTests(unittest.TestCase):
                 "ok": True,
                 "call": {"busy": False},
                 "talk": {},
+                "open_call_tap": {"id": "20261109T120000Z-grokbot", "dir": str(directory), "meta": {"mode": "grokbot"}},
                 "last_call_tap": {"id": "20261109T120000Z-grokbot", "dir": str(directory), "meta": {"mode": "grokbot"}},
             }
             st = cew.WatchState(call_id="phone-1", number="+15551212")
+            st.tap_id = "20261109T120000Z-grokbot"
+            st.tap_dir = str(directory)
             with patch.object(cew, "journal_summary", return_value={}):
                 payload = cew.build_payload(st=st, duration_s=30, test=True, health=health, now_ts=1_700_000_000)
             self.assertEqual(payload["transcript"]["status"], "ok")
@@ -525,6 +528,56 @@ class LevelMergeTests(unittest.TestCase):
             self.assertEqual(disk["note"], "keep")
 
 
+class SlowMixTests(unittest.TestCase):
+    def test_tap_dir_is_known_while_the_mix_is_still_running(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                previous = root / "old-grokbot"
+                previous.mkdir()
+                gt.save_transcript_result(
+                    previous,
+                    "old-grokbot",
+                    "ok",
+                    [{"speaker": "assistant", "text": "previous", "timestamp": None}],
+                )
+                tap = CallTap("new-grokbot", {"mode": "grokbot", "id": "new-grokbot"}, record_dir=root)
+                identity = {"id": tap.call_id, "dir": str(tap.dir), "meta": dict(tap.meta)}
+                started = asyncio.Event()
+
+                async def slow_mix(self: CallTap) -> dict:
+                    del self
+                    started.set()
+                    await asyncio.Event().wait()
+                    return {}
+
+                with patch.object(CallTap, "_mix_rooms", slow_mix):
+                    close_task = asyncio.create_task(tap.close())
+                    await asyncio.wait_for(started.wait(), timeout=1)
+                    self.assertFalse(close_task.done())
+                    self.assertEqual(identity["id"], "new-grokbot")
+                    self.assertTrue(Path(identity["dir"]).is_dir())
+                    # The 5s hub cap drops close() while the mix is still going.
+                    with self.assertRaises(asyncio.TimeoutError):
+                        await asyncio.wait_for(asyncio.shield(close_task), timeout=0.2)
+                    self.assertFalse(close_task.done())
+                    source = {
+                        "id": identity["id"],
+                        "dir": identity["dir"],
+                        "meta": identity["meta"],
+                    }
+                    pointer = gt.transcript_for_alert(source)
+                    assert pointer is not None
+                    self.assertEqual(pointer["status"], "pending")
+                    self.assertEqual(pointer["call_id"], "new-grokbot")
+                    self.assertNotEqual(pointer.get("call_id"), "old-grokbot")
+                    close_task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await close_task
+
+        asyncio.run(scenario())
+
+
 class QueuedDownlinkTests(unittest.TestCase):
     def test_loop_queues_the_wav_write(self) -> None:
         async def scenario() -> None:
@@ -580,9 +633,15 @@ class QueuedDownlinkTests(unittest.TestCase):
         asyncio.run(scenario())
         self.assertEqual(order, ["write-start", "write-end", "flush-done", "closed"])
 
-    def test_cancelled_flush_still_joins_the_writer(self) -> None:
-        release = threading.Event()
-        order: list[str] = []
+    def test_blocked_writer_does_not_keep_the_call_slot(self) -> None:
+        import hub
+
+        block = threading.Event()
+        started = threading.Event()
+
+        def release_later() -> None:
+            time.sleep(2)
+            block.set()
 
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as tmp:
@@ -590,30 +649,40 @@ class QueuedDownlinkTests(unittest.TestCase):
                 original = tap.write_s16
 
                 def wrapped(name: str, pcm: bytes, rate: int, channels: int = 1) -> None:
-                    order.append("write-start")
-                    release.wait(timeout=2)
+                    started.set()
+                    block.wait(timeout=5)
                     original(name, pcm, rate, channels)
-                    order.append("write-end")
 
                 tap.write_s16 = wrapped  # type: ignore[method-assign]
                 tap.write_phone_downlink(b"\x00\x10" * 8, 8000)
-                flush_task = asyncio.create_task(tap.flush_phone_downlink())
                 for _ in range(50):
-                    if "write-start" in order:
+                    if started.is_set():
                         break
                     await asyncio.sleep(0.02)
-                flush_task.cancel()
-                await asyncio.sleep(0.05)
-                self.assertFalse(flush_task.done())
-                release.set()
-                await asyncio.wait_for(flush_task, timeout=2)
-                order.append("flush-done")
-                self.assertFalse(tap._closed)
-                await tap.stop_capture()
-                order.append("closed")
+                self.assertTrue(started.is_set())
+                if hub.live_call.busy:
+                    hub.live_call.release()
+                self.assertTrue(hub.live_call.claim("/"))
+                threading.Thread(target=release_later, daemon=True).start()
+                t0 = time.monotonic()
+                try:
+                    # Flush bound is long, so only the outer wait_for can free the slot.
+                    # uncancel() would keep wait_for blocked until the writer returns.
+                    with patch.object(call_tap, "DOWNLINK_FLUSH_S", 30):
+                        with self.assertRaises(asyncio.TimeoutError):
+                            await asyncio.wait_for(tap.stop_capture(), timeout=0.3)
+                    elapsed = time.monotonic() - t0
+                finally:
+                    if hub.live_call.busy:
+                        hub.live_call.release()
+                self.assertLess(elapsed, 0.8)
+                self.assertTrue(hub.live_call.claim("/next"))
+                hub.live_call.release()
+                block.set()
+                if tap._down_task is not None and not tap._down_task.done():
+                    await asyncio.wait_for(tap._down_task, timeout=3)
 
         asyncio.run(scenario())
-        self.assertEqual(order, ["write-start", "write-end", "flush-done", "closed"])
 
 
 class ServedBundleTests(unittest.TestCase):
@@ -643,7 +712,6 @@ class ServedBundleTests(unittest.TestCase):
         script = r"""
 const assert = require('assert');
 const clicks = [];
-const timers = [];
 global.window = global;
 global.document = {
   querySelectorAll() {
@@ -653,21 +721,43 @@ global.document = {
     }];
   },
 };
-global.setTimeout = (fn) => { timers.push(fn); return 1; };
 const click = %s;
-window.__gsm2TranscriptToken = 'tok';
-eval(click);
-assert.strictEqual(timers.length, 1);
 window.__gsm2TranscriptToken = null;
-timers.shift()();
+eval(click);
 assert.deepStrictEqual(clicks, []);
 window.__gsm2TranscriptToken = 'tok';
 eval(click);
-timers.shift()();
+assert.deepStrictEqual(clicks, ['clicked']);
+window.__gsm2TranscriptToken = 'other';
+eval(click);
 assert.deepStrictEqual(clicks, ['clicked']);
 """ % json.dumps(gt._click_js("/c/voice", "tok"))
         proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+
+    def test_click_is_sent_after_the_python_wait(self) -> None:
+        calls: list[str] = []
+
+        async def fake_eval(ws: object, nid: list[int], expression: str) -> bool:
+            del ws, nid
+            calls.append(expression)
+            return True
+
+        async def scenario() -> None:
+            abort = asyncio.Event()
+            with patch.object(gt, "CLICK_GUARD_MS", 40), patch.object(gt, "_cdp_eval", fake_eval):
+                await gt._wait_then_click(None, [0], "/c/voice", "tok", abort)
+            self.assertEqual(len(calls), 1)
+            self.assertIn("__gsm2TranscriptToken", calls[0])
+            self.assertNotIn("setTimeout", calls[0])
+            calls.clear()
+            abort.set()
+            with patch.object(gt, "CLICK_GUARD_MS", 200), patch.object(gt, "_cdp_eval", fake_eval):
+                with self.assertRaises(asyncio.CancelledError):
+                    await gt._wait_then_click(None, [0], "/c/voice", "tok", abort)
+            self.assertEqual(calls, [])
+
+        asyncio.run(scenario())
 
 
 class StopLaterHookTests(unittest.TestCase):

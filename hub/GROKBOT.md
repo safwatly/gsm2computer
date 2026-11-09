@@ -73,7 +73,10 @@ the file is not ready yet the alert says `transcript_status=pending`. The same
 process then waits up to 25s for `transcript.json` and posts `call_transcript`
 with the same `post_alert_event` helper, webhook URL, key, and spool. The hub
 process does not post that event: `gsm2computer-hub.service` has no webhook
-URL, and adding one would be a second copy of the secret.
+URL, and adding one would be a second copy of the secret. The wait runs in a
+daemon thread on that process. Restarting the unit during the wait drops the
+follow-up; `transcript.json` is still written for the portal, and
+`call_transcript` is not retried.
 
 On a normal hangup that process is `gsm2computer-call-end-watch.service`
 (`call_end_watch.py`). When adb did not fire within 25s,

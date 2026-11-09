@@ -2,6 +2,7 @@
 """dropped_suspected: teardown inside the margin is not a drop."""
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
@@ -239,6 +240,11 @@ class ScenarioTests(unittest.TestCase):
                 "ok": True,
                 "call": {},
                 "talk": {},
+                "open_call_tap": {
+                    "id": "20261109T120000Z-grokbot",
+                    "dir": tmp,
+                    "meta": {"mode": "grokbot"},
+                },
                 "last_call_tap": {
                     "id": "20261109T120000Z-grokbot",
                     "dir": tmp,
@@ -246,6 +252,8 @@ class ScenarioTests(unittest.TestCase):
                 },
             }
             st, _final, now = cew.simulate_scenario("normal", now=10_000.0)
+            st.tap_id = "20261109T120000Z-grokbot"
+            st.tap_dir = tmp
             with patch.object(cew, "journal_summary", return_value={}), patch.object(
                 cew, "save_state"
             ), patch.object(cew, "post_alert_event", side_effect=capture), patch(
@@ -270,6 +278,96 @@ class ScenarioTests(unittest.TestCase):
             self.assertEqual(posts[-1]["event"], "call_transcript")
             self.assertEqual(posts[-1]["transcript_status"], "unmatched")
             self.assertEqual(posts[-1]["call_id"], "20261109T120000Z-grokbot")
+
+    def test_slow_mix_followup_waits_for_this_call(self) -> None:
+        """last_call_tap is still the previous call while this call's mix is running."""
+        import grokbot_transcript as gt
+
+        posts: list[dict] = []
+        threads: list = []
+        real = gt.schedule_transcript_followup
+
+        def wrapped(pointer, **kwargs):
+            thread = real(pointer, timeout_s=2, poll_s=0.05, **kwargs)
+            threads.append(thread)
+            return thread
+
+        def capture(payload):
+            posts.append(dict(payload))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            previous = root / "20261109T110000Z-grokbot"
+            current = root / "20261109T120000Z-grokbot"
+            previous.mkdir()
+            current.mkdir()
+            gt.save_transcript_result(
+                previous,
+                "20261109T110000Z-grokbot",
+                "ok",
+                [{"speaker": "assistant", "text": "previous call", "timestamp": None}],
+            )
+            health = {
+                "ok": True,
+                "call": {"busy": False},
+                "talk": {},
+                "open_call_tap": {
+                    "id": current.name,
+                    "dir": str(current),
+                    "meta": {"mode": "grokbot"},
+                },
+                "last_call_tap": {
+                    "id": previous.name,
+                    "dir": str(previous),
+                    "meta": {"mode": "grokbot"},
+                    "transcript": {"status": "ok", "call_id": previous.name},
+                },
+            }
+            st = cew.WatchState(call_id="phone-this")
+            st.tap_id = current.name
+            st.tap_dir = str(current)
+            with patch.object(cew, "journal_summary", return_value={}), patch.object(
+                cew, "save_state"
+            ), patch.object(cew, "post_alert_event", side_effect=capture), patch(
+                "alert_webhook.post_alert_event", side_effect=capture
+            ), patch(
+                "grokbot_transcript.schedule_transcript_followup", wrapped
+            ):
+                cew.fire_call_ended(st, 20.0, test=False, health=health, now_ts=10_000.0)
+                self.assertEqual(posts[0]["event"], "call_ended")
+                self.assertEqual(posts[0]["transcript"]["status"], "pending")
+                self.assertEqual(posts[0]["transcript"]["call_id"], current.name)
+                self.assertEqual(posts[0]["tap_dir"], str(current))
+                self.assertNotIn("previous call", json.dumps(posts[0]))
+                gt.save_transcript_result(
+                    current,
+                    current.name,
+                    "ok",
+                    [{"speaker": "caller", "text": "this call", "timestamp": None}],
+                )
+                self.assertEqual(len(threads), 1)
+                threads[0].join(timeout=2)
+            self.assertEqual(posts[-1]["event"], "call_transcript")
+            self.assertEqual(posts[-1]["call_id"], current.name)
+            self.assertEqual(posts[-1]["transcript"]["preview"][0]["text"], "this call")
+
+    def test_observe_records_open_tap_not_the_previous_summary(self) -> None:
+        st = cew.WatchState(in_call=True)
+        health = {
+            "ok": True,
+            "call": {"busy": True, "e2e": False, "last_ws_s": 0.1},
+            "open_call_tap": {
+                "id": "20261109T120000Z-grokbot",
+                "dir": "/calls/20261109T120000Z-grokbot",
+            },
+            "last_call_tap": {"id": "old-grokbot", "dir": "/calls/old-grokbot"},
+        }
+        cew.observe_hub_during_call(st, health, now=1000.0)
+        self.assertEqual(st.tap_id, "20261109T120000Z-grokbot")
+        source = cew.transcript_source(st, health)
+        assert source is not None
+        self.assertEqual(source["id"], "20261109T120000Z-grokbot")
+        self.assertNotEqual(source["id"], "old-grokbot")
 
 
 if __name__ == "__main__":
