@@ -30,6 +30,29 @@ hold tone is not counted). Call dirs are named `<stamp>-grokbot`.
 call_end_watch, cup_watchdog reply_audio and the post-call silent check read
 the grok-* taps for these calls.
 
+After a successful switch the tap ignores the first 2 s of each stem
+(`GSM2COMPUTER_ASSISTANT_SILENT_AFTER_S`), then counts `judge_loud_frac`.
+When the judged window is at least 8 s on both stems
+(`GSM2COMPUTER_ASSISTANT_SILENT_MIN_S`), the caller is loud
+(`GSM2COMPUTER_ASSISTANT_SILENT_MIC_LOUD`, default 0.05) and Suzie is not
+(`GSM2COMPUTER_ASSISTANT_SILENT_SPK_LOUD`, default 0.02), the hub logs
+`assistant silent while caller talking` and `call_ended` carries
+`assistant_silent: true` plus `assistant_silent_stats`. A single opening
+blip inside the 2 s grace does not count as a reply. The same payload
+includes `grok_page`, a small `patchbay status --json` readout taken at
+switch and again at hangup, before `patchbay off`. That readout is
+whatever patchbay reports under `ui` (live, muted, idle, session when it
+sends them). The hub does not evaluate or click the Grok page during the
+call.
+
+There is no automatic re-switch. A second `patchbay switch` while the call
+is live is not safe to ship: patchbay is outside this repo, exit 0 only
+means its own live check passed, and another switch can tear down a session
+that is about to speak. Re-arming through the transcript CDP click is also
+out: that click runs only after `patchbay off`. One recovery attempt cannot
+be tested against the failure where the page stops playing while patchbay
+still reports success.
+
 Every call, not only Grok Bot, also writes `phone-downlink-8k-mono.wav`: the
 mono PCM the hub handed to the phone, stored at 8 kHz. The pump queues those
 frames and a side task writes the WAV, so a slow disk does not stall the

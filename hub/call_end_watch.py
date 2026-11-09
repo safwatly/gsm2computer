@@ -637,6 +637,13 @@ def build_payload(
         transcript = transcript_for_alert(source)
     except Exception:
         LOG.debug("transcript pointer failed", exc_info=True)
+    silence = None
+    try:
+        from call_tap import assistant_silence_from_health
+
+        silence = assistant_silence_from_health(health)
+    except Exception:
+        LOG.debug("assistant silence read failed", exc_info=True)
     text = (
         f"call_ended duration_s={duration_s:.0f} "
         f"dropped_suspected={dropped} "
@@ -648,6 +655,7 @@ def build_payload(
             if transcript
             else ""
         )
+        + (" assistant_silent=true" if silence and silence.get("assistant_silent") else "")
         + (" TEST" if test else "")
     )
     payload = {
@@ -705,6 +713,27 @@ def build_payload(
     if source and source.get("dir"):
         payload["tap_dir"] = source.get("dir")
         payload["tap_id"] = source.get("id")
+    if silence:
+        payload["assistant_silent"] = bool(silence.get("assistant_silent"))
+        stats = silence.get("assistant_silent_stats")
+        if not isinstance(stats, dict):
+            stats = {
+                key: silence.get(key)
+                for key in (
+                    "judged",
+                    "after_s",
+                    "mic_loud_frac",
+                    "spk_loud_frac",
+                    "mic_judge_s",
+                    "spk_judge_s",
+                    "mic_rms",
+                    "spk_rms",
+                )
+                if key in silence
+            }
+        payload["assistant_silent_stats"] = stats
+        if silence.get("grok_page"):
+            payload["grok_page"] = silence["grok_page"]
     return payload
 
 

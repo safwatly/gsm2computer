@@ -150,6 +150,7 @@ relink_gate = RelinkGate()
 last_call_tap: Optional[dict[str, Any]] = None
 # Set when the tap directory is created, before close() mixes. Survives a slow mix.
 open_call_tap: Optional[dict[str, Any]] = None
+last_assistant_silent: Optional[dict[str, Any]] = None
 # session_id -> (entrance, monotonic time the socket finished)
 _finished_call_entrances: dict[str, tuple[str, float]] = {}
 _finished_call_order: list[str] = []
@@ -1682,7 +1683,10 @@ async def _grokbot_call_start(
     res = await voice.start()
     if res.get("ok") and tap is not None:
         # Started after the switch so the patchbay hold tone is not counted as Suzie.
+        # The silence window ignores the first 2s of that stem (hold-tone tail).
+        tap.begin_reply_judge()
         await tap.start_source("grok-spk-48k-stereo", GROKBOT_SPK_SINK, 48000, 2)
+        await _note_grok_page(voice, tap, "switch")
     elif not res.get("ok"):
         LOG.error(
             "grokbot call path without live voice (e2e=%s): rc=%s %s",
@@ -1691,6 +1695,66 @@ async def _grokbot_call_start(
             res.get("meaning"),
         )
     return res
+
+
+async def _note_grok_page(voice: Any, tap: Optional[CallTap], when: str) -> None:
+    """Store patchbay's page readout on the call. Never clicks the live page."""
+    if tap is None or voice is None or not hasattr(voice, "read_page_state"):
+        return
+    try:
+        tap.note_page_state(when, await voice.read_page_state())
+    except Exception:
+        LOG.warning("grok page state (%s) failed", when, exc_info=True)
+
+
+def _publish_assistant_silence(tap: CallTap) -> None:
+    """Log the post-switch window and expose it on /health before the tap mix."""
+    global last_assistant_silent
+    assessment = tap.assistant_silence()
+    if assessment is None:
+        return
+    published = {
+        "assistant_silent": assessment["assistant_silent"],
+        "assistant_silent_stats": {
+            key: assessment[key]
+            for key in (
+                "judged",
+                "after_s",
+                "mic_loud_frac",
+                "spk_loud_frac",
+                "mic_judge_s",
+                "spk_judge_s",
+                "mic_rms",
+                "spk_rms",
+            )
+        },
+    }
+    pages: dict[str, Any] = {}
+    if "grok_page_at_switch" in tap.meta:
+        pages["at_switch"] = tap.meta["grok_page_at_switch"]
+    if "grok_page_at_hangup" in tap.meta:
+        pages["at_hangup"] = tap.meta["grok_page_at_hangup"]
+    if pages:
+        published["grok_page"] = pages
+    last_assistant_silent = published
+    stats = published["assistant_silent_stats"]
+    if published.get("assistant_silent"):
+        LOG.warning(
+            "assistant silent while caller talking mic_loud_frac=%s spk_loud_frac=%s "
+            "mic_judge_s=%s spk_judge_s=%s",
+            stats.get("mic_loud_frac"),
+            stats.get("spk_loud_frac"),
+            stats.get("mic_judge_s"),
+            stats.get("spk_judge_s"),
+        )
+    else:
+        LOG.info(
+            "assistant silence check silent=%s judged=%s mic_loud_frac=%s spk_loud_frac=%s",
+            published.get("assistant_silent"),
+            stats.get("judged"),
+            stats.get("mic_loud_frac"),
+            stats.get("spk_loud_frac"),
+        )
 
 
 async def _run_e2e_after_silent_call(call_id: str) -> None:
@@ -2118,6 +2182,8 @@ async def handle_websocket(
         writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
         await writer.drain()
         return
+    global last_assistant_silent
+    last_assistant_silent = None
     live_call.session_id = session_id
     live_call.note_entrance(entrance.name, _current_device_id.get())
 
@@ -2527,6 +2593,8 @@ async def handle_websocket(
 
                     grok_voice._transcript_announced = False
                     grok_voice.on_transcript_abort = on_abort
+                    await _note_grok_page(grok_voice, tap, "hangup")
+                    _publish_assistant_silence(tap)
 
                     async def on_transcript(res: dict[str, Any], voice: Any = grok_voice) -> None:
                         await _finish_grok_transcript(
@@ -2683,6 +2751,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 body["last_call_tap"] = last_call_tap
             if open_call_tap:
                 body["open_call_tap"] = open_call_tap
+            if last_assistant_silent:
+                body["assistant_silent"] = last_assistant_silent
             if OPENCLAW_TALK_MODE == "webrtc-ui" and get_talk_ui is not None:
                 try:
                     ui = get_talk_ui()

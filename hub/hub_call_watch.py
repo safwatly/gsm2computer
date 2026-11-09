@@ -58,6 +58,33 @@ def transcript_pointer(tap):
         return None
 
 
+def _attach_assistant_silence(payload, tap):
+    """Copy the post-switch silence assessment from levels.json onto call_ended."""
+    if not tap or "/" in tap or "\\" in tap or tap in {".", ".."}:
+        return
+    path = Path(os.environ.get("GSM2COMPUTER_CALL_RECORD_DIR", str(Path.home() / "gsm2computer-calls"))) / tap / "levels.json"
+    try:
+        levels = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(levels, dict):
+        return
+    try:
+        from call_tap import assistant_silence_from_health
+
+        found = assistant_silence_from_health({"last_call_tap": levels})
+    except Exception as exc:
+        log("assistant silence read failed", exc)
+        return
+    if not found:
+        return
+    payload["assistant_silent"] = bool(found.get("assistant_silent"))
+    stats = found.get("assistant_silent_stats")
+    payload["assistant_silent_stats"] = stats if isinstance(stats, dict) else {}
+    if found.get("grok_page"):
+        payload["grok_page"] = found["grok_page"]
+
+
 def on_end(start, tap, reason):
     time.sleep(GRACE_S)
     if adb_fired_since(start):
@@ -80,6 +107,7 @@ def on_end(start, tap, reason):
             "preview": [],
         }
         p["transcript_status"] = "pending"
+    _attach_assistant_silence(p, tap)
     try:
         post_alert_event(p); log("posted", p)
     except Exception as e:
