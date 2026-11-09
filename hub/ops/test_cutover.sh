@@ -58,7 +58,7 @@ cat >"$BIN/rsync" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'rsync %s\n' "$*" >>"$GSM2COMPUTER_CUTOVER_ACTION_LOG"
-exit 0
+exec /usr/bin/rsync "$@"
 EOF
 
 cat >"$BIN/curl" <<'EOF'
@@ -102,19 +102,43 @@ stop_hub() {
 }
 
 start_hub() {
-  local busy=$1
+  local shape=$1
   stop_hub
   local fifo=$WORK/hub.out
   rm -f "$fifo"
   mkfifo "$fifo"
-  python3 - "$busy" >"$fifo" <<'PY' &
+  python3 - "$shape" >"$fifo" <<'PY' &
 import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
-busy = sys.argv[1] == "true"
+shape = sys.argv[1]
+if shape == "call-true":
+    payload = {
+        "ok": True,
+        "auto_mode": "grokbot",
+        "mode": "openclaw",
+        "entrances": [{"name": "tailscale"}],
+        "call": {"busy": True, "path": "tailscale", "session_id": "hub-live"},
+    }
+elif shape == "call-false":
+    payload = {
+        "ok": True,
+        "auto_mode": "grokbot",
+        "mode": "openclaw",
+        "entrances": [{"name": "tailscale"}],
+        "call": {"busy": False, "path": None, "session_id": None},
+    }
+elif shape == "top-true":
+    payload = {"ok": True, "auto_mode": "grokbot", "busy": True}
+elif shape == "top-false":
+    payload = {"ok": True, "auto_mode": "grokbot", "busy": False}
+elif shape == "neither":
+    payload = {"ok": True, "auto_mode": "grokbot", "call": {"path": None}}
+else:
+    raise SystemExit("unknown health shape " + shape)
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = json.dumps({"ok": True, "busy": busy}).encode()
+        body = json.dumps(payload).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -163,13 +187,48 @@ assert_no_mutate() {
 
 : >"$GSM2COMPUTER_CUTOVER_ACTION_LOG"
 
-note "busy true"
-start_hub true
+note "call.busy true"
+start_hub call-true
 PORT=$(cat "$WORK/hub.port")
 write_units 127.0.0.1 "$PORT"
 rc=$(run_cutover apply)
 [[ "$rc" -eq 1 ]] || fail "busy apply rc=$rc $(cat "$WORK/err")"
 grep -q 'not idle' "$WORK/err" || fail "busy apply did not say not idle: $(cat "$WORK/err")"
+assert_no_mutate
+note "  apply aborted rc=1"
+rc=$(run_cutover rollback)
+[[ "$rc" -eq 1 ]] || fail "busy rollback rc=$rc $(cat "$WORK/err")"
+grep -q 'not idle' "$WORK/err" || fail "busy rollback did not say not idle: $(cat "$WORK/err")"
+assert_no_mutate
+note "  rollback aborted rc=1"
+kill "$HUB_PID" 2>/dev/null || true
+wait "$HUB_PID" 2>/dev/null || true
+HUB_PID=""
+
+note "top-level busy true, no call.busy"
+start_hub top-true
+PORT=$(cat "$WORK/hub.port")
+write_units 127.0.0.1 "$PORT"
+rc=$(run_cutover apply)
+[[ "$rc" -eq 1 ]] || fail "legacy busy apply rc=$rc $(cat "$WORK/err")"
+grep -q 'not idle' "$WORK/err" || fail "legacy busy message: $(cat "$WORK/err")"
+assert_no_mutate
+note "  apply aborted rc=1"
+rc=$(run_cutover rollback)
+[[ "$rc" -eq 1 ]] || fail "legacy busy rollback rc=$rc $(cat "$WORK/err")"
+assert_no_mutate
+note "  rollback aborted rc=1"
+kill "$HUB_PID" 2>/dev/null || true
+wait "$HUB_PID" 2>/dev/null || true
+HUB_PID=""
+
+note "health has neither call.busy nor top-level busy"
+start_hub neither
+PORT=$(cat "$WORK/hub.port")
+write_units 127.0.0.1 "$PORT"
+rc=$(run_cutover apply)
+[[ "$rc" -eq 1 ]] || fail "missing busy apply rc=$rc $(cat "$WORK/err")"
+grep -q 'not idle' "$WORK/err" || fail "missing busy message: $(cat "$WORK/err")"
 assert_no_mutate
 note "  apply aborted rc=1"
 kill "$HUB_PID" 2>/dev/null || true
@@ -190,7 +249,7 @@ assert_no_mutate
 note "  rollback aborted rc=1"
 
 note "phone off-hook"
-start_hub false
+start_hub call-false
 PORT=$(cat "$WORK/hub.port")
 write_units 127.0.0.1 "$PORT"
 export GSM2COMPUTER_CUTOVER_CALL_STATE='mCallState=2'
@@ -205,7 +264,7 @@ wait "$HUB_PID" 2>/dev/null || true
 HUB_PID=""
 
 note "missing phone address on hub-call-watch"
-start_hub false
+start_hub call-false
 PORT=$(cat "$WORK/hub.port")
 write_units 127.0.0.1 "$PORT" ""
 rc=$(run_cutover apply)
@@ -217,16 +276,61 @@ kill "$HUB_PID" 2>/dev/null || true
 wait "$HUB_PID" 2>/dev/null || true
 HUB_PID=""
 
-note "idle apply"
-start_hub false
+note "idle apply (call.busy false, no top-level busy)"
+mkdir -p \
+  "$WORK/live/.git" \
+  "$WORK/live/.health-watch" \
+  "$WORK/live/portal/node_modules" \
+  "$WORK/live/portal/dist" \
+  "$WORK/live/.venv" \
+  "$WORK/live/state" \
+  "$WORK/repo/portal/dist"
+printf 'live-history\n' >"$WORK/live/.git/HEAD"
+printf 'checked\n' >"$WORK/live/.cup-health-checked-calls"
+printf '{}\n' >"$WORK/live/.cup-health-reply-audio-state.json"
+printf 'watch\n' >"$WORK/live/.health-watch/checked-calls.txt"
+printf 'nm\n' >"$WORK/live/portal/node_modules/keep.txt"
+printf 'venv\n' >"$WORK/live/.venv/pyvenv.cfg"
+printf 'token\n' >"$WORK/live/device-tokens.json"
+printf 'db\n' >"$WORK/live/portal.sqlite"
+printf 'wal\n' >"$WORK/live/portal.sqlite-wal"
+printf 'state\n' >"$WORK/live/state/keep.txt"
+printf 'bak\n' >"$WORK/live/hub.py.bak"
+printf 'oldasset\n' >"$WORK/live/portal/dist/old-asset.js"
+printf 'obsolete\n' >"$WORK/live/obsolete.txt"
+printf 'newasset\n' >"$WORK/repo/portal/dist/index.js"
+printf 'from-repo\n' >"$WORK/repo/from-repo.txt"
+start_hub call-false
 PORT=$(cat "$WORK/hub.port")
 write_units 127.0.0.1 "$PORT"
 rc=$(run_cutover apply)
-[[ "$rc" -eq 0 ]] || fail "idle apply rc=$rc $(cat "$WORK/err")"
+[[ "$rc" -eq 0 ]] || fail "idle apply rc=$rc $(cat "$WORK/err") $(cat "$WORK/out")"
 grep -q 'rsync ' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle apply did not rsync"
+grep -q -- '--dry-run' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle apply did not dry-run --delete"
+grep -q 'obsolete.txt' "$WORK/out" || fail "dry-run did not list obsolete.txt: $(cat "$WORK/out")"
+grep -q 'portal/dist/old-asset.js' "$WORK/out" || fail "dry-run did not list old dist asset: $(cat "$WORK/out")"
+if grep -q '.git' "$WORK/out"; then
+  fail "dry-run listed .git: $(cat "$WORK/out")"
+fi
 grep -q 'restart gsm2computer-hub.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle apply did not restart the hub"
 grep -q 'restart gsm2computer-hub-call-watch.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle apply did not restart the call watcher"
-note "  apply rc=0 after the gate"
+grep -q 'restart gsm2computer-call-end-watch.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle apply did not restart the adb watcher"
+[[ "$(cat "$WORK/live/.git/HEAD")" == "live-history" ]] || fail ".git was deleted"
+[[ "$(cat "$WORK/live/.cup-health-checked-calls")" == "checked" ]] || fail "checked-calls was deleted"
+[[ "$(cat "$WORK/live/.cup-health-reply-audio-state.json")" == "{}" ]] || fail "reply-audio state was deleted"
+[[ "$(cat "$WORK/live/.health-watch/checked-calls.txt")" == "watch" ]] || fail ".health-watch was deleted"
+[[ "$(cat "$WORK/live/portal/node_modules/keep.txt")" == "nm" ]] || fail "node_modules was deleted"
+[[ "$(cat "$WORK/live/.venv/pyvenv.cfg")" == "venv" ]] || fail ".venv was deleted"
+[[ "$(cat "$WORK/live/device-tokens.json")" == "token" ]] || fail "device-tokens.json was deleted"
+[[ "$(cat "$WORK/live/portal.sqlite")" == "db" ]] || fail "portal.sqlite was deleted"
+[[ "$(cat "$WORK/live/portal.sqlite-wal")" == "wal" ]] || fail "portal.sqlite-wal was deleted"
+[[ "$(cat "$WORK/live/state/keep.txt")" == "state" ]] || fail "state/ was deleted"
+[[ "$(cat "$WORK/live/hub.py.bak")" == "bak" ]] || fail "bak file was deleted"
+[[ -f "$WORK/live/obsolete.txt" ]] && fail "obsolete.txt survived"
+[[ -f "$WORK/live/portal/dist/old-asset.js" ]] && fail "old dist asset survived"
+[[ "$(cat "$WORK/live/portal/dist/index.js")" == "newasset" ]] || fail "new dist asset was not copied"
+[[ "$(cat "$WORK/live/from-repo.txt")" == "from-repo" ]] || fail "repo file was not copied"
+note "  apply rc=0 after the gate; protected paths kept"
 printf 'applied-marker\n' >"$WORK/live/marker.txt"
 
 note "idle rollback"
@@ -235,14 +339,26 @@ rc=$(run_cutover rollback)
 [[ "$rc" -eq 0 ]] || fail "idle rollback rc=$rc $(cat "$WORK/err")"
 grep -q 'stop gsm2computer-hub.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle rollback did not stop the hub"
 grep -q 'stop gsm2computer-hub-call-watch.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle rollback did not stop the call watcher"
+grep -q 'stop gsm2computer-call-end-watch.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle rollback did not stop the adb watcher"
 grep -q 'start gsm2computer-hub.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle rollback did not start the hub"
 grep -q 'start gsm2computer-hub-call-watch.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle rollback did not start the call watcher"
+grep -q 'start gsm2computer-call-end-watch.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle rollback did not start the adb watcher"
 grep -q 'live-marker' "$WORK/live/marker.txt" || fail "idle rollback did not restore the live tree"
+[[ "$(cat "$WORK/live/.git/HEAD")" == "live-history" ]] || fail "rollback lost .git"
 note "  rollback rc=0"
+
+note "idle apply with top-level busy false"
+: >"$GSM2COMPUTER_CUTOVER_ACTION_LOG"
+start_hub top-false
+PORT=$(cat "$WORK/hub.port")
+write_units 127.0.0.1 "$PORT"
+rc=$(run_cutover apply)
+[[ "$rc" -eq 0 ]] || fail "legacy idle apply rc=$rc $(cat "$WORK/err")"
+note "  legacy shape apply rc=0"
 
 note "busy rollback"
 : >"$GSM2COMPUTER_CUTOVER_ACTION_LOG"
-start_hub true
+start_hub call-true
 PORT=$(cat "$WORK/hub.port")
 write_units 127.0.0.1 "$PORT"
 rc=$(run_cutover rollback)
