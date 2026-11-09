@@ -49,12 +49,7 @@ object BridgeConfig {
         } else {
             null
         }
-        val legacy = if (prefs.contains(KEY_HUB_CONTROL_URL)) {
-            prefs.getString(KEY_HUB_CONTROL_URL, "")
-        } else {
-            null
-        }
-        return HubEndpoints.resolveEndpointUrls(explicit, legacy, BuildConfig.DEFAULT_HUB_ENDPOINTS)
+        return HubEndpoints.resolveEndpointUrls(explicit, BuildConfig.DEFAULT_HUB_ENDPOINTS)
     }
 
     fun resolveDeviceToken(prefs: SharedPreferences): String {

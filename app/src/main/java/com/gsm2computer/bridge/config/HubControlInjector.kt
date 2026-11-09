@@ -24,13 +24,17 @@ object HubControlInjector {
             return false
         }
         if (!replaceDropFile(context, url)) {
-            removeDropFile()
+            if (!dropKeepsProvision()) removeDropFile()
             BridgeLog.w("hub url file not updated")
         }
         return commitUrl(context, url, reload = true, reloadAsync = false)
     }
 
-    /** Read [HubControlUrl.DROP_FILE]. No-op when it matches the stored URL. */
+    /**
+     * Read [HubControlUrl.DROP_FILE]. A one-line URL updates the legacy hub URL.
+     * `hub_endpoints` and `device_token` lines update those prefs. No-op when
+     * nothing changed. The device token is not logged.
+     */
     fun applyDropFile(
         context: Context,
         reload: Boolean = true,
@@ -38,12 +42,12 @@ object HubControlInjector {
     ): Boolean {
         val raw = readDropFile()
         if (raw.isBlank()) return false
-        val url = HubControlUrl.parse(raw)
-        if (url == null) {
+        val plan = HubControlUrl.planDrop(stored(context), raw)
+        if (plan == null) {
             noteReject(raw)
             return false
         }
-        return commitUrl(context, url, reload, reloadAsync)
+        return commitDrop(context, plan, reload, reloadAsync)
     }
 
     /**
@@ -57,26 +61,20 @@ object HubControlInjector {
             return
         }
         if (!replaceDropFile(context, url)) {
-            removeDropFile()
+            if (!dropKeepsProvision()) removeDropFile()
             BridgeLog.w("hub url file not updated")
         }
     }
 
+    private fun dropKeepsProvision(): Boolean {
+        val drop = HubControlUrl.parseDrop(readDropFile()) ?: return false
+        return drop.endpoints != null || !drop.deviceToken.isNullOrEmpty()
+    }
+
     fun replaceDropFile(context: Context, url: String): Boolean {
         val safe = HubControlUrl.parse(url) ?: return false
-        return try {
-            val tmp = File(context.cacheDir, "hub-control.url")
-            tmp.writeText(safe + "\n")
-            RootShell.init()
-            val code = RootShell.exec(
-                "cp ${tmp.absolutePath} ${HubControlUrl.DROP_FILE} && chmod 644 ${HubControlUrl.DROP_FILE}",
-            )
-            tmp.delete()
-            code == 0
-        } catch (e: Exception) {
-            BridgeLog.w("hub url file not updated (${e.javaClass.simpleName})")
-            false
-        }
+        val existing = HubControlUrl.parseDrop(readDropFile())
+        return writeDrop(context, HubControlUrl.renderForUrl(safe, existing))
     }
 
     fun removeDropFile(): Boolean {
@@ -94,25 +92,79 @@ object HubControlInjector {
         reload: Boolean,
         reloadAsync: Boolean,
     ): Boolean {
+        val current = stored(context)
+        val plan = HubControlUrl.planDrop(
+            HubControlUrl.Stored(current.hubControlUrl, current.streamTokenUrl, null, null),
+            url,
+        ) ?: return false
+        return commitDrop(context, plan, reload, reloadAsync)
+    }
+
+    private fun commitDrop(
+        context: Context,
+        plan: HubControlUrl.DropPlan,
+        reload: Boolean,
+        reloadAsync: Boolean,
+    ): Boolean {
+        if (!plan.changed && !plan.clearStreamToken) return false
         val prefs = BridgeConfig.openPrefs(context)
-        val stored = if (prefs.contains(BridgeConfig.KEY_HUB_CONTROL_URL)) {
+        val editor = prefs.edit()
+        if (plan.url != null) {
+            editor.putString(BridgeConfig.KEY_HUB_CONTROL_URL, plan.url)
+                .putString(BridgeConfig.KEY_HUB_URL_DROP, plan.url)
+                .putBoolean(BridgeConfig.KEY_STREAM_ENABLED, true)
+        }
+        if (plan.clearStreamToken) editor.remove(BridgeConfig.KEY_STREAM_TOKEN_URL)
+        if (plan.endpoints != null) {
+            editor.putString(BridgeConfig.KEY_HUB_ENDPOINTS, plan.endpoints.joinToString("\n"))
+        }
+        if (plan.deviceToken != null) {
+            editor.putString(BridgeConfig.KEY_DEVICE_TOKEN, plan.deviceToken)
+        }
+        editor.commit()
+        val tokenState = if (plan.deviceToken == null) "unchanged" else "set"
+        val endpoints = plan.endpoints?.size?.toString() ?: "unchanged"
+        val id = plan.url?.let { HubControlUrl.shortId(it) } ?: "-"
+        BridgeLog.i("hub drop applied id=$id endpoints=$endpoints token=$tokenState")
+        GatewayService.appendLog(context, "Hub entrances updated")
+        if (reload) GatewayService.requestHubReload(context, reloadAsync)
+        return true
+    }
+
+    private fun stored(context: Context): HubControlUrl.Stored {
+        val prefs = BridgeConfig.openPrefs(context)
+        val hub = if (prefs.contains(BridgeConfig.KEY_HUB_CONTROL_URL)) {
             prefs.getString(BridgeConfig.KEY_HUB_CONTROL_URL, null)
         } else {
             null
         }
-        val token = prefs.getString(BridgeConfig.KEY_STREAM_TOKEN_URL, null)
-        val plan = HubControlUrl.plan(stored, token, url) ?: return false
-        if (!plan.changed && !plan.clearToken) return false
-        val editor = prefs.edit()
-            .putString(BridgeConfig.KEY_HUB_CONTROL_URL, plan.url)
-            .putString(BridgeConfig.KEY_HUB_URL_DROP, plan.url)
-            .putBoolean(BridgeConfig.KEY_STREAM_ENABLED, true)
-        if (plan.clearToken) editor.remove(BridgeConfig.KEY_STREAM_TOKEN_URL)
-        editor.commit()
-        BridgeLog.i("hub url applied id=${HubControlUrl.shortId(plan.url)}")
-        GatewayService.appendLog(context, "Hub control URL updated")
-        if (reload) GatewayService.requestHubReload(context, reloadAsync)
-        return true
+        val endpoints = if (prefs.contains(BridgeConfig.KEY_HUB_ENDPOINTS)) {
+            prefs.getString(BridgeConfig.KEY_HUB_ENDPOINTS, "")
+        } else {
+            null
+        }
+        return HubControlUrl.Stored(
+            hubControlUrl = hub,
+            streamTokenUrl = prefs.getString(BridgeConfig.KEY_STREAM_TOKEN_URL, null),
+            endpoints = endpoints,
+            deviceToken = prefs.getString(BridgeConfig.KEY_DEVICE_TOKEN, null),
+        )
+    }
+
+    private fun writeDrop(context: Context, body: String): Boolean {
+        return try {
+            val tmp = File(context.cacheDir, "hub-control.url")
+            tmp.writeText(body)
+            RootShell.init()
+            val code = RootShell.exec(
+                "cp ${tmp.absolutePath} ${HubControlUrl.DROP_FILE} && chmod 644 ${HubControlUrl.DROP_FILE}",
+            )
+            tmp.delete()
+            code == 0
+        } catch (e: Exception) {
+            BridgeLog.w("hub url file not updated (${e.javaClass.simpleName})")
+            false
+        }
     }
 
     private fun readDropFile(): String {

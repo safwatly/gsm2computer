@@ -73,6 +73,20 @@ HUB_CONTROL_URL=http://hub.mining-ling.ts.net:8787 \
 
 `STREAM_TOKEN_URL` is optional and defaults to `{HUB_CONTROL_URL}/token`. OpenAI `STREAM_MODEL` / `STREAM_VOICE` are unused in hub mode.
 
+### Upgrade the Moto from build 344
+
+Build 344 saved `hub_control_url` and did not save `hub_endpoints` or `device_token`. Install build 346 (`0.2.7`) over that phone. With `hub_endpoints` absent, the walk is `wss://gsm.ta3leam.com/` then `ws://100.113.222.47:8787/`. A public attempt with no device token is logged (`device token unset; … rejected the call, trying the next endpoint`) and the walk continues to Tailscale.
+
+Do not hand-edit `gsm2computer.xml`. Write the drop file as root. The bridge applies `/data/local/tmp/gsm2computer-hub.url` on boot and on `MY_PACKAGE_REPLACED`:
+
+```bash
+# The token file is one line. The script does not print it.
+DEVICE_TOKEN_FILE=/path/to/device-token \
+  ./scripts/set-bridge-entrances.sh -s <moto-serial>
+```
+
+Logcat `GSM2Bridge` should show `hub drop applied` with `endpoints=2 token=set` and must not show the token.
+
 Then open the app once (or let boot autostart) so the foreground-service mic capability is established.
 
 ## SMS forwarder

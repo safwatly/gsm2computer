@@ -27,16 +27,36 @@ object HubEndpoints {
             .filter { it.isNotEmpty() }
 
     /**
-     * [explicitList] set (even to empty) wins. Otherwise a saved single hub URL.
-     * Neither set means [defaults], which is the public entrance then Tailscale.
+     * [explicitList] set (even to empty) is the walk. A saved `hub_control_url`
+     * is not a list: build 344 stored that and nothing else, and treating it as
+     * the list kept the phone on one Tailscale origin. Absent means [defaults],
+     * public then Tailscale.
      */
-    fun resolveEndpointUrls(explicitList: String?, legacySingle: String?, defaults: String): List<String> {
+    fun resolveEndpointUrls(explicitList: String?, defaults: String): List<String> {
         if (explicitList != null) return parseEndpointList(explicitList)
-        if (legacySingle != null) {
-            val one = normalizeBase(legacySingle)
-            return if (one.isEmpty()) emptyList() else listOf(one)
-        }
         return parseEndpointList(defaults).ifEmpty { defaultEndpointUrls() }
+    }
+
+    /**
+     * Logged before a walk when an entrance has no device token. Names that
+     * entrance and the next one, so a public 401 is visibly not the end of the walk.
+     */
+    fun missingDeviceTokenWarning(endpoints: List<HubEndpoint>): String? {
+        val index = endpoints.indexOfFirst { it.deviceToken.isBlank() }
+        if (index < 0) return null
+        val bare = endpoints[index]
+        val next = endpoints.getOrNull(index + 1)
+        return if (next == null) {
+            "device token unset; ${bare.url} will reject the call"
+        } else {
+            "device token unset; ${bare.url} will reject the call and the walk continues to ${next.url}"
+        }
+    }
+
+    /** Detail for a 401 when this entrance was dialed with no device token. */
+    fun missingTokenRejection(url: String, httpStatus: Int, tokenBlank: Boolean): String? {
+        if (httpStatus != 401 || !tokenBlank) return null
+        return "device token unset; $url rejected the call, trying the next endpoint"
     }
 
     /** `ws`/`wss` back to the HTTP origin used for `/token`, `/sms`, and `/calls`. */

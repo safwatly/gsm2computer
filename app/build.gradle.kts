@@ -38,9 +38,9 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        // versionCode 345 walks the ordered hub list on top of build 344.
-        versionCode = 345
-        versionName = "0.2.6"
+        // versionCode 346 provisions the ordered entrances on a 344 prefs upgrade.
+        versionCode = 346
+        versionName = "0.2.7"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

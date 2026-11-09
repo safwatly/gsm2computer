@@ -44,6 +44,6 @@ Unit tests of ordering, failover, backoff, and the 409 stop live in `app/src/tes
 
 ## Gotchas
 
-- Config keys: `hub_endpoints` (one origin per line or comma) and `device_token`, adb-settable through `scripts/configure-bridge.sh`. A saved legacy `hub_control_url` is a one-element list. Neither key means the two defaults. The token is never logged.
+- Config keys: `hub_endpoints` (one origin per line or comma) and `device_token`. When `hub_endpoints` is absent the walk is the two defaults, including a build 344 phone that only saved `hub_control_url`. That saved URL is not the list. Provision the list and the token with `scripts/set-bridge-entrances.sh` (root drop file, applied on boot and package replace). A missing token on an entrance is logged and that attempt is retryable, so the walk continues. The token is never logged.
 - Reconnect walks the list from the start. It does not pin the entrance that happened to work last time.
 - This VM does not reach `62.83.35.197` or the phone. The script's "public" socket is the hub's loopback public listener, which is what Caddy proxies on cup.

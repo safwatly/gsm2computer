@@ -142,8 +142,18 @@ class HubCallDialer(
         call.execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) {
+                val rejected = HubEndpoints.missingTokenRejection(
+                    request.endpoint.url,
+                    resp.code,
+                    request.endpoint.deviceToken.isBlank(),
+                )
                 throw DialFailed(
-                    failureResponse(resp.code, body.take(160), secrets, request.sessionId),
+                    failureResponse(
+                        resp.code,
+                        rejected ?: body.take(160),
+                        secrets,
+                        request.sessionId,
+                    ),
                 )
             }
             val value = jsonStringField(body, "value")

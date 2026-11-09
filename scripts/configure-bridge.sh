@@ -10,8 +10,11 @@
 #
 # Environment:
 #   HUB_ENDPOINTS               newline-separated hub URLs (default: public, then Tailscale)
-#   HUB_CONTROL_URL             legacy single origin. Used as the only endpoint when
-#                               HUB_ENDPOINTS is unset and this is set.
+#   HUB_CONTROL_URL             legacy single origin shown in settings.
+#                               It does not replace hub_endpoints. The Moto
+#                               upgrade from build 344 uses
+#                               scripts/set-bridge-entrances.sh instead of
+#                               rewriting this XML.
 #   DEVICE_TOKEN                X-Gsm-Device-Token. Printed as set or unset, never the value.
 #   STREAM_TOKEN_URL            token endpoint (default: {first endpoint}/token)
 #   STREAM_ENABLED=true|false   (default: true when hub or token URL set)
@@ -49,11 +52,7 @@ ADB=(adb)
 [[ -n "$SERIAL" ]] && ADB=(adb -s "$SERIAL")
 
 if [[ -z "${HUB_ENDPOINTS+x}" ]]; then
-  if [[ -n "${HUB_CONTROL_URL:-}" ]]; then
-    HUB_ENDPOINTS="$HUB_CONTROL_URL"
-  else
-    HUB_ENDPOINTS="$DEFAULT_ENDPOINTS"
-  fi
+  HUB_ENDPOINTS="$DEFAULT_ENDPOINTS"
 fi
 FIRST_ENDPOINT="${HUB_ENDPOINTS%%$'\n'*}"
 HUB_CONTROL_URL="${HUB_CONTROL_URL:-$FIRST_ENDPOINT}"
