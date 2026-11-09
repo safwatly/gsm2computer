@@ -105,10 +105,18 @@ not executed. Do not point the account shell at `nologin` or
 Re-running the script keeps existing key files and any other file
 already in the bundle, including `phone_known_hosts`. It replaces only
 this account's authorized_keys line and the marked Match block, in
-place. A cup that already has the block gets `ClientAliveInterval` and
-`ClientAliveCountMax` on the next run. The block is not stacked, and
-the live `sshd_config` is still swapped by a same-directory rename
-after `sshd -t` and `sshd -T` accept it.
+place, when `id_ed25519` is still in the bundle. A cup that already has
+the block gets `ClientAliveInterval` and `ClientAliveCountMax` on the
+next run. The block is not stacked, and the live `sshd_config` is still
+swapped by a same-directory rename after `sshd -t` and `sshd -T` accept it.
+
+If `id_ed25519` has already been shredded, the re-run does not generate
+a replacement and does not append a second line to `authorized_keys`.
+It reuses `id_ed25519.pub` when that file is still there, and otherwise
+the key already in `authorized_keys`. The authorized_keys file is left
+unchanged. A different private key dropped into the bundle is refused
+unless you pass `--rotate-key`. That flag mints a new tunnel key and
+replaces the old line, so the file holds exactly one key.
 
 Nothing secret is committed. After the phone has `id_ed25519` and
 `phonetunnel-status` shows `tunnel=up` for a while, delete the phone
@@ -118,7 +126,9 @@ private key from cup:
 shred -u /root/phonetunnel-install/id_ed25519
 ```
 
-Keep `phone_shell_ed25519` on cup.
+Keep `id_ed25519.pub` and `phone_shell_ed25519` on cup. To change the
+phone's tunnel identity later, run the setup script with `--rotate-key`,
+copy the new `id_ed25519` to the phone, and remove the previous key there.
 
 ## Phone install
 

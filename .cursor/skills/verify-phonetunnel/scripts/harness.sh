@@ -1566,6 +1566,76 @@ if compgen -G "$root/etc/ssh/sshd_config.tmp.*" >/dev/null; then
     exit 1
 fi
 echo "second run reused the key, kept extra bundle files, and did not stack Match blocks"
+auth="$root/home/phonetunnel/.ssh/authorized_keys"
+keycount=$(grep -c 'ssh-ed25519 ' "$auth" || true)
+[ "$keycount" -eq 1 ]
+
+echo "---- re-run after the private key is shredded ----"
+auth_hash=$(sha256sum "$auth")
+rm -f "$root/root/phonetunnel-install/id_ed25519" "$root/root/phonetunnel-install/id_ed25519.txt"
+set +e
+run_setup >"$root/shred.out" 2>"$root/shred.err"
+shrc=$?
+set -e
+echo "shred rc=$shrc"
+cat "$root/shred.err"
+[ "$shrc" -eq 0 ]
+grep -q 'reused id_ed25519.pub' "$root/shred.out"
+[ "$(sha256sum "$auth")" = "$auth_hash" ]
+[ ! -e "$root/root/phonetunnel-install/id_ed25519" ]
+[ "$(awk '{print $2}' "$root/root/phonetunnel-install/id_ed25519.pub")" = "$pub1" ]
+echo "shredded private key left authorized_keys byte-identical"
+
+echo "---- re-run with the public key gone too ----"
+rm -f "$root/root/phonetunnel-install/id_ed25519.pub"
+set +e
+run_setup >"$root/nopub.out" 2>"$root/nopub.err"
+nprc=$?
+set -e
+echo "nopub rc=$nprc"
+cat "$root/nopub.err"
+[ "$nprc" -eq 0 ]
+grep -q 'reused the key already in authorized_keys' "$root/nopub.out"
+[ "$(sha256sum "$auth")" = "$auth_hash" ]
+[ ! -e "$root/root/phonetunnel-install/id_ed25519" ]
+[ "$(awk '{print $2}' "$root/root/phonetunnel-install/id_ed25519.pub")" = "$pub1" ]
+echo "missing pub was restored from authorized_keys and the file was not changed"
+
+echo "---- a different private key is not appended ----"
+dropbearkey -t ed25519 -f "$root/root/phonetunnel-install/id_ed25519" >/dev/null
+set +e
+run_setup >"$root/secondkey.out" 2>"$root/secondkey.err"
+skrc=$?
+set -e
+echo "secondkey rc=$skrc"
+cat "$root/secondkey.err"
+[ "$skrc" -ne 0 ]
+grep -q 'refusing to add a second key' "$root/secondkey.err"
+grep -q -- '--rotate-key' "$root/secondkey.err"
+[ "$(sha256sum "$auth")" = "$auth_hash" ]
+echo "a different private key did not change authorized_keys"
+
+echo "---- rotate-key replaces the tunnel key ----"
+set +e
+run_setup '' --rotate-key >"$root/rotate.out" 2>"$root/rotate.err"
+rorc=$?
+set -e
+echo "rotate rc=$rorc"
+cat "$root/rotate.err"
+[ "$rorc" -eq 0 ]
+grep -q 'rotated; authorized_keys replaced' "$root/rotate.out"
+keycount=$(grep -c 'ssh-ed25519 ' "$auth" || true)
+[ "$keycount" -eq 1 ]
+rotated=$(awk '{print $2}' "$root/root/phonetunnel-install/id_ed25519.pub")
+[ "$rotated" != "$pub1" ]
+installed=$(awk '{ for (i = 1; i <= NF; i++) if ($i == "ssh-ed25519") { print $(i + 1); exit } }' "$auth")
+[ "$installed" = "$rotated" ]
+if grep -F -q "$pub1" "$auth"; then
+    echo "rotate left the old key in authorized_keys" >&2
+    exit 1
+fi
+[ -s "$root/root/phonetunnel-install/id_ed25519" ]
+echo "rotate-key left exactly one new key"
 echo "account ok"
 EOS
         echo "host passwd and sshd were not the chroot"
