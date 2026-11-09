@@ -1255,12 +1255,14 @@ def main() -> int:
     global HUB_HTTP
     if args.hub:
         HUB_HTTP = args.hub.rstrip("/")
-    # Cup default if localhost health fails
     setup_logging()
     try:
         health()
     except Exception:
-        alt = os.environ.get("GSM2COMPUTER_HUB_URL", "http://:8787")
+        alt = os.environ.get("GSM2COMPUTER_HUB_URL", "").strip()
+        if not alt:
+            LOG.error("hub %s unreachable and GSM2COMPUTER_HUB_URL is unset", HUB_HTTP)
+            return 2
         LOG.warning("hub %s unreachable, trying %s", HUB_HTTP, alt)
         HUB_HTTP = alt.rstrip("/")
 

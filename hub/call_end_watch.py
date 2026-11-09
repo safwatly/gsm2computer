@@ -33,10 +33,8 @@ from link_gap_log import read_recent
 LOG = logging.getLogger("gsm2computer-call-end-watch")
 
 ET = ZoneInfo("America/New_York")
-ADB_SERIAL = os.environ.get("GSM2COMPUTER_CALL_END_ADB", ":5555")
-HUB_HTTP = os.environ.get("GSM2COMPUTER_E2E_HUB") or os.environ.get(
-    "GSM2COMPUTER_HUB_HTTP", "http://:8787"
-)
+ADB_SERIAL = os.environ.get("GSM2COMPUTER_CALL_END_ADB", "")
+HUB_HTTP = os.environ.get("GSM2COMPUTER_E2E_HUB") or os.environ.get("GSM2COMPUTER_HUB_HTTP", "")
 POLL_S = float(os.environ.get("GSM2COMPUTER_CALL_END_POLL_S", "2.5"))
 # Poll fast only while a call is active or just ended; slow when idle.
 IDLE_POLL_S = float(os.environ.get("GSM2COMPUTER_CALL_END_IDLE_POLL_S", "10"))
@@ -930,6 +928,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     setup_logging()
     if args.dry_run:
         return dry_run(args.scenario, post=not args.no_post)
+    if not ADB_SERIAL or not HUB_HTTP:
+        LOG.error(
+            "set GSM2COMPUTER_CALL_END_ADB and GSM2COMPUTER_HUB_HTTP "
+            "(or GSM2COMPUTER_E2E_HUB) in the cup drop-in"
+        )
+        return 2
 
     st = load_state()
     snap = read_phone_snapshot()

@@ -13,11 +13,11 @@ live-call rule (`busy` / `real_call_busy` are included in every payload).
 
 | check | fails when |
 |---|---|
-| `hub_health` | `GET http://:8787/health` not 200 / `ok != true` (1 quick retry) |
+| `hub_health` | `GET $CUP_WATCHDOG_HUB/health` not 200 / `ok != true` (1 quick retry). Unset `CUP_WATCHDOG_HUB` fails the check. |
 | `talk_page` | (idle only) Talk Chromium CDP down, no Talk button, or page not exactly `/chat/main` on the expected origin |
 | `portal_cup` / `hub_cup_portal` | `https://portal-cup…/`, `https://hub-cup…/portal` final status (after redirects) not 200 |
 | `unit:gsm2computer-hub` / `unit:talk-chromium` / `unit:openclaw-gateway` | user unit not `active` (NRestarts tracked; increases logged as `unit_restart` events in the daily summary) |
-| `pixel_ping` | `tailscale ping --tsmp --c 1 --timeout 5s ` fails 3 tries in a row |
+| `pixel_ping` | `tailscale ping --tsmp --c 1 --timeout 5s $CUP_WATCHDOG_PIXEL_IP` fails 3 tries in a row. Unset `CUP_WATCHDOG_PIXEL_IP` fails the check. |
 | `webhook_env` | hub unit Environment lacks `GSM2COMPUTER_ALERT_WEBHOOK_URL`/`_KEY` (presence only) |
 | `uplink_volume` | `phone_uplink.monitor` not 100% |
 | `stale_bridge` | any `rejecting websocket: call already in progress` in the hub journal since the previous run |

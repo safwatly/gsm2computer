@@ -264,6 +264,13 @@ async def read_http_headers(reader: asyncio.StreamReader) -> Tuple[str, str, dic
         raise HttpRequestError(408, "header timeout") from exc
 
 
+def split_request_target(target: str) -> tuple[str, dict[str, str]]:
+    """Path plus the last value of each query key. Portal tests import this."""
+    parts = urlsplit(target)
+    query = {key: values[-1] for key, values in parse_qs(parts.query, keep_blank_values=True).items()}
+    return parts.path or "/", query
+
+
 def content_length_header(headers: dict) -> int:
     raw = headers.get("content-length")
     if raw is None or raw == "":

@@ -7,8 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/gsm2computer-hub
 Environment=PYTHONPATH=%h/gsm2computer-hub
-Environment=GSM2COMPUTER_HUB_HTTP=http://:8787
-Environment=GSM2COMPUTER_CALL_END_ADB=:5555
+# GSM2COMPUTER_HUB_HTTP and GSM2COMPUTER_CALL_END_ADB are set in the cup drop-in.
 Environment=GSM2COMPUTER_CALL_END_POLL_S=2.5
 Environment=GSM2COMPUTER_CALL_END_MIN_S=5
 ExecStart=%h/gsm2computer-hub/.venv/bin/python %h/gsm2computer-hub/call_end_watch.py

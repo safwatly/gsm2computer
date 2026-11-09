@@ -34,14 +34,14 @@ class TailscalePathTests(unittest.TestCase):
         payload = {
             "Peer": {
                 "n1": {
-                    "TailscaleIPs": [""],
+                    "TailscaleIPs": ["100.64.0.25"],
                     "CurAddr": "203.0.113.10:51421",
                     "Relay": "par",
                     "Online": True,
                 }
             }
         }
-        info = parse_tailscale_status(payload, "")
+        info = parse_tailscale_status(payload, "100.64.0.25")
         self.assertEqual(info["mode"], "direct")
         self.assertEqual(info["relay"], "par")
         self.assertEqual(info["addr"], "203.0.113.10:51421")
@@ -50,13 +50,13 @@ class TailscalePathTests(unittest.TestCase):
         payload = {
             "Peer": {
                 "n1": {
-                    "TailscaleIPs": [""],
+                    "TailscaleIPs": ["100.64.0.25"],
                     "CurAddr": "",
                     "Relay": "par",
                 }
             }
         }
-        info = parse_tailscale_status(payload, "")
+        info = parse_tailscale_status(payload, "100.64.0.25")
         self.assertEqual(info["mode"], "relay")
 
     def test_unknown_peer(self) -> None:
@@ -67,7 +67,7 @@ class TailscalePathTests(unittest.TestCase):
 class SocketStatTests(unittest.TestCase):
     def test_parse_ss_ti(self) -> None:
         text = (
-            "ESTAB 0 0 :8787 :51234\n"
+            "ESTAB 0 0 192.0.2.42:8787 192.0.2.25:51234\n"
             " cubic rto:201 rtt:89.2/12.1 bytes_retrans:5 unacked:2\n"
         )
         parsed = parse_ss_ti(text)

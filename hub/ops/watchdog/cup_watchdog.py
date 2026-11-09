@@ -45,7 +45,7 @@ ET = ZoneInfo("America/New_York")
 HOME = Path.home()
 HOST = socket.gethostname() or "safwat-cup"
 
-HUB = os.environ.get("CUP_WATCHDOG_HUB", "http://:8787").rstrip("/")
+HUB = os.environ.get("CUP_WATCHDOG_HUB", "").rstrip("/")
 PIXEL_IP = os.environ.get("CUP_WATCHDOG_PIXEL_IP", "")
 PORTALS = {
     "portal_cup": "https://portal-cup.mining-ling.ts.net/",
@@ -175,6 +175,8 @@ class Ctx:
 
 
 def check_hub_health(ctx: Ctx):
+    if not HUB:
+        return False, "CUP_WATCHDOG_HUB unset"
     last = ""
     for attempt in range(2):
         st, body, _ = http_get(HUB + "/health", 8)
@@ -257,6 +259,8 @@ def make_unit_check(unit: str):
 def check_pixel_ping(ctx: Ctx):
     if os.environ.get("CUP_WATCHDOG_MUTE_PIXEL", "") not in ("", "0"):
         return True, "muted (Pixel retired, CUP_WATCHDOG_MUTE_PIXEL=1)"
+    if not PIXEL_IP:
+        return False, "CUP_WATCHDOG_PIXEL_IP unset"
     last = ""
     for i in range(3):
         rc, out = run(["tailscale", "ping", "--tsmp", "--c", "1", "--timeout", "5s", PIXEL_IP], 12)

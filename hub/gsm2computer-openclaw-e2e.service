@@ -6,8 +6,7 @@ Wants=gsm2computer-hub.service
 [Service]
 Type=oneshot
 WorkingDirectory=%h/gsm2computer-hub
-# Prefer Tailscale hub bind used on cup; script falls back if needed.
-Environment=GSM2COMPUTER_E2E_HUB=http://:8787
+# GSM2COMPUTER_E2E_HUB is set in the cup drop-in. Unset, the script uses 127.0.0.1:8787.
 Environment=GSM2COMPUTER_HUB_DIR=%h/gsm2computer-hub
 Environment=PYTHONPATH=%h/gsm2computer-hub
 ExecStart=%h/gsm2computer-hub/.venv/bin/python %h/gsm2computer-hub/openclaw_e2e.py --ladder

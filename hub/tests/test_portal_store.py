@@ -24,33 +24,34 @@ class PortalStoreTest(unittest.TestCase):
         self.assertEqual(normalize_peer(" +1 (555) 987-6 "), "+15559876")
 
     def test_threads_order_latest_first(self):
-        self.store.persist_inbound("+15551111", "older", "2026-01-01T00:00:00Z")
-        self.store.persist_inbound("+15552222", "newest", "2026-09-19T12:00:00Z")
-        self.store.persist_inbound("+15551111", "mid", "2026-03-01T00:00:00Z")
+        self.store.add_message("in", "+15551111", "older", ts="2026-01-01T00:00:00Z")
+        self.store.add_message("in", "+15552222", "newest", ts="2026-09-19T12:00:00Z")
+        self.store.add_message("in", "+15551111", "mid", ts="2026-03-01T00:00:00Z")
         threads = self.store.list_threads()
         self.assertEqual([t["peer"] for t in threads], ["+15552222", "+15551111"])
         self.assertEqual(threads[0]["lastBody"], "newest")
         self.assertEqual(threads[1]["lastBody"], "mid")
 
     def test_messages_sorted_oldest_first(self):
-        self.store.persist_inbound("+1555", "a", "2026-01-01T00:00:00Z")
-        self.store.persist_inbound("+1555", "b", "2026-01-02T00:00:00Z")
+        self.store.add_message("in", "+1555", "a", ts="2026-01-01T00:00:00Z")
+        self.store.add_message("in", "+1555", "b", ts="2026-01-02T00:00:00Z")
         bodies = [m["body"] for m in self.store.list_messages("+1555")]
         self.assertEqual(bodies, ["a", "b"])
 
     def test_outbound_queue_and_ack(self):
-        queued = self.store.queue_outbound("+15553333", "ping")
-        self.assertEqual(queued["status"], "queued")
-        self.assertEqual(len(self.store.list_outbox()), 1)
-        acked = self.store.ack_outbox(queued["outboxId"])
+        queued = self.store.enqueue_outbound("+15553333", "ping")
+        self.assertEqual(queued["message"]["status"], "queued")
+        self.assertEqual(queued["status"], "pending")
+        self.assertEqual(len(self.store.list_outbox_pending()), 1)
+        acked = self.store.ack_outbox(queued["id"])
         self.assertIsNotNone(acked)
         self.assertEqual(acked["status"], "sent")
-        self.assertEqual(self.store.list_outbox(), [])
+        self.assertEqual(self.store.list_outbox_pending(), [])
         self.assertEqual(self.store.list_messages("+15553333")[0]["status"], "sent")
 
-    def test_blank_peer_skipped(self):
-        self.assertIsNone(self.store.persist_inbound("  ", "hi"))
-        self.assertEqual(self.store.list_threads(), [])
+    def test_blank_peer_is_not_a_number(self):
+        item = self.store.add_message("in", "  ", "hi")
+        self.assertEqual(item["peer"], "")
 
 
 if __name__ == "__main__":

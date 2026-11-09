@@ -34,6 +34,9 @@ def on_end(start, tap, reason):
         log("post failed", e)
 
 def ts_monitor():
+    if not PEER:
+        log("MOTO_TS_IP unset; phone reachability check off")
+        return
     off_since, alerted = None, False
     while True:
         try:

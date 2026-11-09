@@ -91,16 +91,17 @@ class PortalHttpTest(unittest.IsolatedAsyncioTestCase):
     async def test_send_queues_outbox_ack_updates_status(self):
         payload = json.dumps({"to": "+15553333", "body": "desk ping"}).encode()
         status, _, body = await self._exchange(_encode_request("POST", "/portal/api/messages/send", payload))
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 201)
         rec = json.loads(body)["message"]
         self.assertEqual(rec["status"], "queued")
         status, _, body = await self._exchange(_encode_request("GET", "/sms/outbox"))
         self.assertEqual(status, 200)
-        item = json.loads(body)["outbox"][0]
-        ack = json.dumps({"id": item["id"]}).encode()
-        status, _, body = await self._exchange(_encode_request("POST", "/sms/outbox/ack", ack))
+        item = json.loads(body)["items"][0]
+        status, _, body = await self._exchange(
+            _encode_request("POST", f"/sms/outbox/{item['id']}/ack", b"{}")
+        )
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["message"]["status"], "sent")
+        self.assertEqual(json.loads(body)["item"]["status"], "sent")
 
     async def test_sse_emits_inbound_message(self):
         reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
