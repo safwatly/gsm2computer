@@ -88,13 +88,18 @@ class RtpSession(
     // Previous capacity=3 was too aggressive: any slight jitter caused
     // packet drops and choppy audio.
     //
-    // WS transport mode uses a much larger buffer (≈10s): OpenAI streams a whole
-    // response faster than real time in a burst, and the playback loop paces it
-    // out at 20ms/frame. The drain-excess logic is disabled in WS mode so the
-    // burst isn't discarded (see playbackLoop).
+    // WS mode keeps up to 10 s so a fast hub burst is not dropped on arrival.
+    // A stall that then delivers that burst is trimmed by [trimDownlink]:
+    // silence first, then oldest speech past 2 s. UDP still drains above 100 ms.
     private class QueuedDownlink(val bytes: ByteArray, val energy: Int)
 
     private val jitterBuffer = ArrayBlockingQueue<QueuedDownlink>(if (transport != null) 500 else 8)
+    private val downlinkLock = Any()
+    private val downlinkRx = DownlinkRxGaps()
+    private val downlinkPlayout = DownlinkPlayout()
+    private var dlCatchupSilence = 0
+    private var dlCatchupSpeech = 0
+    private var dlCatchupSped = 0
 
     // RTP inactivity tracking
     @Volatile private var lastRtpReceivedTime = 0L
@@ -459,6 +464,23 @@ class RtpSession(
 
         try { transport?.stop() } catch (_: Exception) {}
 
+        val entrance = try {
+            transport?.currentLink()?.entrance?.ifBlank { "-" } ?: "-"
+        } catch (_: Exception) {
+            "-"
+        }
+        val rxLine = "downlink rx entrance=$entrance maxGapMs=${downlinkRx.maxGapMs} " +
+            "stalls=${downlinkRx.stalls} catchupSilence=$dlCatchupSilence " +
+            "catchupSpeech=$dlCatchupSpeech catchupSped=$dlCatchupSped seqGaps=$dlSeqGaps"
+        Log.i(TAG, rxLine)
+        BridgeLog.i(rxLine)
+        listener?.onRtpStats(rxLine)
+        captureTap?.putMeta("dl_max_rx_gap_ms", downlinkRx.maxGapMs)
+        captureTap?.putMeta("dl_rx_stalls", downlinkRx.stalls)
+        captureTap?.putMeta("dl_catchup_silence", dlCatchupSilence)
+        captureTap?.putMeta("dl_catchup_speech", dlCatchupSpeech)
+        captureTap?.putMeta("dl_catchup_sped", dlCatchupSped)
+
         captureTap?.close()
         captureTap = null
 
@@ -477,6 +499,19 @@ class RtpSession(
      */
     private val transportSink = object : MediaTransport.Sink {
         override fun onAudio(frame: ByteArray, format: String, rate: Int) {
+            val gapMs = downlinkRx.onFrame(System.currentTimeMillis())
+            if (gapMs >= 250L) {
+                val entrance = try {
+                    transport?.currentLink()?.entrance?.ifBlank { "-" } ?: "-"
+                } catch (_: Exception) {
+                    "-"
+                }
+                val line = "downlink rx stall gapMs=$gapMs stalls=${downlinkRx.stalls} " +
+                    "maxGapMs=${downlinkRx.maxGapMs} entrance=$entrance"
+                Log.w(TAG, line)
+                BridgeLog.w(line)
+                listener?.onRtpStats(line)
+            }
             val fmt = format.ifBlank { "audio/pcmu" }
             val hz = if (rate > 0) rate else 8000
             if (fmt != inboundFormat || hz != inboundRate) {
@@ -500,9 +535,11 @@ class RtpSession(
                 val energy = FrameEnergy.rms(slice, inboundFormat)
                 rxPacketCount++
                 val queued = QueuedDownlink(slice, energy)
-                if (!jitterBuffer.offer(queued)) {
-                    jitterBuffer.poll()
-                    jitterBuffer.offer(queued)
+                synchronized(downlinkLock) {
+                    if (!jitterBuffer.offer(queued)) {
+                        jitterBuffer.poll()
+                        jitterBuffer.offer(queued)
+                    }
                 }
             }
         }
@@ -517,7 +554,7 @@ class RtpSession(
 
         override fun onFlushPlayback() {
             // Caller barged in — discard queued agent audio so we stop talking.
-            jitterBuffer.clear()
+            synchronized(downlinkLock) { jitterBuffer.clear() }
         }
 
         override fun onStatus(msg: String) {
@@ -1052,8 +1089,6 @@ class RtpSession(
     private var dlPrebufferWaits = 0L
     private val dlPerSec = org.json.JSONArray()
     private val jbTargetFrames = 15   // 300 ms prebuffer after silence
-    private val jbMaxFrames = 75      // >1.5 s behind -> drop oldest
-    private val jbCatchupFrames = 25  // catch up to 500 ms
 
     /**
      * New track every call, and again when playback goes silent. The public
@@ -1278,6 +1313,49 @@ class RtpSession(
         }
     }
 
+    /**
+     * Silence first, then oldest speech past 2 s. Runs on the playback thread.
+     * [onAudio] takes [downlinkLock] too, so a burst cannot land in the middle
+     * of the rebuild and a barge-in flush cannot be undone by offering it back.
+     */
+    private fun trimDownlink() {
+        if (jitterBuffer.size <= DownlinkCatchup.TARGET_FRAMES) return
+        var silence = 0
+        var speech = 0
+        var kept = 0
+        synchronized(downlinkLock) {
+            if (jitterBuffer.size <= DownlinkCatchup.TARGET_FRAMES) return
+            val held = ArrayList<QueuedDownlink>()
+            while (true) {
+                val item = jitterBuffer.poll() ?: break
+                held.add(item)
+            }
+            val plan = DownlinkCatchup.trim(IntArray(held.size) { held[it].energy })
+            silence = plan.silenceDropped
+            speech = plan.speechDropped
+            for (i in held.indices) {
+                if (!plan.keep[i]) continue
+                jitterBuffer.offer(held[i])
+                kept++
+            }
+        }
+        val dropped = silence + speech
+        if (dropped == 0) return
+        dlCatchupSilence += silence
+        dlCatchupSpeech += speech
+        dlCatchupDropped += dropped
+        val entrance = try {
+            transport?.currentLink()?.entrance?.ifBlank { "-" } ?: "-"
+        } catch (_: Exception) {
+            "-"
+        }
+        val line = "downlink catch-up silence=$silence speech=$speech kept=$kept " +
+            "maxGapMs=${downlinkRx.maxGapMs} stalls=${downlinkRx.stalls} entrance=$entrance"
+        Log.w(TAG, line)
+        BridgeLog.w(line)
+        listener?.onRtpStats(line)
+    }
+
     private fun playbackLoop() {
         val track = audioTrack ?: return
         var dlSecStart = System.currentTimeMillis()
@@ -1356,14 +1434,17 @@ class RtpSession(
                         captureTap?.putMeta("dl_last_seq", dlLastSeq)
                         captureTap?.putMeta("dl_underruns", dlUnderruns)
                         captureTap?.putMeta("dl_catchup_dropped", dlCatchupDropped)
+                        captureTap?.putMeta("dl_catchup_silence", dlCatchupSilence)
+                        captureTap?.putMeta("dl_catchup_speech", dlCatchupSpeech)
+                        captureTap?.putMeta("dl_catchup_sped", dlCatchupSped)
+                        captureTap?.putMeta("dl_max_rx_gap_ms", downlinkRx.maxGapMs)
+                        captureTap?.putMeta("dl_rx_stalls", downlinkRx.stalls)
                         captureTap?.putMeta("dl_prebuffer_waits", dlPrebufferWaits)
                         captureTap?.putMeta("dl_wire", "$inboundFormat/$inboundRate")
                     } catch (_: Exception) {}
                     dlSecStart = nowMs; dlSecPlayed = 0; dlSecUnder = 0; dlSecGaps = 0; dlSecBytes = 0; dlSecMsgs0 = dlRxMsgs
                 }
-                if (wsMode && jitterBuffer.size > jbMaxFrames) {
-                    while (jitterBuffer.size > jbCatchupFrames) { jitterBuffer.poll(); dlCatchupDropped++ }
-                }
+                if (wsMode) trimDownlink()
                 // Prebuffer ~300 ms after silence so a laggy link doesn't chop speech.
                 val prebuffer = wsMode && wasPlayingSilence && jitterBuffer.size in 1 until jbTargetFrames &&
                     nowMs - dlFirstQueuedAt < 300
@@ -1385,6 +1466,11 @@ class RtpSession(
                     currentPlaybackActive = false
                     wasPlayingSilence = true
                     notePlaybackHealth(eligible = false, inputRms = 0)
+                    continue
+                }
+                if (downlinkPlayout.skip(jitterBuffer.size + 1, queued.energy)) {
+                    dlCatchupSped++
+                    dlCatchupDropped++
                     continue
                 }
                 val encoded = queued.bytes
