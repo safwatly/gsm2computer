@@ -2,6 +2,7 @@
 """gsm2computer hub: PCM/μ-law WebSocket ↔ PipeWire gsm_bus + switchboard control."""
 from __future__ import annotations
 
+import array
 import asyncio
 import collections
 import audioop
@@ -11,6 +12,7 @@ import enum
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -618,6 +620,30 @@ def _resample_pcm(pcm: bytes, src_rate: int, dst_rate: int, state: Any) -> Tuple
     return converted, new_state
 
 
+# Debug downlink only. Two 250 ms pulses, then silence, so it is not the phone's own 0.5 s beep.
+TEST_TONE_RATE = 8000
+TEST_TONE_HZ = 1000
+TEST_TONE_S = 2.0
+TEST_TONE_AMP = int(round(32767 * 10 ** (-12 / 20)))
+
+
+def build_test_tone_pcm(rate: int = TEST_TONE_RATE, seconds: float = TEST_TONE_S) -> bytes:
+    """1 kHz at about -12 dBFS: 250 ms on, 250 ms off, 250 ms on, then silence."""
+    n = int(rate * seconds)
+    first_off = int(rate * 0.25)
+    second_on = int(rate * 0.50)
+    second_off = int(rate * 0.75)
+    samples = array.array("h")
+    for i in range(n):
+        on = i < first_off or second_on <= i < second_off
+        if on:
+            sample = int(round(TEST_TONE_AMP * math.sin(2 * math.pi * TEST_TONE_HZ * i / rate)))
+        else:
+            sample = 0
+        samples.append(sample)
+    return samples.tobytes()
+
+
 PORTAL_DB = Path(os.environ.get("GSM2COMPUTER_PORTAL_DB", str(HUB_DIR / "portal.sqlite")))
 portal_store = PortalStore(PORTAL_DB)
 portal_events = EventBus()
@@ -769,6 +795,10 @@ class PipewireBridge:
         self.downlink_guard = DownlinkSendGuard()
         self.kernel_queue = KernelQueueWatch()
         self._dl_frame_bytes = 0
+        self._test_tone_pcm: Optional[bytes] = None
+        self._test_tone_off = 0
+        self._test_tone_done = False
+        self._test_tone_ratecv: Any = None
         self._dl_q = collections.deque()
         self.dl_seq = 0
         self.dl_sent = 0
@@ -1007,6 +1037,42 @@ class PipewireBridge:
         if (self.kernel_queue.max_outq, self.kernel_queue.stall_count) != before:
             self._publish_kernel_queue()
 
+    def _mark_test_tone(self) -> None:
+        tap = self.tap
+        if tap is None:
+            return
+        tap.meta["test_tone"] = True
+        opened = open_call_tap
+        if (
+            isinstance(opened, dict)
+            and opened.get("id") == tap.call_id
+            and isinstance(opened.get("meta"), dict)
+        ):
+            opened["meta"]["test_tone"] = True
+
+    def _take_test_tone_frame(self) -> Optional[bytes]:
+        """Next 20 ms of the debug tone. None when the flag is off or the 2 s is done."""
+        if self._test_tone_done:
+            return None
+        frame_bytes = (TEST_TONE_RATE // 50) * 2
+        if self._test_tone_pcm is None:
+            if not _env_flag("GSM2COMPUTER_TEST_TONE", False):
+                self._test_tone_done = True
+                return None
+            self._test_tone_pcm = build_test_tone_pcm(TEST_TONE_RATE)
+            self._test_tone_off = 0
+            self._mark_test_tone()
+            LOG.info("downlink test tone start")
+        off = self._test_tone_off
+        frame = self._test_tone_pcm[off : off + frame_bytes]
+        self._test_tone_off = off + len(frame)
+        if self._test_tone_off >= len(self._test_tone_pcm):
+            frames = self._test_tone_off // frame_bytes
+            self._test_tone_done = True
+            self._test_tone_pcm = b""
+            LOG.info("downlink test tone end frames=%s", frames)
+        return frame or None
+
     def current_downlink_writer(self) -> Optional[asyncio.StreamWriter]:
         writer = self._out_writer
         if writer is None or writer_closing(writer):
@@ -1041,8 +1107,6 @@ class PipewireBridge:
             left = audioop.tomono(chunk, 2, 1, 0)
             right = audioop.tomono(chunk, 2, 0, 1)
             mono_pcm = audioop.tomono(chunk, 2, 0.5, 0.5)
-            if self.tap:
-                self.tap.write_s16("gsm-downlink-8k-mono", mono_pcm, self.rate, 1)
             energy_l = audioop.rms(left, 2) / 32768.0
             energy_r = audioop.rms(right, 2) / 32768.0
             if energy_l > 0.02 or energy_r > 0.02:
@@ -1050,17 +1114,41 @@ class PipewireBridge:
                 self.downlink_energy_ticks = nonzero
                 if nonzero == 1 or nonzero % 50 == 0:
                     LOG.info("downlink energy l=%.3f r=%.3f", energy_l, energy_r)
-            out_fmt = self.client_out_format
-            out_rate = self.client_out_rate
-            if out_rate != self._out_dst_rate:
-                self._out_ratecv = None
-                self._out_dst_rate = out_rate
-            payload_pcm, self._out_ratecv = _resample_pcm(
-                mono_pcm, self.rate, out_rate, self._out_ratecv
-            )
-            # What the caller should hear, every mode. Independent of the
-            # existing bus-rate gsm-downlink stem and of the app-specific taps.
-            self.note_phone_downlink(payload_pcm, out_rate)
+            ws_writer = self._out_writer
+            if ws_writer is None or writer_closing(ws_writer):
+                if ws_writer is not None and self._out_writer is ws_writer and writer_closing(ws_writer):
+                    self._out_writer = None
+                if self.tap:
+                    self.tap.write_s16("gsm-downlink-8k-mono", mono_pcm, self.rate, 1)
+                continue
+            tone_pcm = self._take_test_tone_frame()
+            if tone_pcm is not None:
+                # Drop this bus chunk. Do not queue it behind the tone.
+                payload_pcm = tone_pcm
+                out_fmt = "audio/pcmu"
+                out_rate = TEST_TONE_RATE
+                energy_l = energy_r = _pcm_rms_energy(tone_pcm)
+                if self.tap:
+                    bus_tone, self._test_tone_ratecv = _resample_pcm(
+                        tone_pcm, TEST_TONE_RATE, self.rate, self._test_tone_ratecv
+                    )
+                    if bus_tone:
+                        self.tap.write_s16("gsm-downlink-8k-mono", bus_tone, self.rate, 1)
+                self.note_phone_downlink(payload_pcm, out_rate)
+            else:
+                if self.tap:
+                    self.tap.write_s16("gsm-downlink-8k-mono", mono_pcm, self.rate, 1)
+                out_fmt = self.client_out_format
+                out_rate = self.client_out_rate
+                if out_rate != self._out_dst_rate:
+                    self._out_ratecv = None
+                    self._out_dst_rate = out_rate
+                payload_pcm, self._out_ratecv = _resample_pcm(
+                    mono_pcm, self.rate, out_rate, self._out_ratecv
+                )
+                # What the caller should hear, every mode. Independent of the
+                # existing bus-rate gsm-downlink stem and of the app-specific taps.
+                self.note_phone_downlink(payload_pcm, out_rate)
             if out_fmt == "audio/pcm":
                 payload = payload_pcm
                 wire_fmt = "audio/pcm"
@@ -1083,11 +1171,6 @@ class PipewireBridge:
             # kernel: every frame is still written, sequence numbers stay
             # contiguous, and the phone sees one late burst.
             guard = self.downlink_guard
-            ws_writer = self._out_writer
-            if ws_writer is None or writer_closing(ws_writer):
-                if ws_writer is not None and self._out_writer is ws_writer and writer_closing(ws_writer):
-                    self._out_writer = None
-                continue
             guard.observe(transport_buffered(ws_writer))
             dead = guard.dead_reason()
             if dead:
