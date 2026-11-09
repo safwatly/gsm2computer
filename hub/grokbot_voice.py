@@ -38,6 +38,36 @@ TRANSCRIPT_ABORT_S = float(os.environ.get("GSM2COMPUTER_GROKBOT_TRANSCRIPT_ABORT
 # Linear gain on caller audio before it reaches the bot (1.0 = unity).
 UPLINK_GAIN = float(os.environ.get("GSM2COMPUTER_GROKBOT_UPLINK_GAIN", "1.0"))
 
+_PAGE_DEVICE_NAMES = ("grok_bus", "grok_mic")
+
+
+def page_state_from_status(status: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Small readout of ``patchbay status --json``. No DOM scrape and no click.
+
+    Patchbay owns the Grok page. Whatever it puts under ``ui`` (live, muted,
+    idle, session) is kept, capped so a large blob cannot land in call meta.
+    """
+    blob = status or {}
+    nested = blob.get("json")
+    if isinstance(nested, dict):
+        blob = nested
+    if not isinstance(blob, dict):
+        return {}
+    out: dict[str, Any] = {}
+    ui = blob.get("ui")
+    if isinstance(ui, dict) and ui:
+        out["ui"] = {str(key): ui[key] for key in list(ui)[:12]}
+    for key in ("cdp_up", "routing_rule_present"):
+        if key in blob:
+            out[key] = blob[key]
+    devices = blob.get("devices")
+    if isinstance(devices, dict):
+        out["devices"] = {
+            name: bool(devices.get(name)) for name in _PAGE_DEVICE_NAMES if name in devices
+        }
+    return out
+
+
 EXIT_MEANING = {
     0: "ok",
     1: "runtime error",
@@ -215,6 +245,14 @@ class GrokBotVoice:
                     self.bot, res["rc"], res["meaning"], res["ms"], res.get("error"),
                 )
             return res
+
+    async def read_page_state(self) -> dict[str, Any]:
+        """One ``patchbay status --json``. Failures become ``{"error": ...}``."""
+        res = await run_patchbay("status", "--json", timeout_s=3, binary=self.binary)
+        state = page_state_from_status(res.get("json"))
+        if not state and res.get("rc") not in (0, None):
+            return {"error": res.get("meaning") or "status failed"}
+        return state
 
     async def stop(self) -> dict[str, Any]:
         async with self._lock:

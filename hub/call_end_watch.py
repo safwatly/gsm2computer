@@ -600,6 +600,35 @@ def transcript_source(st: WatchState, health: dict[str, Any]) -> Optional[dict[s
     return {"id": tap_id or None, "dir": tap_dir, "meta": meta}
 
 
+def kernel_queue_fields(
+    st: WatchState, health: dict[str, Any], source: Optional[dict[str, Any]]
+) -> dict[str, int]:
+    """max_outq and stall_count for this call, from its meta or the live snapshot."""
+    metas: list[dict[str, Any]] = []
+    if isinstance(source, dict) and isinstance(source.get("meta"), dict):
+        metas.append(source["meta"])
+    opened = health.get("open_call_tap")
+    want = str((source or {}).get("id") or st.tap_id or "")
+    if isinstance(opened, dict):
+        opened_id = str(opened.get("id") or "")
+        if (not want or opened_id == want) and isinstance(opened.get("meta"), dict):
+            metas.append(opened["meta"])
+    call = health.get("call") or {}
+    if isinstance(call, dict):
+        metas.append(call)
+    for meta in metas:
+        if "max_outq" not in meta:
+            continue
+        try:
+            return {
+                "max_outq": int(meta.get("max_outq") or 0),
+                "stall_count": int(meta.get("stall_count") or 0),
+            }
+        except (TypeError, ValueError):
+            return {}
+    return {}
+
+
 def _safe_link_gaps() -> list:
     try:
         return read_recent(limit=30)
@@ -637,6 +666,14 @@ def build_payload(
         transcript = transcript_for_alert(source)
     except Exception:
         LOG.debug("transcript pointer failed", exc_info=True)
+    silence = None
+    try:
+        from call_tap import assistant_silence_from_health
+
+        silence = assistant_silence_from_health(health)
+    except Exception:
+        LOG.debug("assistant silence read failed", exc_info=True)
+    kernel_q = kernel_queue_fields(st, health, source)
     text = (
         f"call_ended duration_s={duration_s:.0f} "
         f"dropped_suspected={dropped} "
@@ -646,6 +683,12 @@ def build_payload(
         + (
             f" transcript_status={transcript.get('status')} transcript={transcript.get('path') or '-'}"
             if transcript
+            else ""
+        )
+        + (" assistant_silent=true" if silence and silence.get("assistant_silent") else "")
+        + (
+            f" kernel_stalls={kernel_q['stall_count']} max_outq={kernel_q['max_outq']}"
+            if kernel_q.get("stall_count")
             else ""
         )
         + (" TEST" if test else "")
@@ -705,6 +748,30 @@ def build_payload(
     if source and source.get("dir"):
         payload["tap_dir"] = source.get("dir")
         payload["tap_id"] = source.get("id")
+    if silence:
+        payload["assistant_silent"] = bool(silence.get("assistant_silent"))
+        stats = silence.get("assistant_silent_stats")
+        if not isinstance(stats, dict):
+            stats = {
+                key: silence.get(key)
+                for key in (
+                    "judged",
+                    "after_s",
+                    "mic_loud_frac",
+                    "spk_loud_frac",
+                    "mic_judge_s",
+                    "spk_judge_s",
+                    "mic_rms",
+                    "spk_rms",
+                )
+                if key in silence
+            }
+        payload["assistant_silent_stats"] = stats
+        if silence.get("grok_page"):
+            payload["grok_page"] = silence["grok_page"]
+    if kernel_q:
+        payload["max_outq"] = kernel_q["max_outq"]
+        payload["stall_count"] = kernel_q["stall_count"]
     return payload
 
 

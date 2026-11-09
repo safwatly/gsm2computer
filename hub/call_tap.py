@@ -76,6 +76,15 @@ _DOWNLINK_QUEUE_MAX = 100
 DOWNLINK_FLUSH_S = float(os.environ.get("GSM2COMPUTER_DOWNLINK_FLUSH_S", "1"))
 MIX_TIMEOUT_S = 30.0
 
+GROK_MIC_STEM = "grok-mic-48k-stereo"
+GROK_SPK_STEM = "grok-spk-48k-stereo"
+# Ignore the hold-tone tail. The judged window starts this long after switch.
+REPLY_JUDGE_AFTER_S = float(os.environ.get("GSM2COMPUTER_ASSISTANT_SILENT_AFTER_S", "2"))
+# Both stems must have at least this much judged audio before the flag can be true.
+REPLY_JUDGE_MIN_S = float(os.environ.get("GSM2COMPUTER_ASSISTANT_SILENT_MIN_S", "8"))
+REPLY_MIC_LOUD_MIN = float(os.environ.get("GSM2COMPUTER_ASSISTANT_SILENT_MIC_LOUD", "0.05"))
+REPLY_SPK_LOUD_MAX = float(os.environ.get("GSM2COMPUTER_ASSISTANT_SILENT_SPK_LOUD", "0.02"))
+
 # out name, left stem, right stem, mix sample rate
 _ROOM_MIXES: tuple[tuple[str, str, str, int], ...] = (
     ("gsm.mp3", "gsm-uplink-8k-mono", "gsm-downlink-8k-mono", 16000),
@@ -86,6 +95,64 @@ _ROOM_MIXES: tuple[tuple[str, str, str, int], ...] = (
 
 def _enabled() -> bool:
     return RECORD_ENABLED
+
+
+def judge_assistant_silence(
+    mic: dict[str, Any],
+    spk: dict[str, Any],
+    *,
+    after_s: float = REPLY_JUDGE_AFTER_S,
+    min_s: float = REPLY_JUDGE_MIN_S,
+    mic_loud_min: float = REPLY_MIC_LOUD_MIN,
+    spk_loud_max: float = REPLY_SPK_LOUD_MAX,
+) -> dict[str, Any]:
+    """True when the caller talked and Suzie did not, after the post-switch grace.
+
+    ``judge_loud_frac`` is the fraction of 20 ms windows at or above rms 0.02,
+    counted only once ``after_s`` has elapsed on that stem. A short opening
+    blip inside the grace does not count as a reply.
+    """
+    mic_s = float(mic.get("judge_seconds") or 0.0)
+    spk_s = float(spk.get("judge_seconds") or 0.0)
+    mic_frac = float(mic.get("judge_loud_frac") or 0.0)
+    spk_frac = float(spk.get("judge_loud_frac") or 0.0)
+    enough = mic_s >= min_s and spk_s >= min_s
+    silent = enough and mic_frac >= mic_loud_min and spk_frac <= spk_loud_max
+    return {
+        "assistant_silent": silent,
+        "judged": enough,
+        "after_s": after_s,
+        "mic_loud_frac": mic_frac,
+        "spk_loud_frac": spk_frac,
+        "mic_judge_s": round(mic_s, 3),
+        "spk_judge_s": round(spk_s, 3),
+        "mic_rms": float(mic.get("judge_rms") or 0.0),
+        "spk_rms": float(spk.get("judge_rms") or 0.0),
+    }
+
+
+def assistant_silence_from_health(health: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """The assessment published on /health, else the one stored on the last tap."""
+    live = health.get("assistant_silent")
+    if isinstance(live, dict) and "assistant_silent" in live:
+        return live
+    tap = health.get("last_call_tap")
+    if not isinstance(tap, dict) or "assistant_silent" not in tap:
+        return None
+    stats = tap.get("assistant_silent_stats")
+    out: dict[str, Any] = {
+        "assistant_silent": bool(tap.get("assistant_silent")),
+        "assistant_silent_stats": stats if isinstance(stats, dict) else {},
+    }
+    meta = tap.get("meta") if isinstance(tap.get("meta"), dict) else {}
+    pages: dict[str, Any] = {}
+    if "grok_page_at_switch" in meta:
+        pages["at_switch"] = meta["grok_page_at_switch"]
+    if "grok_page_at_hangup" in meta:
+        pages["at_hangup"] = meta["grok_page_at_hangup"]
+    if pages:
+        out["grok_page"] = pages
+    return out
 
 
 def _wav_seconds(path: Path) -> float:
@@ -215,6 +282,19 @@ class _Stream:
         self.sum_sq = 0.0
         self.loud_windows = 0
         self.windows = 0
+        self._judge_skip: Optional[int] = None
+        self.judge_nbytes = 0
+        self.judge_loud_windows = 0
+        self.judge_windows = 0
+        self.judge_sum_sq = 0.0
+
+    def judge_after(self, seconds: float) -> None:
+        """Count loudness only once `seconds` more audio has been written."""
+        if self._judge_skip is not None:
+            return
+        frame = 2 * self.channels
+        skip = max(0.0, float(seconds))
+        self._judge_skip = self.nbytes + int(skip * self.rate) * frame
 
     def write(self, pcm: bytes) -> None:
         if not pcm:
@@ -224,6 +304,7 @@ class _Stream:
             pcm = pcm[: len(pcm) - extra]
         if not pcm:
             return
+        start = self.nbytes
         self.wav.writeframes(pcm)
         self.nbytes += len(pcm)
         width = 2
@@ -233,14 +314,21 @@ class _Stream:
         # One window per write is good enough for 20 ms frames.
         self.windows += 1
         self.sum_sq += float(rms) * float(rms)
-        if rms / 32768.0 > 0.02:
+        loud = rms / 32768.0 > 0.02
+        if loud:
             self.loud_windows += 1
+        if self._judge_skip is not None and start >= self._judge_skip:
+            self.judge_nbytes += len(pcm)
+            self.judge_windows += 1
+            self.judge_sum_sq += float(rms) * float(rms)
+            if loud:
+                self.judge_loud_windows += 1
 
     def stats(self) -> dict[str, Any]:
         samples = self.nbytes // (2 * self.channels)
         seconds = samples / self.rate if self.rate else 0.0
         mean_rms = (self.sum_sq / self.windows) ** 0.5 / 32768.0 if self.windows else 0.0
-        return {
+        out = {
             "file": self.path.name,
             "rate": self.rate,
             "channels": self.channels,
@@ -249,6 +337,18 @@ class _Stream:
             "rms": round(mean_rms, 4),
             "loud_frac": round(self.loud_windows / self.windows, 3) if self.windows else 0.0,
         }
+        if self._judge_skip is not None:
+            judge_samples = self.judge_nbytes // (2 * self.channels)
+            judge_seconds = judge_samples / self.rate if self.rate else 0.0
+            judge_rms = (
+                (self.judge_sum_sq / self.judge_windows) ** 0.5 / 32768.0 if self.judge_windows else 0.0
+            )
+            out["judge_seconds"] = round(judge_seconds, 3)
+            out["judge_rms"] = round(judge_rms, 4)
+            out["judge_loud_frac"] = (
+                round(self.judge_loud_windows / self.judge_windows, 3) if self.judge_windows else 0.0
+            )
+        return out
 
     def close(self) -> None:
         self.wav.close()
@@ -272,6 +372,9 @@ class CallTap:
         self._down_task: Optional[asyncio.Task] = None
         self._down_drop_logged = False
         self._down_stop = False
+        self._reply_judged = False
+        self._reply_judge_after_s = REPLY_JUDGE_AFTER_S
+        self._judge_from_start: dict[str, float] = {}
         self.started_wall = datetime.now(timezone.utc).timestamp()
         LOG.info("call tap dir %s", self.dir)
 
@@ -317,7 +420,44 @@ class CallTap:
             path = self.dir / f"{name}.wav"
             stream = _Stream(path, rate, channels)
             self._streams[name] = stream
+            if name in self._judge_from_start:
+                stream.judge_after(self._judge_from_start[name])
         stream.write(pcm)
+
+    def begin_reply_judge(self, after_s: float = REPLY_JUDGE_AFTER_S) -> None:
+        """Start the post-switch window. Mic is already recording; spk may not be."""
+        self._reply_judged = True
+        self._reply_judge_after_s = after_s
+        self._judge_from_start[GROK_SPK_STEM] = after_s
+        mic = self._streams.get(GROK_MIC_STEM)
+        if mic is not None:
+            mic.judge_after(after_s)
+        else:
+            self._judge_from_start[GROK_MIC_STEM] = after_s
+        spk = self._streams.get(GROK_SPK_STEM)
+        if spk is not None:
+            spk.judge_after(after_s)
+
+    def note_page_state(self, when: str, state: dict[str, Any]) -> None:
+        if when not in {"switch", "hangup"}:
+            return
+        self.meta[f"grok_page_at_{when}"] = state
+
+    def assistant_silence(self) -> Optional[dict[str, Any]]:
+        if not self._reply_judged:
+            return None
+        mic = self._streams.get(GROK_MIC_STEM)
+        spk = self._streams.get(GROK_SPK_STEM)
+        if mic is None or spk is None:
+            return None
+        return judge_assistant_silence(
+            mic.stats(),
+            spk.stats(),
+            after_s=self._reply_judge_after_s,
+            min_s=REPLY_JUDGE_MIN_S,
+            mic_loud_min=REPLY_MIC_LOUD_MIN,
+            spk_loud_max=REPLY_SPK_LOUD_MAX,
+        )
 
     def write_phone_downlink(self, pcm: bytes, rate: int) -> None:
         """Record mono s16 that the hub is handing to the phone, at 8 kHz.
@@ -503,11 +643,28 @@ class CallTap:
                     )
 
     def summary(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "id": self.call_id,
             "dir": str(self.dir),
             "streams": {name: stream.stats() for name, stream in self._streams.items()},
         }
+        assessment = self.assistant_silence()
+        if assessment is not None:
+            out["assistant_silent"] = assessment["assistant_silent"]
+            out["assistant_silent_stats"] = {
+                key: assessment[key]
+                for key in (
+                    "judged",
+                    "after_s",
+                    "mic_loud_frac",
+                    "spk_loud_frac",
+                    "mic_judge_s",
+                    "spk_judge_s",
+                    "mic_rms",
+                    "spk_rms",
+                )
+            }
+        return out
 
     def _summary_with_transcript(self, summary: dict[str, Any]) -> dict[str, Any]:
         """Keep a transcript already saved, including one written into levels.json."""
@@ -532,9 +689,18 @@ class CallTap:
         return summary
 
     def write_levels(self, summary: dict[str, Any]) -> dict[str, Any]:
-        """Rewrite levels.json without dropping a transcript pointer already stored."""
+        """Rewrite levels.json without dropping a transcript or an earlier mix."""
         summary = self._summary_with_transcript(dict(summary))
         path = self.dir / "levels.json"
+        if path.is_file():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = None
+            if isinstance(existing, dict):
+                merged = dict(existing)
+                merged.update(summary)
+                summary = merged
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         tmp.replace(path)
@@ -542,9 +708,11 @@ class CallTap:
 
     async def close(self) -> dict[str, Any]:
         if self._closed and not self._procs and not self._tasks:
+            # stop_capture already ran (the hub does that before close). Still
+            # persist levels so the silence flag and page readout reach disk.
             summary = self._summary_with_transcript(self.summary())
             summary["meta"] = self.meta
-            return summary
+            return self.write_levels(summary)
         await self.stop_capture()
         mixes: dict[str, Any] = {}
         try:

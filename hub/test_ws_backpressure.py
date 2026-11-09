@@ -9,12 +9,16 @@ import sys
 import time
 import types
 import unittest
+from unittest import mock
 
 sys.modules.setdefault("audioop", types.ModuleType("audioop"))  # py3.13 CI; unused here
 
 from call_slot import CallSlot  # noqa: E402
 from ws_backpressure import (  # noqa: E402
+    SIOCOUTQ,
     DownlinkSendGuard,
+    KernelQueueWatch,
+    kernel_send_queue,
     offer_nowait,
     reconnect_should_supersede,
     transport_buffered,
@@ -269,7 +273,9 @@ class HubSourceTests(unittest.TestCase):
         src = inspect.getsource(hub.PipewireBridge._pump_out)
         self.assertNotIn("ws_send_text(ws_writer", src)
         self.assertNotIn("send stalled", src)
+        self.assertNotIn("drain(", src)
         self.assertIn("downlink_guard", src)
+        self.assertIn("_note_kernel_queue", src)
 
     def test_pong_never_awaits_drain(self) -> None:
         import hub
@@ -290,6 +296,134 @@ class HubSourceTests(unittest.TestCase):
 
         src = inspect.getsource(hub._watch_live_call)
         self.assertIn("SUPERSEDED_REASON", src)
+
+
+class _Sock:
+    def fileno(self) -> int:
+        return 7
+
+
+class _Writer:
+    def __init__(self, sock: object | None = None, via_transport: bool = False) -> None:
+        self._sock = sock
+        self._via = via_transport
+        self.drained = 0
+
+    def get_extra_info(self, key: str) -> object | None:
+        if key == "socket" and not self._via:
+            return self._sock
+        return None
+
+    @property
+    def transport(self) -> object:
+        sock = self._sock
+
+        class _Transport:
+            def get_extra_info(self, key: str) -> object | None:
+                return sock if key == "socket" else None
+
+        return _Transport()
+
+    async def drain(self) -> None:
+        self.drained += 1
+
+
+class KernelQueueTests(unittest.TestCase):
+    def test_ioctl_reads_siocoutq(self) -> None:
+        seen: dict[str, object] = {}
+
+        def fake_ioctl(fd: int, request: int, buf: object, mutate: bool = False) -> int:
+            seen["fd"] = fd
+            seen["request"] = request
+            seen["mutate"] = mutate
+            buf[0] = 12345  # type: ignore[index]
+            return 0
+
+        writer = _Writer(_Sock())
+        with mock.patch("fcntl.ioctl", fake_ioctl):
+            self.assertEqual(kernel_send_queue(writer), 12345)
+        self.assertEqual(seen["fd"], 7)
+        self.assertEqual(seen["request"], SIOCOUTQ)
+        self.assertTrue(seen["mutate"])
+        self.assertEqual(writer.drained, 0)
+
+    def test_ioctl_uses_transport_socket_and_oserror_is_none(self) -> None:
+        writer = _Writer(_Sock(), via_transport=True)
+
+        def fake_ioctl(fd: int, request: int, buf: object, mutate: bool = False) -> int:
+            buf[0] = 50  # type: ignore[index]
+            return 0
+
+        with mock.patch("fcntl.ioctl", fake_ioctl):
+            self.assertEqual(kernel_send_queue(writer), 50)
+
+        def boom(*_a: object, **_k: object) -> int:
+            raise OSError("not linux")
+
+        with mock.patch("fcntl.ioctl", boom):
+            self.assertIsNone(kernel_send_queue(writer))
+        self.assertIsNone(kernel_send_queue(_Writer(None)))
+
+    def test_high_queue_logs_once_per_episode_after_hold(self) -> None:
+        watch = KernelQueueWatch()
+        # 1000 bytes is one 20 ms frame, so 25000 bytes is 500 ms of audio.
+        self.assertIsNone(watch.note(25000, 1000, entrance="public", now=0.0))
+        self.assertEqual(watch.stall_count, 0)
+        self.assertEqual(watch.max_outq, 25000)
+        self.assertIsNone(watch.note(25000, 1000, entrance="public", now=0.49))
+        line = watch.note(26000, 1000, entrance="public", now=0.50)
+        self.assertEqual(
+            line,
+            "downlink kernel queue high outq=26000 ms_est=520 entrance=public",
+        )
+        self.assertEqual(watch.stall_count, 1)
+        self.assertIsNone(watch.note(27000, 1000, entrance="public", now=2.0))
+        self.assertEqual(watch.stall_count, 1)
+        self.assertEqual(watch.max_outq, 27000)
+        # Back under the line ends the episode. A short spike does not count.
+        self.assertIsNone(watch.note(1000, 1000, entrance="public", now=2.1))
+        self.assertIsNone(watch.note(25000, 1000, entrance="public", now=2.2))
+        self.assertIsNone(watch.note(1000, 1000, entrance="public", now=2.6))
+        self.assertEqual(watch.stall_count, 1)
+        self.assertIsNone(watch.note(25000, 1000, entrance="", now=3.0))
+        line = watch.note(25000, 1000, entrance="tailscale", now=3.5)
+        self.assertEqual(watch.stall_count, 2)
+        self.assertEqual(
+            line,
+            "downlink kernel queue high outq=25000 ms_est=500 entrance=tailscale",
+        )
+        self.assertIsNone(watch.note(None, 1000, entrance="public", now=3.5))
+        self.assertEqual(watch.samples, 9)
+
+    def test_pump_note_updates_call_meta_and_does_not_drain(self) -> None:
+        import hub
+
+        class Tap:
+            call_id = "phone-1"
+            meta: dict[str, int] = {}
+
+        bridge = hub.PipewireBridge("sink", "mon", 48000)
+        bridge.tap = Tap()
+        clock = Clock()
+        bridge.kernel_queue = KernelQueueWatch(clock=clock)
+        writer = _Writer(_Sock())
+        previous = hub.open_call_tap
+        hub.open_call_tap = {"id": "phone-1", "dir": "/tmp/phone-1", "meta": {}}
+        hub.live_call.entrance = "public"
+        try:
+            with mock.patch("hub.kernel_send_queue", return_value=26000) as ioctl:
+                bridge._note_kernel_queue(writer, 1000)
+                clock.t += 0.5
+                bridge._note_kernel_queue(writer, 0)
+            self.assertEqual(ioctl.call_count, 2)
+            self.assertEqual(writer.drained, 0)
+            self.assertEqual(bridge.tap.meta["max_outq"], 26000)
+            self.assertEqual(bridge.tap.meta["stall_count"], 1)
+            self.assertEqual(hub.open_call_tap["meta"]["stall_count"], 1)
+            self.assertEqual(bridge.downlink_snapshot()["stall_count"], 1)
+        finally:
+            hub.open_call_tap = previous
+            hub.live_call.entrance = ""
 
 
 if __name__ == "__main__":
