@@ -31,6 +31,10 @@ TS_ACTIVITY="com.tailscale.ipn/com.tailscale.ipn.IPNActivity"
 TS_CHECK_SEC="60"
 TS_DOWN_STREAK="3"
 TS_RESTART_MIN_SEC="900"
+# Empty means: a tunN or tailscaleN interface with a 100.64.0.0/10 address.
+TS_IFACE=""
+TAILSCALE_IFACE="none"
+TAILSCALE_ADDR="none"
 
 log_msg() {
     _msg="$*"
@@ -56,33 +60,109 @@ is_num() {
     return 0
 }
 
-# Print up, down, or unknown. An ip error is unknown, not down: a
-# missing -o flag or a toybox failure must not restart a healthy Tailscale.
+# 100.64.0.0/10 is Tailscale's CGNAT range (second octet 64-127).
+# Carrier CGNAT uses the same range on rmnet, so an address counts only
+# on a tunN or tailscaleN interface unless TS_IFACE names one interface.
+# Print "up|down|unknown <iface> <addr>". Callers must read that line.
+# A command substitution cannot see variables set in this function.
+# An ip error is unknown, not down: a toybox failure must not restart a
+# healthy Tailscale. Output is read from a file, never as one argv string.
+_ts_emit() {
+    TAILSCALE_IFACE=${2:-none}
+    TAILSCALE_ADDR=${3:-none}
+    printf '%s %s %s\n' "$1" "$TAILSCALE_IFACE" "$TAILSCALE_ADDR"
+}
+
 tailscale_state() {
     _ip="${IP_BIN:-ip}"
+    TAILSCALE_IFACE="none"
+    TAILSCALE_ADDR="none"
     if ! command -v "$_ip" >/dev/null 2>&1; then
-        printf '%s\n' unknown
+        _ts_emit unknown
         return 0
     fi
-    _out=$("$_ip" addr show tailscale0 2>&1)
-    _rc=$?
-    if [ "$_rc" -ne 0 ]; then
-        if printf '%s\n' "$_out" | grep -E -q -i 'does not exist|Cannot find device|No such device'; then
-            printf '%s\n' down
+    # mksh and dash exit the whole script when a redirect cannot create
+    # its file, even inside if or ||. Make the directory first.
+    if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+        _ts_emit unknown
+        return 0
+    fi
+    _outf="$STATE_DIR/ip.addr"
+    _errf="$STATE_DIR/ip.err"
+    : > "$_outf"
+    : > "$_errf"
+    chmod 600 "$_outf" "$_errf" 2>/dev/null || true
+    if [ -n "$TS_IFACE" ]; then
+        if ! "$_ip" addr show "$TS_IFACE" >"$_outf" 2>"$_errf"; then
+            if grep -E -q -i 'does not exist|Cannot find device|No such device' "$_errf"; then
+                _ts_emit down
+                return 0
+            fi
+            _ts_emit unknown
             return 0
         fi
-        printf '%s\n' unknown
+        if ! grep -F -q " ${TS_IFACE}:" "$_outf"; then
+            _ts_emit unknown
+            return 0
+        fi
+        _addr=$(awk '$1=="inet" { split($2, a, "/"); print a[1]; exit }' "$_outf" 2>/dev/null || true)
+        if [ -n "$_addr" ]; then
+            _ts_emit up "$TS_IFACE" "$_addr"
+            return 0
+        fi
+        _ts_emit down
         return 0
     fi
-    if ! printf '%s\n' "$_out" | grep -q 'tailscale0'; then
-        printf '%s\n' unknown
+    # List every interface. Do not pass -o: a toybox that rejects it
+    # would look like an error and must stay unknown, not down.
+    if ! "$_ip" addr show >"$_outf" 2>"$_errf"; then
+        _ts_emit unknown
         return 0
     fi
-    if printf '%s\n' "$_out" | grep -q 'inet '; then
-        printf '%s\n' up
+    if ! [ -s "$_outf" ]; then
+        _ts_emit unknown
         return 0
     fi
-    printf '%s\n' down
+    if ! grep -E -q '^[0-9]+:' "$_outf"; then
+        _ts_emit unknown
+        return 0
+    fi
+    # Single-quoted so the shell does not expand awk's field variables.
+    _hit=$(awk '
+function cgnat(addr, n, o) {
+    n = split(addr, o, ".")
+    if (n < 2 || o[1] != 100) return 0
+    n = o[2] + 0
+    if (n >= 64 && n <= 127) return 1
+    return 0
+}
+$1 ~ /^[0-9]+:$/ {
+    name = $2
+    sub(/:$/, "", name)
+    sub(/@.*$/, "", name)
+    cur = name
+    next
+}
+$1 == "inet" && cur != "" {
+    split($2, a, "/")
+    if ((cur ~ /^tun[0-9]/ || cur ~ /^tailscale[0-9]/) && cgnat(a[1])) {
+        print cur
+        print a[1]
+        found = 1
+        exit 0
+    }
+}
+END { if (!found) exit 1 }
+' "$_outf" 2>/dev/null) || _hit=""
+    if [ -n "$_hit" ]; then
+        TAILSCALE_IFACE=$(printf '%s\n' "$_hit" | awk 'NR==1 { print; exit }')
+        TAILSCALE_ADDR=$(printf '%s\n' "$_hit" | awk 'NR==2 { print; exit }')
+        [ -n "$TAILSCALE_IFACE" ] || TAILSCALE_IFACE=none
+        [ -n "$TAILSCALE_ADDR" ] || TAILSCALE_ADDR=none
+        _ts_emit up "$TAILSCALE_IFACE" "$TAILSCALE_ADDR"
+        return 0
+    fi
+    _ts_emit down
     return 0
 }
 
@@ -95,6 +175,8 @@ safe_token() {
 }
 
 load_config() {
+    # Drop a previous TS_IFACE when the file no longer sets one.
+    TS_IFACE=""
     [ -f "$CONFIG_FILE" ] || return 0
     while IFS= read -r _line || [ -n "$_line" ]; do
         case "$_line" in
@@ -122,6 +204,23 @@ load_config() {
             TS_CHECK_SEC) TS_CHECK_SEC="$_val" ;;
             TS_DOWN_STREAK) TS_DOWN_STREAK="$_val" ;;
             TS_RESTART_MIN_SEC) TS_RESTART_MIN_SEC="$_val" ;;
+            TS_IFACE)
+                case "$_val" in
+                    [A-Za-z0-9]*)
+                        case "$_val" in
+                            *[!A-Za-z0-9._-]*)
+                                log_msg "config: rejected TS_IFACE (characters)"
+                                return 1
+                                ;;
+                        esac
+                        TS_IFACE="$_val"
+                        ;;
+                    *)
+                        log_msg "config: rejected TS_IFACE (characters)"
+                        return 1
+                        ;;
+                esac
+                ;;
             *) log_msg "config: ignored $_key" ;;
         esac
     done < "$CONFIG_FILE"

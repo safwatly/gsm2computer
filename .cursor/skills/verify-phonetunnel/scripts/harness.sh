@@ -71,6 +71,7 @@ cmd_doctor() {
         file "$MULTI" | grep -q 'ARM aarch64' || die "binary is not aarch64"
         file "$MULTI" | grep -q 'static-pie' || die "binary is not static-pie"
         command -v qemu-aarch64-static >/dev/null || die "qemu-aarch64-static missing"
+        command -v mksh >/dev/null || die "mksh missing (phone shell; large dumpsys test)"
         qemu-aarch64-static "$MULTI" dbclient -h >/dev/null 2>&1
         echo "qemu dbclient -h: ok"
         command -v ssh >/dev/null || die "ssh client missing"
@@ -559,13 +560,43 @@ cmd_drive_watchdog() {
     cat > "$wd/bin/ip" << EOF
 #!/bin/sh
 mode=\$(cat "$wd/ip.mode" 2>/dev/null || echo missing)
+dev=
+for a in "\$@"; do
+    case "\$a" in
+        addr|show|-*) ;;
+        *) dev=\$a ;;
+    esac
+done
 if [ "\$mode" = error ]; then
     echo "ip: invalid argument" >&2
     exit 1
 fi
-if [ "\$mode" = missing ]; then
-    echo "Device \\"tailscale0\\" does not exist." >&2
+if [ -n "\$dev" ] && [ "\$dev" != "\$mode" ] && [ "\$mode" != missing ] && [ "\$mode" != carrier ]; then
+    echo "Device \\"\$dev\\" does not exist." >&2
     exit 1
+fi
+if [ "\$mode" = missing ]; then
+    if [ -n "\$dev" ]; then
+        echo "Device \\"\$dev\\" does not exist." >&2
+        exit 1
+    fi
+    echo "1: lo: <LOOPBACK,UP> mtu 65536"
+    echo "    inet 127.0.0.1/8 scope host lo"
+    echo "2: wlan0: <BROADCAST,UP> mtu 1500"
+    echo "    inet 192.168.1.20/24 scope global wlan0"
+    exit 0
+fi
+if [ "\$mode" = carrier ]; then
+    echo "8: rmnet_data0: <UP> mtu 1500"
+    echo "    inet 100.80.1.2/24 scope global rmnet_data0"
+    exit 0
+fi
+if [ "\$mode" = tun1 ]; then
+    echo "8: rmnet_data0: <UP> mtu 1500"
+    echo "    inet 100.80.1.2/24 scope global rmnet_data0"
+    echo "11: tun1: <POINTOPOINT,UP> mtu 1280"
+    echo "    inet 100.111.22.5/32 scope global tun1"
+    exit 0
 fi
 if [ "\$mode" = up ]; then
     echo "3: tailscale0: <BROADCAST,UP> mtu 1280 qdisc fq_codel state UNKNOWN"
@@ -683,6 +714,89 @@ EOF
         echo "after explicit idle and missing interface, am lines: $lines"
         [ "$lines" -eq 4 ]
 
+        # tun1 with a CGNAT address is Tailscale, even next to a carrier
+        # 100.64 address on rmnet. A high streak must not restart.
+        printf 'tun1\n' > "$wd/ip.mode"
+        printf '0\n' > "$wd/state/watchdog.last"
+        printf '9\n' > "$wd/state/watchdog.streak"
+        "${env_prefix[@]}" sh "$MODULE/bin/watchdog.sh" once
+        lines=$(wc -l < "$wd/am.log" | tr -d ' ')
+        echo "tun1 up beside carrier CGNAT, am lines: $lines"
+        [ "$lines" -eq 4 ]
+        PHONETUNNEL_STATE="$wd/state" \
+            PHONETUNNEL_MODDIR="$MODULE" \
+            PHONETUNNEL_CONFIG="$wd/state/config.env" \
+            PHONETUNNEL_LOG="$wd/state/phonetunnel.log" \
+            IP_BIN="$wd/bin/ip" \
+            sh "$MODULE/bin/status.sh" > "$wd/status.tun1"
+        grep -q '^tailscale=up$' "$wd/status.tun1"
+        grep -q '^tailscale_iface=tun1$' "$wd/status.tun1"
+        grep -q '^tailscale_addr=100.111.22.5$' "$wd/status.tun1"
+        echo "status sees tun1"
+
+        # Carrier CGNAT alone is not Tailscale. The miss still counts.
+        printf 'carrier\n' > "$wd/ip.mode"
+        printf '0\n' > "$wd/state/watchdog.last"
+        printf '9\n' > "$wd/state/watchdog.streak"
+        "${env_prefix[@]}" sh "$MODULE/bin/watchdog.sh" once
+        lines=$(wc -l < "$wd/am.log" | tr -d ' ')
+        echo "carrier CGNAT only, am lines: $lines"
+        [ "$lines" -eq 6 ]
+
+        # An explicit interface name overrides the scan.
+        printf 'TS_IFACE=tun1\n' >> "$wd/state/config.env"
+        printf 'tun1\n' > "$wd/ip.mode"
+        printf '0\n' > "$wd/state/watchdog.last"
+        printf '9\n' > "$wd/state/watchdog.streak"
+        "${env_prefix[@]}" sh "$MODULE/bin/watchdog.sh" once
+        lines=$(wc -l < "$wd/am.log" | tr -d ' ')
+        echo "TS_IFACE=tun1, am lines: $lines"
+        [ "$lines" -eq 6 ]
+        printf 'TS_IFACE=notun\n' >> "$wd/state/config.env"
+        printf '0\n' > "$wd/state/watchdog.last"
+        printf '9\n' > "$wd/state/watchdog.streak"
+        "${env_prefix[@]}" sh "$MODULE/bin/watchdog.sh" once
+        lines=$(wc -l < "$wd/am.log" | tr -d ' ')
+        echo "TS_IFACE=notun missing, am lines: $lines"
+        [ "$lines" -eq 8 ]
+        grep -v '^TS_IFACE=' "$wd/state/config.env" > "$wd/state/config.nots"
+        mv "$wd/state/config.nots" "$wd/state/config.env"
+
+        # A telephony dump bigger than one argument must still be readable.
+        # mksh (the phone shell) execs printf, and a 200KB argument fails
+        # with "Argument list too long". dash's builtin would hide that.
+        python3 - << PY
+from pathlib import Path
+p = Path("$wd/dumpsys.txt")
+line = b"mCellIdentity=padding\\n"
+blob = line * ((256 * 1024) // len(line) + 1)
+p.write_bytes(blob + b"mCallState=0\\nmRingingCallState=0\\nmPreciseCallState=IDLE\\n")
+print(p.stat().st_size)
+PY
+        [ "$(wc -c < "$wd/dumpsys.txt" | tr -d ' ')" -gt 200000 ]
+        printf 'missing\n' > "$wd/ip.mode"
+        printf '0\n' > "$wd/state/watchdog.last"
+        printf '1\n' > "$wd/state/watchdog.streak"
+        "${env_prefix[@]}" mksh "$MODULE/bin/watchdog.sh" once
+        lines=$(wc -l < "$wd/am.log" | tr -d ' ')
+        echo "large idle dumpsys, am lines: $lines"
+        [ "$lines" -eq 10 ]
+        if grep -q 'Argument list too long' "$wd/state/phonetunnel.log"; then
+            echo "large dumpsys was passed as one argument" >&2
+            exit 1
+        fi
+        python3 - << PY
+from pathlib import Path
+p = Path("$wd/dumpsys.txt")
+p.write_bytes(p.read_bytes() + b"state: OFFHOOK\\n")
+PY
+        printf '0\n' > "$wd/state/watchdog.last"
+        printf '9\n' > "$wd/state/watchdog.streak"
+        "${env_prefix[@]}" mksh "$MODULE/bin/watchdog.sh" once
+        lines=$(wc -l < "$wd/am.log" | tr -d ' ')
+        echo "large dumpsys with OFFHOOK, am lines: $lines"
+        [ "$lines" -eq 10 ]
+
         # A config that names the bridge package must not call am.
         sed 's/TS_PACKAGE=com.tailscale.ipn/TS_PACKAGE=com.gsm2computer.bridge/' \
             "$wd/state/config.env" > "$wd/state/config.bad"
@@ -696,7 +810,7 @@ EOF
             sh "$MODULE/bin/watchdog.sh" once
         lines=$(wc -l < "$wd/am.log" | tr -d ' ')
         echo "bridge package in config, am lines: $lines"
-        [ "$lines" -eq 4 ]
+        [ "$lines" -eq 10 ]
         grep -q 'TS_PACKAGE must be com.tailscale.ipn' "$wd/state/phonetunnel.log"
         echo "watchdog ok"
     } | tee "$EVIDENCE/watchdog.txt"
@@ -1363,6 +1477,110 @@ assert_system_sshd_untouched() {
     [ "$now" = "$(cat "$run/system-sshd.sha")" ] || die "/etc/ssh/sshd_config changed"
 }
 
+cmd_drive_nopasswd() {
+    local out="$EVIDENCE/nopasswd.txt"
+    local work port sp before after
+    command -v qemu-aarch64-static >/dev/null || die "qemu-aarch64-static missing"
+    command -v mksh >/dev/null || true
+    work=$(mktemp -d)
+    port=$(free_port)
+    sp=""
+    before=$(sudo sha256sum /etc/passwd /etc/group /etc/shells)
+    sudo rm -rf /run/phonetunnel-nopasswd
+    cleanup_np() {
+        if [ -n "${sp:-}" ]; then
+            sudo kill "$sp" 2>/dev/null || true
+            wait "$sp" 2>/dev/null || true
+        fi
+        if [ -f "$work/dropbear.pid" ]; then
+            sudo kill "$(cat "$work/dropbear.pid")" 2>/dev/null || true
+        fi
+        sudo rm -rf /run/phonetunnel-nopasswd
+        rm -rf "$work"
+    }
+    trap cleanup_np RETURN
+    ssh-keygen -t ed25519 -f "$work/id" -N "" -q
+    qemu-aarch64-static "$MULTI" dropbearkey -t ed25519 -f "$work/hostkey" >"$work/keygen.out"
+    chmod 600 "$work/hostkey" "$work/id"
+    printf '%s\n' 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin' > "$work/passwd"
+    printf '%s\n' 'nobody:x:65534:' > "$work/group"
+    : > "$work/shells"
+    sudo mkdir -p /run/phonetunnel-nopasswd/keys
+    sudo chmod 755 /run/phonetunnel-nopasswd /run/phonetunnel-nopasswd/keys
+    sudo cp "$work/hostkey" /run/phonetunnel-nopasswd/hostkey
+    sudo cp "$work/id.pub" /run/phonetunnel-nopasswd/keys/authorized_keys
+    sudo chmod 600 /run/phonetunnel-nopasswd/hostkey /run/phonetunnel-nopasswd/keys/authorized_keys
+    sudo chown root:root /run/phonetunnel-nopasswd /run/phonetunnel-nopasswd/keys \
+        /run/phonetunnel-nopasswd/hostkey /run/phonetunnel-nopasswd/keys/authorized_keys
+    {
+        echo "drive nopasswd $(date -Is)"
+        sudo unshare --mount --propagation private bash -c "
+set -euo pipefail
+mount --bind '$work/passwd' /etc/passwd
+mount --bind '$work/group' /etc/group
+if [ -e /etc/shells ]; then mount --bind '$work/shells' /etc/shells; fi
+if grep -q '^root:' /etc/passwd; then
+    echo 'root is still in the mounted passwd' >&2
+    exit 1
+fi
+echo \$\$ > '$work/dropbear.pid'
+exec qemu-aarch64-static '$MULTI' dropbear -F \
+    -p '127.0.0.1:$port' \
+    -r /run/phonetunnel-nopasswd/hostkey \
+    -D /run/phonetunnel-nopasswd/keys \
+    -j -k
+" >"$work/dropbear.log" 2>&1 &
+        sp=$!
+        i=0
+        for i in $(seq 1 30); do
+            if tcp_open "$port"; then
+                break
+            fi
+            sleep 0.2
+        done
+        if ! tcp_open "$port"; then
+            echo "dropbear did not listen" >&2
+            cat "$work/dropbear.log" >&2 || true
+            exit 1
+        fi
+        nonce="nopasswd-$(date +%s)-$$"
+        got=$(ssh -i "$work/id" -p "$port" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            root@127.0.0.1 "id -u; printf '%s\n' '$nonce'")
+        echo "root login:"
+        printf '%s\n' "$got"
+        printf '%s\n' "$got" | grep -q '^0$'
+        printf '%s\n' "$got" | grep -q "$nonce"
+        if grep -q 'nonexistent user' "$work/dropbear.log"; then
+            echo "root login was logged as nonexistent" >&2
+            exit 1
+        fi
+        set +e
+        ssh -i "$work/id" -p "$port" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=5 \
+            ghost@127.0.0.1 true >"$work/ghost.out" 2>"$work/ghost.err"
+        grc=$?
+        set -e
+        echo "ghost rc=$grc"
+        cat "$work/ghost.err"
+        [ "$grc" -ne 0 ]
+        grep 'nonexistent user' "$work/dropbear.log"
+        echo "root logged in with no passwd entry; ghost was rejected"
+        echo "nopasswd ok"
+    } | tee "$out"
+    after=$(sudo sha256sum /etc/passwd /etc/group /etc/shells)
+    [ "$before" = "$after" ] || die "host passwd, group, or shells changed"
+    grep -q 'nopasswd ok' "$out"
+}
+
 cmd_drive_all() {
     cmd_drive_tunnel
     cmd_drive_shell
@@ -1370,6 +1588,7 @@ cmd_drive_all() {
     cmd_drive_reconnect
     cmd_drive_supervise
     cmd_drive_watchdog
+    cmd_drive_nopasswd
     cmd_drive_policy
     cmd_drive_account
     assert_system_sshd_untouched
@@ -1443,13 +1662,14 @@ case "${1:-}" in
     drive-adb) cmd_drive_adb ;;
     drive-reconnect) cmd_drive_reconnect ;;
     drive-watchdog) cmd_drive_watchdog ;;
+    drive-nopasswd) cmd_drive_nopasswd ;;
     drive-supervise) cmd_drive_supervise ;;
     drive-policy) cmd_drive_policy ;;
     drive-account) cmd_drive_account ;;
     drive-all) cmd_drive_all ;;
     cleanup) cmd_cleanup ;;
     *)
-        echo "usage: harness.sh doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-supervise|drive-watchdog|drive-policy|drive-account|drive-all|cleanup" >&2
+        echo "usage: harness.sh doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-supervise|drive-watchdog|drive-nopasswd|drive-policy|drive-account|drive-all|cleanup" >&2
         exit 2
         ;;
 esac

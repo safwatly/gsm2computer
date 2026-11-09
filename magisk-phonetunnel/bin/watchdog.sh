@@ -22,25 +22,35 @@ call_verified_idle() {
         log_msg "watchdog: dumpsys missing; not restarting Tailscale"
         return 1
     fi
-    _dump=$(dumpsys telephony.registry 2>&1)
-    _rc=$?
-    if [ "$_rc" -ne 0 ] || [ -z "$_dump" ]; then
+    # The dump is written to a file and grepped there. Holding it in a
+    # shell variable and passing it to printf hits "Argument list too long"
+    # once telephony.registry is a few hundred kilobytes.
+    _idle=0
+    _dumpf="$STATE_DIR/telephony.dump"
+    # mksh exits the script if a redirect cannot create its file.
+    if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+        log_msg "watchdog: cannot store telephony dump; not restarting Tailscale"
+    else
+    : > "$_dumpf"
+    if ! dumpsys telephony.registry >"$_dumpf" 2>&1; then
         log_msg "watchdog: dumpsys telephony.registry unusable; not restarting Tailscale"
-        return 1
-    fi
+    elif ! [ -s "$_dumpf" ]; then
+        log_msg "watchdog: dumpsys telephony.registry unusable; not restarting Tailscale"
     # Any active, off-hook, or ringing value blocks a restart, even when
     # another line says mCallState=0. Word boundaries keep mRingingCallState=0
     # from matching RINGING. A contradictory dump is not idle.
-    if printf '%s\n' "$_dump" | grep -E -q -i \
-        '(^|[^A-Za-z0-9_])(OFFHOOK|RINGING|FG_ACTIVE|BG_ACTIVE|DIALING|ALERTING|INCOMING|WAITING|HOLDING|DISCONNECTING)([^A-Za-z0-9_]|$)|mCallState=[1-9]|mRingingCallState=[1-9]|mForegroundCallState=[1-9]|mBackgroundCallState=[1-9]|PreciseCallState=ACTIVE([^A-Za-z0-9_]|$)'; then
+    elif grep -E -q -i \
+        '(^|[^A-Za-z0-9_])(OFFHOOK|RINGING|FG_ACTIVE|BG_ACTIVE|DIALING|ALERTING|INCOMING|WAITING|HOLDING|DISCONNECTING)([^A-Za-z0-9_]|$)|mCallState=[1-9]|mRingingCallState=[1-9]|mForegroundCallState=[1-9]|mBackgroundCallState=[1-9]|PreciseCallState=ACTIVE([^A-Za-z0-9_]|$)' \
+        "$_dumpf"; then
         log_msg "watchdog: call active or contradictory; not restarting Tailscale"
-        return 1
+    elif grep -E -q 'mCallState=0' "$_dumpf"; then
+        _idle=1
+    else
+        log_msg "watchdog: telephony state is not an explicit idle; not restarting Tailscale"
     fi
-    if printf '%s\n' "$_dump" | grep -E -q 'mCallState=0'; then
-        return 0
     fi
-    log_msg "watchdog: telephony state is not an explicit idle; not restarting Tailscale"
-    return 1
+    rm -f "$_dumpf"
+    [ "$_idle" -eq 1 ]
 }
 
 watchdog_once() {
@@ -53,7 +63,8 @@ watchdog_once() {
         printf '0\n' > "$STATE_DIR/watchdog.streak"
         return 0
     fi
-    _ts=$(tailscale_state)
+    _ts_line=$(tailscale_state)
+    _ts=${_ts_line%% *}
     if [ "$_ts" = up ]; then
         printf '0\n' > "$STATE_DIR/watchdog.streak"
         return 0
@@ -67,7 +78,11 @@ watchdog_once() {
     is_num "$_streak" || _streak=0
     _streak=$((_streak + 1))
     printf '%s\n' "$_streak" > "$STATE_DIR/watchdog.streak"
-    log_msg "watchdog: tailscale0 has no IPv4 (streak $_streak of $TS_DOWN_STREAK)"
+    if [ -n "$TS_IFACE" ]; then
+        log_msg "watchdog: $TS_IFACE has no IPv4 (streak $_streak of $TS_DOWN_STREAK)"
+    else
+        log_msg "watchdog: no tun/tailscale address in 100.64.0.0/10 (streak $_streak of $TS_DOWN_STREAK)"
+    fi
     if [ "$_streak" -lt "$TS_DOWN_STREAK" ]; then
         return 0
     fi

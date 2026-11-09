@@ -9,4 +9,8 @@
 /* The phone has no useful /etc/motd, and reading one is wasted work. */
 #define DO_MOTD 0
 
+/* See patches/android-root-login.patch. Without a passwd entry,
+ * getpwnam("root") fails and the sshd refuses the login. */
+#define DROPBEAR_ANDROID_ROOT 1
+
 #endif
