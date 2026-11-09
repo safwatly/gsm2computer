@@ -14,6 +14,15 @@ object TinymixTrace {
     fun statements(script: String): List<String> =
         script.split(';').map { it.trim() }.filter { it.isNotEmpty() }
 
+    /**
+     * Drop `2>/dev/null` and merge stderr into stdout. A rejected tinymix
+     * write reports the error on stderr; the root shell only keeps stdout.
+     */
+    fun captureCommand(part: String): String {
+        val stripped = part.replace("2>/dev/null", "").trim()
+        return "{ $stripped; } 2>&1"
+    }
+
     fun line(cmd: String, exitCode: Int, output: String): String {
         val out = output.replace('\n', ' ').trim().take(160)
         return "tinymix write exit=$exitCode cmd=$cmd out=$out"
@@ -32,7 +41,7 @@ object TinymixTrace {
         val lines = ArrayList<String>()
         for (part in statements(script)) {
             val raw = try {
-                RootShell.execForOutput("$part; echo $MARKER\$?", timeoutMs)
+                RootShell.execForOutput("${captureCommand(part)}; echo $MARKER\$?", timeoutMs)
             } catch (e: Exception) {
                 "$MARKER-1\n${e.message ?: ""}"
             }

@@ -1813,6 +1813,7 @@ class RtpSession(
         Thread({
             val deadline = System.currentTimeMillis() + 8_000
             var attempts = 0
+            var lastProbeLog = ""
             while (running.get() && System.currentTimeMillis() < deadline && attempts < 2) {
                 val probe = try {
                     RootShell.execForOutput(VoiceTxUnmute.probeScript, 2000)
@@ -1821,11 +1822,13 @@ class RtpSession(
                     ""
                 }
                 val parsed = VoiceTxUnmute.parseProbe(probe)
-                if (parsed.runningUnknown.isNotEmpty()) {
-                    Log.i(TAG, "voice tx unmute: running pcm with no VSID ${parsed.runningUnknown}")
+                val probeLine = VoiceTxUnmute.summary(parsed)
+                if (probeLine != lastProbeLog) {
+                    lastProbeLog = probeLine
+                    Log.i(TAG, probeLine)
+                    listener?.onRtpStats(probeLine)
                 }
                 if (parsed.active.isEmpty()) {
-                    Log.i(TAG, "voice tx unmute: no RUNNING voice pcm yet")
                     try { Thread.sleep(250) } catch (_: InterruptedException) { return@Thread }
                     continue
                 }
@@ -1837,7 +1840,7 @@ class RtpSession(
                 for (session in parsed.active) {
                     val cmd = DeviceProfile.resolveCmd(VoiceTxUnmute.unmuteCommand(session.vsid))
                     val lines = TinymixTrace.run(cmd, timeoutMs = 3000) { listener?.onRtpStats(it) }
-                    val summary = "voice tx unmute session=${session.name} vsid=${session.vsid} " +
+                    val summary = "voice tx unmute session=${session.id} vsid=${session.vsid} " +
                         lines.joinToString(" | ")
                     Log.i(TAG, summary)
                     listener?.onRtpStats(summary)
