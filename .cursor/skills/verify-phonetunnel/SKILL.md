@@ -55,6 +55,7 @@ One feature:
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-reconnect
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-supervise
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-watchdog
+.cursor/skills/verify-phonetunnel/scripts/harness.sh drive-nopasswd
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-policy
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-account
 ```
@@ -81,7 +82,8 @@ Each drive writes a file under `/opt/cursor/artifacts/verify-phonetunnel/`
 | `adb-forward.txt` | `adb_reply=adb-standin-ok` through the cup adb port |
 | `reconnect.txt` | shell works after killing the client, after an iptables drop, and after restarting the stand-in sshd |
 | `supervise.txt` | dropbear restarts under the same tunnel pid; a dead dropbear makes `tunnel=down` while `tunnel_session=up` |
-| `watchdog.txt` | streak restart, rate limit, `mCallState=2`, empty dumpsys, dumpsys error, `mPreciseCallState=FG_ACTIVE`, `ip` error, missing dumpsys, and a bridge package name do not over-restart; an explicit idle plus a missing interface does |
+| `watchdog.txt` | streak restart, rate limit, call states, `ip` error, and a bridge package do not over-restart; `tun1` with a CGNAT address is up; carrier CGNAT alone is down; a dumpsys bigger than 200KB still counts as idle under `mksh` |
+| `nopasswd.txt` | Dropbear accepts `root` when `/etc/passwd` has no root line, and rejects any other missing name |
 | `policy.txt` | zero timers are raised, an earlier Include Match is refused and the config restored, key and Match block the extra `-R`, `-L`, and unix-socket forward, and ForceCommand runs |
 | `account.txt` | real `useradd` in a private mount namespace: a loose Match writes nothing, a failure after the hold script rolls the new user back, a fresh account has shell `/bin/sh`, and a second run reuses the key. Host passwd is unchanged. Uninstall does not kill a reused pid |
 | `phonetunnel.log` | supervisor log copied at the end of `drive-all` |
@@ -153,8 +155,11 @@ the line is idle, after the real cup setup in `docs/PHONETUNNEL.md`.
 - `magisk-phonetunnel/bin/dropbearmulti` runs under
   `qemu-aarch64-static`, not on the Moto CPU and not under Android
   SELinux or Magisk labels.
-- The shell through the tunnel is the harness uid and `/bin/sh`, not
-  `root` and `/system/bin/sh`. A PTY was not established: qemu-user
+- The shell through the tunnel is the harness uid and `/bin/sh`.
+  `drive-nopasswd` logs in as `root` with uid 0 while the mounted
+  passwd has no root line. This VM has no `/system/bin/sh`, so that
+  test uses `/bin/sh`. The phone shell is `/system/bin/sh`. A PTY was
+  not established: qemu-user
   fails `ioctl(TIOCSCTTY)` and `/dev/pts/0`. The key does not set
   `no-pty`. `ssh -t` on the phone is still unchecked.
 - Adb is a Python process that answers `adb-probe` with
