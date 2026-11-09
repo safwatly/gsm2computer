@@ -160,15 +160,52 @@ sign_apk() {
         echo "WARNING: apksigner not found; APK left unsigned (priv-app install will fail)"
         return 0
     fi
-    local KS="${GATEWAY_KEYSTORE:-$HOME/.android/debug.keystore}"
+    local KS ALIAS
+    KS="$(gsm_signing GSM2COMPUTER_STORE_FILE)"
+    if [ -z "$KS" ]; then
+        KS="${GATEWAY_KEYSTORE:-$HOME/.android/debug.keystore}"
+        export GSM2COMPUTER_STORE_PASSWORD=android
+        export GSM2COMPUTER_KEY_PASSWORD=android
+        ALIAS=androiddebugkey
+        echo "Signing with the debug keystore (set GSM2COMPUTER_STORE_FILE for a deployable build)"
+    else
+        export GSM2COMPUTER_STORE_PASSWORD="$(gsm_signing GSM2COMPUTER_STORE_PASSWORD)"
+        export GSM2COMPUTER_KEY_PASSWORD="$(gsm_signing GSM2COMPUTER_KEY_PASSWORD)"
+        ALIAS="$(gsm_signing GSM2COMPUTER_KEY_ALIAS)"
+        ALIAS="${ALIAS:-androiddebugkey}"
+        if [ -z "$GSM2COMPUTER_STORE_PASSWORD" ] || [ -z "$GSM2COMPUTER_KEY_PASSWORD" ]; then
+            echo "ERROR: GSM2COMPUTER_STORE_PASSWORD and GSM2COMPUTER_KEY_PASSWORD are required" >&2
+            echo "Put them in local.properties or the environment. Do not commit them." >&2
+            exit 1
+        fi
+        echo "Signing with $KS alias $ALIAS"
+    fi
     if [ ! -f "$KS" ]; then
         echo "WARNING: keystore not found at $KS; APK left unsigned"
         return 0
     fi
     echo "Signing APK with $APKSIGNER ..."
-    "$APKSIGNER" sign --ks "$KS" --ks-pass pass:android \
-        --key-pass pass:android --ks-key-alias androiddebugkey "$APK" \
+    "$APKSIGNER" sign --ks "$KS" \
+        --ks-pass env:GSM2COMPUTER_STORE_PASSWORD \
+        --key-pass env:GSM2COMPUTER_KEY_PASSWORD \
+        --ks-key-alias "$ALIAS" "$APK" \
         && echo "APK signed" || echo "WARNING: APK signing failed"
+}
+
+# Env wins over gitignored local.properties. Prints the value only.
+gsm_signing() {
+    local key="$1"
+    local value="${!key:-}"
+    if [ -n "$value" ]; then
+        printf '%s' "$value"
+        return 0
+    fi
+    local file="$SCRIPT_DIR/local.properties"
+    if [ -f "$file" ]; then
+        local line
+        line="$(grep -m1 "^${key}=" "$file" || true)"
+        printf '%s' "${line#*=}"
+    fi
 }
 
 # ── Build Magisk module ─────────────────────────────

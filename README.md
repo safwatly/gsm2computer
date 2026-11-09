@@ -53,6 +53,17 @@ sudo ./setup.sh          # once: JDK + Android SDK
 ./deploy.sh --reboot     # first install (Magisk module + priv-app)
 ```
 
+Build 345 on the phone has to be signed with the same upload keystore as build 344 (`signing/gsm2computer-upload.keystore`, alias `androiddebugkey`). That file and its password stay off the repo. Put them in gitignored `local.properties` or the environment, then `./build.sh release`. With `GSM2COMPUTER_STORE_FILE` unset, the release build uses `~/.android/debug.keystore` (password `android`) so CI can still assemble.
+
+```properties
+GSM2COMPUTER_STORE_FILE=signing/gsm2computer-upload.keystore
+GSM2COMPUTER_STORE_PASSWORD=...
+GSM2COMPUTER_KEY_PASSWORD=...
+GSM2COMPUTER_KEY_ALIAS=androiddebugkey
+```
+
+The path is relative to the repo root. `GSM2COMPUTER_KEY_ALIAS` defaults to `androiddebugkey`. An update signed with the debug key will not install over the phone's copy.
+
 Configure the hub URL on-device or via adb (defaults to the Tailscale hub):
 
 ```bash

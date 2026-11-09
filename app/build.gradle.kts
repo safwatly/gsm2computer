@@ -1,8 +1,24 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jlleitschuh.gradle.ktlint")
     id("io.gitlab.arturbosch.detekt")
+}
+
+// Release signing. Env wins over gitignored local.properties. When
+// GSM2COMPUTER_STORE_FILE is unset, the public debug keystore is used so CI
+// stays unchanged. The upload keystore and its password stay off the repo.
+val gsmSigningProps = Properties().apply {
+    val local = rootProject.file("local.properties")
+    if (local.isFile) local.inputStream().use { load(it) }
+}
+
+fun gsmSigning(name: String): String {
+    val fromEnv = System.getenv(name)?.trim().orEmpty()
+    if (fromEnv.isNotEmpty()) return fromEnv
+    return gsmSigningProps.getProperty(name)?.trim().orEmpty()
 }
 
 ktlint {
@@ -43,10 +59,27 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+            val storePath = gsmSigning("GSM2COMPUTER_STORE_FILE")
+            if (storePath.isEmpty()) {
+                storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            } else {
+                val storePasswordValue = gsmSigning("GSM2COMPUTER_STORE_PASSWORD")
+                val keyPasswordValue = gsmSigning("GSM2COMPUTER_KEY_PASSWORD")
+                if (storePasswordValue.isEmpty() || keyPasswordValue.isEmpty()) {
+                    error(
+                        "GSM2COMPUTER_STORE_PASSWORD and GSM2COMPUTER_KEY_PASSWORD are required " +
+                            "when GSM2COMPUTER_STORE_FILE is set. Put them in local.properties " +
+                            "(gitignored) or the environment. Do not commit them.",
+                    )
+                }
+                storeFile = rootProject.file(storePath)
+                storePassword = storePasswordValue
+                keyAlias = gsmSigning("GSM2COMPUTER_KEY_ALIAS").ifEmpty { "androiddebugkey" }
+                keyPassword = keyPasswordValue
+            }
         }
     }
 
