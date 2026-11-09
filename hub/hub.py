@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import audioop
 import base64
 import hashlib
@@ -120,6 +121,7 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 current_mode: Optional[str] = None
 WS_SEND_TIMEOUT_S = float(os.environ.get("GSM2COMPUTER_WS_SEND_TIMEOUT_S", "5"))
 WS_PING_SKIP_BACKLOG_BYTES = 256 * 1024
+DOWNLINK_MAX_AGE_S = float(os.environ.get("GSM2COMPUTER_WS_DOWNLINK_MAX_AGE_S", "1.2") or 1.2)
 SUPERSEDED_REASON = "superseded by Pixel reconnect"
 RECONNECT_TAKEOVER_WAIT_S = float(os.environ.get("GSM2COMPUTER_RECONNECT_TAKEOVER_WAIT_S", "8"))
 active_bridge: Optional["PipewireBridge"] = None
@@ -325,8 +327,23 @@ async def ws_read_frame(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         return WsRead(text="", pong=True)
     if opcode == 0x1:
         return WsRead(text=payload.decode("utf-8", errors="replace"))
+    if opcode == 0x2:
+        return WsRead(binary=payload)
     return WsRead(text="")
 
+
+
+def parse_uplink_binary(payload: bytes) -> Optional[Tuple[bytes, str, int]]:
+    """G2 v1 uplink frame from phone builds >=331: 'G2', ver 1, fmt 1 (s16le mono), rate u16 BE, 2 reserved, pcm."""
+    if len(payload) < 8 or payload[0:2] != b"G2" or payload[2] != 1 or payload[3] != 1:
+        return None
+    rate = int.from_bytes(payload[4:6], "big")
+    pcm = payload[8:]
+    if rate <= 0 or len(pcm) < 2:
+        return None
+    if len(pcm) & 1:
+        pcm = pcm[:-1]
+    return pcm, "audio/pcm", rate
 
 async def ws_send_close(writer: asyncio.StreamWriter, code: int, reason: str) -> None:
     payload = code.to_bytes(2, "big") + reason.encode("utf-8")[:120]
@@ -555,6 +572,11 @@ class PipewireBridge:
         self._in_src_rate = DEFAULT_CLIENT_RATE
         self._out_dst_rate = DEFAULT_CLIENT_RATE
         self.downlink_guard = DownlinkSendGuard()
+        self._dl_q = collections.deque()
+        self.dl_seq = 0
+        self.dl_sent = 0
+        self.dl_dropped_oldest = 0
+        self.dl_max_age_s = 0.0
         self._stall_logged_recovery = True
         self._out_writer: Optional[asyncio.StreamWriter] = None
         # Caller audio is queued here and written to pw-cat on a side task.
@@ -740,6 +762,11 @@ class PipewireBridge:
         except Exception:
             snap = {}
         snap["uplink_dropped_frames"] = self.uplink_dropped
+        snap["dl_seq"] = getattr(self, "dl_seq", 0)
+        snap["dl_sent"] = getattr(self, "dl_sent", 0)
+        snap["dl_dropped_oldest"] = getattr(self, "dl_dropped_oldest", 0)
+        snap["dl_queued"] = len(getattr(self, "_dl_q", ()))
+        snap["dl_max_age_s"] = round(getattr(self, "dl_max_age_s", 0.0), 2)
         q = self._uplink_q
         snap["uplink_queued"] = q.qsize() if q is not None else 0
         return snap
@@ -824,25 +851,44 @@ class PipewireBridge:
                 LOG.error("%s; aborting call %s", dead, guard.snapshot())
                 self._signal_abort(dead)
                 break
-            frame = ws_encode_text(json.dumps(event))
-            if not guard.admit(len(frame)):
-                if guard.drop_run == 1 or guard.drop_run % 250 == 0:
-                    LOG.warning(
-                        "downlink backlog: dropping stale frames (keeping call) %s",
-                        guard.snapshot(),
-                    )
+            # 338: keep a bounded app-side queue and drop the OLDEST frames
+            # (latency cap DOWNLINK_MAX_AGE_S) instead of refusing new ones.
+            self.dl_seq += 1
+            event["seq"] = self.dl_seq
+            now = time.monotonic()
+            q = self._dl_q
+            q.append((now, ws_encode_text(json.dumps(event))))
+            while q and now - q[0][0] > DOWNLINK_MAX_AGE_S:
+                q.popleft()
+                self.dl_dropped_oldest += 1
+                guard.dropped_frames += 1
+                if self.dl_dropped_oldest == 1 or self.dl_dropped_oldest % 250 == 0:
+                    LOG.warning("downlink backlog: dropped oldest frames %s", self.downlink_snapshot())
+            broken = False
+            while q:
+                frame = q[0][1]
+                if not guard.admit(len(frame)):
+                    guard.dropped_frames -= 1
+                    guard.drop_run = 0
+                    break
+                ts, _ = q.popleft()
+                self.dl_max_age_s = max(self.dl_max_age_s, now - ts)
+                try:
+                    ws_writer.write(frame)
+                    self.dl_sent += 1
+                except (ConnectionError, BrokenPipeError, RuntimeError):
+                    if self._out_writer is ws_writer:
+                        self._out_writer = None
+                    broken = True
+                    break
+            if broken:
                 continue
             if guard.stall_started_at is None and guard.max_stall_s >= 1.0 and not self._stall_logged_recovery:
                 self._stall_logged_recovery = True
                 LOG.info("downlink recovered after stall %s", guard.snapshot())
             elif guard.stall_started_at is not None:
                 self._stall_logged_recovery = False
-            try:
-                ws_writer.write(frame)
-            except (ConnectionError, BrokenPipeError, RuntimeError):
-                if self._out_writer is ws_writer:
-                    self._out_writer = None
-                continue
+        LOG.info("downlink call counters %s", self.downlink_snapshot())
         if self._record.returncode is None:
             await self._record.wait()
 
@@ -1961,6 +2007,18 @@ async def handle_websocket(
                 continue
             msg = frame.text
             live_call.note_ws_activity()
+            if frame.binary:
+                parsed = parse_uplink_binary(frame.binary)
+                if parsed is None and bridge.client_in_format == "audio/pcm" and len(frame.binary) >= 2:
+                    raw = frame.binary[: len(frame.binary) & ~1]
+                    parsed = (raw, "audio/pcm", bridge.client_in_rate) if raw else None
+                if parsed is not None:
+                    audio, fmt, rate = parsed
+                    live_call.note_uplink()
+                    bridge.offer_uplink(audio, fmt, rate)
+                    if not loopback and OPENCLAW_TALK_MODE == "relay" and openclaw_bridge is not None:
+                        openclaw_bridge.feed_gsm_ulaw(bridge.to_ulaw_8k(audio, fmt, rate))
+                continue
             if not msg:
                 continue
             try:

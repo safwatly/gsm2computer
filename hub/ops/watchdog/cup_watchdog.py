@@ -255,6 +255,8 @@ def make_unit_check(unit: str):
 
 
 def check_pixel_ping(ctx: Ctx):
+    if os.environ.get("CUP_WATCHDOG_MUTE_PIXEL", "") not in ("", "0"):
+        return True, "muted (Pixel retired, CUP_WATCHDOG_MUTE_PIXEL=1)"
     last = ""
     for i in range(3):
         rc, out = run(["tailscale", "ping", "--tsmp", "--c", "1", "--timeout", "5s", PIXEL_IP], 12)
