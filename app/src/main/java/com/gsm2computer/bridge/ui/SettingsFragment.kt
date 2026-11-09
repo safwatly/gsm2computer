@@ -149,6 +149,8 @@ class SettingsFragment : Fragment() {
         val cfg = BridgeConfig.resolve(prefs)
         val view = layoutInflater.inflate(R.layout.dialog_config, null)
 
+        val etEndpoints = view.findViewById<EditText>(R.id.etHubEndpoints)
+        val etDeviceToken = view.findViewById<EditText>(R.id.etDeviceToken)
         val etHubUrl = view.findViewById<EditText>(R.id.etHubControlUrl)
         val etTokenUrl = view.findViewById<EditText>(R.id.etStreamTokenUrl)
         val etModel = view.findViewById<EditText>(R.id.etStreamModel)
@@ -163,6 +165,7 @@ class SettingsFragment : Fragment() {
             etVoice.visibility = vis
         }
         etHubUrl.doAfterTextChanged { updateOpenAiVisibility() }
+        etEndpoints.setText(cfg.endpoints.joinToString("\n") { it.url })
         etHubUrl.setText(cfg.hubControlUrl)
         etTokenUrl.setText(cfg.streamTokenUrl)
         openHubField = etHubUrl
@@ -182,6 +185,8 @@ class SettingsFragment : Fragment() {
             .setTitle("Hub configuration")
             .setView(view)
             .setPositiveButton("Save") { _, _ ->
+                val endpointText = etEndpoints.text.toString().trim()
+                val deviceToken = etDeviceToken.text.toString().trim()
                 val hubUrl = etHubUrl.text.toString().trim()
                 val tokenUrl = etTokenUrl.text.toString().trim()
                 val model = etModel.text.toString().trim()
@@ -198,6 +203,7 @@ class SettingsFragment : Fragment() {
                         HubControlUrl.tokenFollowsHub(previous, tokenUrl) &&
                         HubControlUrl.normalize(previous) != normalized
                     val editor = prefs.edit()
+                        .putString(BridgeConfig.KEY_HUB_ENDPOINTS, endpointText)
                         .putString(BridgeConfig.KEY_HUB_CONTROL_URL, normalized ?: hubUrl)
                         .putString(BridgeConfig.KEY_STREAM_MODEL, model)
                         .putString(BridgeConfig.KEY_STREAM_VOICE, voice)
@@ -208,6 +214,9 @@ class SettingsFragment : Fragment() {
                         )
                     if (dropDerivedToken) editor.remove(BridgeConfig.KEY_STREAM_TOKEN_URL)
                     else editor.putString(BridgeConfig.KEY_STREAM_TOKEN_URL, tokenUrl)
+                    if (deviceToken.isNotEmpty()) {
+                        editor.putString(BridgeConfig.KEY_DEVICE_TOKEN, deviceToken)
+                    }
                     if (normalized != null) {
                         editor.putString(BridgeConfig.KEY_HUB_URL_DROP, normalized)
                     } else {

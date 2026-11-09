@@ -1,10 +1,11 @@
 ---
 name: verify-gsm2computer
 description: >-
-  Verify the gsm2computer hub: public and Tailscale phone entrances, the
-  shared device-token check, call.path on /health and call reports, loopback
-  audio, SMS outbox, and the cup nftables ruleset. Use before declaring hub,
-  portal, SMS, entrance, or firewall work done.
+  Verify the gsm2computer hub and the bridge's ordered hub walk: public and
+  Tailscale phone entrances, the shared device-token check, call.path on
+  /health and call reports, loopback audio, SMS outbox, and the cup nftables
+  ruleset. Use before declaring hub, portal, SMS, entrance, bridge-path, or
+  firewall work done.
 ---
 
 # Verify gsm2computer
@@ -45,11 +46,18 @@ Firewall table, still not installed on the host:
 .cursor/skills/verify-gsm2computer/scripts/check-firewall.sh
 ```
 
-Feature map: [features/README.md](features/README.md).
+Bridge connection routine, one call on each entrance (and a failover and a relink). This starts its own hub on ports 18987 and 18990. CI runs the same script after the unit tests and fails unless both entrances pass:
+
+```bash
+.cursor/skills/verify-gsm2computer/scripts/drive-bridge-paths.sh
+```
+
+Feature map: [features/README.md](features/README.md). How to read which path a call used: [features/bridge-paths.md](features/bridge-paths.md).
 
 ## Evidence
 
 `drive-entrances.py` writes `/opt/cursor/artifacts/verify-gsm2computer/entrances.json`.
+`drive-bridge-paths.sh` writes `/opt/cursor/artifacts/verify-gsm2computer/bridge-paths.json`.
 `check-firewall.sh` writes `/opt/cursor/artifacts/verify-gsm2computer/firewall.txt`.
 Hub logs stay in `/tmp/gsm2computer-verify/hub.log`. Override the directory with `GSM2COMPUTER_VERIFY_EVIDENCE`.
 
@@ -70,6 +78,7 @@ Kills the hub, Caddy, WirePlumber, and PipeWire pids recorded under the state di
 | Launch | `.cursor/skills/verify-gsm2computer/scripts/launch-hub.sh` |
 | Doctor | `.cursor/skills/verify-gsm2computer/scripts/doctor.sh` |
 | Drive entrances | `python3 .cursor/skills/verify-gsm2computer/scripts/drive-entrances.py` |
+| Drive bridge paths | `.cursor/skills/verify-gsm2computer/scripts/drive-bridge-paths.sh` |
 | Firewall | `.cursor/skills/verify-gsm2computer/scripts/check-firewall.sh` |
 | Teardown | `.cursor/skills/verify-gsm2computer/scripts/teardown.sh` |
 
@@ -83,6 +92,6 @@ A passing run on this VM does not show:
 - a rollback timer via `systemd-run` (the netns test uses sleep mode)
 - GSM audio, OpenClaw Talk, or the rooted phone
 - WirePlumber as cup runs it (this VM has no systemd-logind, so the launcher disables the logind plugin; without that, WirePlumber exits and `pw-cat --target` never links)
-- the phone sending `X-Gsm-Device-Token` (the client here is Python)
+- the physical phone. `drive-bridge-paths.sh` runs the bridge's `HubConnectionRoutine` and `HubCallDialer` on this VM against loopback sockets. It does not install an APK or place a GSM call.
 
 Cup deploy and rollback: [docs/CUP_PUBLIC_ENTRANCE.md](../../../docs/CUP_PUBLIC_ENTRANCE.md).

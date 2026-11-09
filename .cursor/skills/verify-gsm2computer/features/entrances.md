@@ -14,7 +14,7 @@
 
 ## How to get to it (user POV)
 
-The bridge opens `wss://gsm.ta3leam.com/` (after deploy) or `ws://<tailscale-host>:8787/`. The operator curls `/health`. During a call, `call.path` says which entrance the socket used.
+The bridge walks one ordered list, public then Tailscale, on every connect and every mid-call reconnect. The dial of one endpoint is `POST /token` then the WebSocket, with `X-Gsm-Device-Token` and, once `session.updated` has arrived, `X-Gsm-Call-Session`. The operator curls `/health`. During a call, `call.path` and `call.entrance` say which entrance the socket used. The bridge call log stores the same endpoint URL, the entrance from `session.updated`, and the session id.
 
 ## Driving it with this skill
 

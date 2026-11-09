@@ -171,20 +171,37 @@ class GatewayService : Service() {
                     val number = currentCallNumber
                     val incoming = currentCallIncoming
                     val startedAt = currentCallStart
+                    val link = orch.lastLink()
                     CallLogStore.addEntry(
                         this@GatewayService,
                         CallLogEntry(
                             direction = if (incoming) "IN" else "OUT",
                             number = number,
                             timestamp = startedAt,
-                            durationSec = dur
+                            durationSec = dur,
+                            endpoint = link.endpointUrl,
+                            entrance = link.entrance,
+                            sessionId = link.sessionId,
                         )
+                    )
+                    appendLog(
+                        this@GatewayService,
+                        "call path endpoint=${link.endpointUrl.ifBlank { "-" }} " +
+                            "entrance=${link.entrance.ifBlank { "-" }} " +
+                            "session=${link.sessionId.ifBlank { "-" }}",
                     )
                     currentCallStart = 0L
                     currentCallNumber = ""
                     thread(name = "Call-Upload") {
                         Thread.sleep(1_000)
-                        CallLogUploader.post(this@GatewayService, incoming, number, startedAt, dur)
+                        CallLogUploader.post(
+                            this@GatewayService,
+                            incoming,
+                            number,
+                            startedAt,
+                            dur,
+                            link.sessionId,
+                        )
                     }
                 }
 

@@ -2,17 +2,18 @@ package com.gsm2computer.bridge.realtime
 
 import android.util.Base64
 import android.util.Log
-import com.gsm2computer.bridge.HubEndpoints
+import com.gsm2computer.bridge.DialRequest
+import com.gsm2computer.bridge.DialResponse
+import com.gsm2computer.bridge.DialStatus
+import com.gsm2computer.bridge.HubConnectionRoutine
+import com.gsm2computer.bridge.HubEndpoint
+import com.gsm2computer.bridge.HubLink
 import com.gsm2computer.bridge.diag.BridgeLog
 import com.gsm2computer.bridge.diag.HubLinkGrace
 import com.gsm2computer.bridge.rtp.MediaTransport
 import okhttp3.OkHttpClient
-import okio.ByteString.Companion.toByteString
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
 import okhttp3.WebSocket
-import okhttp3.WebSocketListener
+import okio.ByteString.Companion.toByteString
 import org.json.JSONObject
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -27,14 +28,15 @@ import java.util.concurrent.atomic.AtomicReference
  * the GSM call itself ended. Close code 1000 is a real hangup and is not
  * retried. Silence is what the caller hears during the gap.
  *
- * Custom hub: token from `{hub}/token`, WebSocket upgrade on the same host.
- * Uplink is 16 kHz s16le in a binary frame ([UplinkWire]). Downlink stays
- * the JSON PCM the hub already sends. Appends without format/rate stay
- * 8 kHz μ-law so the browser simulator keeps working.
+ * Each connect and each reconnect walks [endpoints] with [HubConnectionRoutine].
+ * The first that opens is held until the socket dies. Uplink stays 16 kHz
+ * s16le in a binary frame ([UplinkWire]). Downlink stays the JSON PCM the hub
+ * already sends. Appends without format/rate stay 8 kHz μ-law.
  */
 class HubStreamClient(
+    private val endpoints: List<HubEndpoint> = emptyList(),
     private val tokenUrl: String,
-    private val webSocketUrl: String,
+    private val webSocketUrl: String = "",
     private val model: String,
     private val voice: String,
     private val instructions: String,
@@ -71,6 +73,11 @@ class HubStreamClient(
 
     @Volatile var sessionId: String = ""
         private set
+
+    @Volatile private var linkEndpoint: String = ""
+    @Volatile private var linkEntrance: String = ""
+
+    override fun currentLink(): HubLink = HubLink(linkEndpoint, linkEntrance, sessionId)
 
     // Model actually used for the WS connect — the one the token was minted for
     // (returned by /token), which may differ from the configured default. The
@@ -156,21 +163,17 @@ class HubStreamClient(
      */
     private fun openAndHold(): String? {
         linkState = "connecting"
-        val token = try {
-            fetchEphemeralToken()
-        } catch (e: Exception) {
-            val msg = "token fetch failed: ${e.message}"
-            trace("ws_failure", mapOf("code" to -1, "message" to msg))
-            return msg
-        }
         if (closed) return null
-        Log.i(TAG, "Minted ephemeral token ${token.take(8)}…, opening WS (model=$connectModel voice=$voice hubOwned=$hubOwnedSession session=$sessionId)")
+        val targets = endpoints.ifEmpty {
+            listOf(HubEndpoint(webSocketUrl))
+        }.filter { it.url.isNotBlank() }
 
         val opened = AtomicBoolean(false)
         val cleanClose = AtomicBoolean(false)
         val finished = AtomicBoolean(false)
         val failure = AtomicReference<String?>(null)
         val done = CountDownLatch(1)
+        val socketRef = AtomicReference<WebSocket?>(null)
 
         fun finish(message: String?, clean: Boolean) {
             if (!finished.compareAndSet(false, true)) return
@@ -179,29 +182,30 @@ class HubStreamClient(
             done.countDown()
         }
 
-        val url = HubEndpoints.connectUrl(webSocketUrl, connectModel, hubOwnedSession)
-        val builder = Request.Builder()
-            .url(url)
-            .addHeader("Authorization", "Bearer $token")
-        if (sessionId.isNotBlank()) {
-            builder.addHeader("X-Gsm-Call-Session", sessionId)
-        }
-
-        val socket = http.newWebSocket(builder.build(), object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
+        val live = object : HubCallDialer.Live {
+            override fun onOpen(webSocket: WebSocket, request: DialRequest) {
                 opened.set(true)
                 reconnectArmed.set(false)
                 ws = webSocket
+                socketRef.set(webSocket)
+                linkEndpoint = request.endpoint.url
+                linkEntrance = ""
                 linkState = "open"
                 openedAtMs = System.currentTimeMillis()
                 grace.markLinked()
                 sink?.onLinkHold(false, "hub ws open")
-                trace("ws_open", mapOf("session_id" to sessionId, "http" to response.code))
-                BridgeLog.i("ws open http=${response.code} session=${sessionId.ifBlank { "-" }}")
-                if (hubOwnedSession) {
+                trace(
+                    "ws_open",
+                    mapOf("session_id" to sessionId, "endpoint" to request.endpoint.url),
+                )
+                BridgeLog.i(
+                    "ws open endpoint=${request.endpoint.url} session=${sessionId.ifBlank { "-" }}",
+                )
+                val openAi = request.endpoint.url.startsWith("wss://api.openai.com")
+                if (hubOwnedSession && !openAi) {
                     Log.i(TAG, "WS OPEN — hub owns session (skip session.update / greeting)")
                     sendClientAudio(webSocket)
-                    sink?.onStatus("Hub WS connected")
+                    sink?.onStatus("Hub WS connected ${request.endpoint.url}")
                 } else {
                     Log.i(TAG, "WS OPEN — sending session.update")
                     sink?.onStatus("OpenAI WS connected ($voice)")
@@ -213,46 +217,48 @@ class HubStreamClient(
                 handleEvent(text, sink)
             }
 
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            override fun onDead(webSocket: WebSocket, code: Int, detail: String) {
                 if (webSocket !== ws && opened.get()) return
-                val code = response?.code ?: -1
-                val msg = "Hub WS failure (code=$code): ${t.message}"
-                Log.e(TAG, "WS failure code=$code: ${t.message}")
-                BridgeLog.e(
-                    "ws failure code=$code ex=${t.javaClass.simpleName} " +
-                        "msg=${t.message?.take(160) ?: ""}",
-                )
                 if (closed) {
                     finish(null, false)
                     return
                 }
-                trace(
-                    "ws_failure",
-                    mapOf(
-                        "code" to code,
-                        "message" to (t.message ?: ""),
-                        "exception" to t.javaClass.simpleName,
-                    ),
-                )
-                finish(msg, false)
-            }
-
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                Log.i(TAG, "WS CLOSED code=$code reason=$reason")
-                BridgeLog.i("ws closed code=$code reason=${reason.take(120)}")
-                if (closed) {
-                    finish(null, false)
-                    return
-                }
-                trace("ws_closed", mapOf("code" to code, "reason" to reason, "local" to false))
                 if (code == 1000) {
-                    finish("$FATAL_PREFIX Hub WS closed ($code $reason)", true)
+                    BridgeLog.i("ws closed code=$code reason=${detail.take(120)}")
+                    trace("ws_closed", mapOf("code" to code, "reason" to detail, "local" to false))
+                    finish("$FATAL_PREFIX Hub WS closed ($code $detail)", true)
+                } else if (code <= 0) {
+                    val msg = "Hub WS failure (code=$code): $detail"
+                    Log.e(TAG, msg)
+                    BridgeLog.e("ws failure code=$code msg=${detail.take(160)}")
+                    trace("ws_failure", mapOf("code" to code, "message" to detail))
+                    finish(msg, false)
                 } else {
-                    finish("Hub WS closed ($code $reason)", false)
+                    BridgeLog.i("ws closed code=$code reason=${detail.take(120)}")
+                    trace("ws_closed", mapOf("code" to code, "reason" to detail, "local" to false))
+                    finish("Hub WS closed ($code $detail)", false)
                 }
             }
-        })
-        ws = socket
+        }
+
+        val dialer = HubCallDialer(
+            http = http,
+            hubOwned = hubOwnedSession,
+            openAiTokenUrl = tokenUrl,
+            model = connectModel,
+        )
+        val routine = HubConnectionRoutine(targets) { request ->
+            if (closed) DialResponse(DialStatus.STOP, 0, "stopped") else dialer.dial(request, live)
+        }
+        val result = routine.connect(sessionId, maxPasses = 1) { !closed }
+        BridgeLog.i("connect ${result.summary()}")
+        if (!result.opened) {
+            if (closed || result.cancelled) return null
+            trace("ws_failure", mapOf("code" to -1, "message" to result.detail))
+            return result.detail.ifBlank { "hub connect failed" }
+        }
+        connectModel = dialer.mintedModel()
+        val socket = socketRef.get() ?: ws
 
         while (!closed) {
             try {
@@ -262,7 +268,7 @@ class HubStreamClient(
             }
             if (closed) {
                 try {
-                    socket.close(1000, "call ended")
+                    socket?.close(1000, "call ended")
                 } catch (_: Exception) {
                 }
                 return null
@@ -272,7 +278,7 @@ class HubStreamClient(
         linkState = "hold"
         ws = null
         try {
-            socket.cancel()
+            socket?.cancel()
         } catch (_: Exception) {
         }
         if (cleanClose.get()) {
@@ -381,23 +387,6 @@ class HubStreamClient(
         }
     }
 
-    /** POST /token → { value: "ek_...", model: "...", ... }. */
-    private fun fetchEphemeralToken(): String {
-        val req = Request.Builder()
-            .url(tokenUrl)
-            .post(ByteArray(0).toRequestBody(null))
-            .build()
-        http.newCall(req).execute().use { resp ->
-            val body = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) throw RuntimeException("HTTP ${resp.code}: ${body.take(200)}")
-            val json = JSONObject(body)
-            val value = json.optString("value")
-            if (value.isBlank()) throw RuntimeException("no token in response: ${body.take(200)}")
-            json.optString("model").takeIf { it.isNotBlank() }?.let { connectModel = it }
-            return value
-        }
-    }
-
     private fun handleEvent(text: String, sink: MediaTransport.Sink?) {
         if (sink == null) return
         val json = try {
@@ -421,9 +410,16 @@ class HubStreamClient(
             }
             "input_audio_buffer.speech_started" -> sink.onFlushPlayback()
             "session.updated" -> {
-                val id = json.optJSONObject("session")?.optString("id").orEmpty()
+                val session = json.optJSONObject("session")
+                val id = session?.optString("id").orEmpty()
                 if (id.isNotBlank()) sessionId = id
-                Log.i(TAG, "session.updated id=$sessionId — wire $inputFormat/$inputRate in, $outputFormat/$outputRate out")
+                val entrance = session?.optString("entrance").orEmpty()
+                if (entrance.isNotBlank()) linkEntrance = entrance
+                Log.i(
+                    TAG,
+                    "session.updated id=$sessionId entrance=${linkEntrance.ifBlank { "-" }} " +
+                        "— wire $inputFormat/$inputRate in, $outputFormat/$outputRate out",
+                )
                 sink.onStatus("Hub session ready")
                 sendClientAudio(ws)
                 if (!hubOwnedSession) {

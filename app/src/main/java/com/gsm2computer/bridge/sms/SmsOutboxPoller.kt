@@ -6,6 +6,7 @@ import android.telephony.SmsManager
 import android.util.Log
 import com.gsm2computer.bridge.BridgeConfig
 import com.gsm2computer.bridge.HubEndpoints
+import com.gsm2computer.bridge.HubHttpWalk
 import com.gsm2computer.bridge.service.GatewayService
 import com.gsm2computer.bridge.util.RedactingLogger
 import okhttp3.MediaType.Companion.toMediaType
@@ -39,30 +40,26 @@ object SmsOutboxPoller {
     }
 
     private fun pollOnceLocked(context: Context) {
-        val hub = BridgeConfig.resolveHubControlUrl(BridgeConfig.openPrefs(context))
-        val url = HubEndpoints.smsOutboxUrl(hub)
-        if (url.isEmpty()) return
+        val endpoints = BridgeConfig.resolveEndpoints(BridgeConfig.openPrefs(context))
+        if (endpoints.isEmpty()) return
         if (context.checkSelfPermission(android.Manifest.permission.SEND_SMS)
             != PackageManager.PERMISSION_GRANTED
         ) {
             Log.w(TAG, "SEND_SMS not granted — skip outbox poll")
             return
         }
-        val req = Request.Builder().url(url).get().build()
-        val items: JSONArray
-        try {
-            http.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    Log.w(TAG, "outbox GET HTTP ${resp.code}")
-                    return
-                }
-                val root = JSONObject(resp.body?.string().orEmpty().ifBlank { "{}" })
-                items = root.optJSONArray("items") ?: JSONArray()
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "outbox GET failed: ${e.message}")
+        val result = HubHttpWalk(http).run(endpoints) { endpoint ->
+            Request.Builder()
+                .url(HubEndpoints.smsOutboxUrl(HubEndpoints.httpOrigin(endpoint.url)))
+                .get()
+                .build()
+        }
+        if (!result.opened) {
+            Log.w(TAG, "outbox GET HTTP ${result.code} ${result.detail.take(120)}")
             return
         }
+        val hub = HubEndpoints.httpOrigin(result.url)
+        val items = JSONObject(result.body.ifBlank { "{}" }).optJSONArray("items") ?: JSONArray()
         for (i in 0 until items.length()) {
             val item = items.optJSONObject(i) ?: continue
             val id = item.optString("id")

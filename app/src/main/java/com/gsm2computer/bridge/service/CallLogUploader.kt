@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.gsm2computer.bridge.BridgeConfig
 import com.gsm2computer.bridge.HubEndpoints
+import com.gsm2computer.bridge.HubHttpWalk
 import com.gsm2computer.bridge.util.RedactingLogger
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -33,32 +34,31 @@ object CallLogUploader {
         number: String,
         startedAtMs: Long,
         durationSec: Long,
+        sessionId: String = "",
     ) {
-        val hub = BridgeConfig.resolveHubControlUrl(BridgeConfig.openPrefs(context))
-        val url = HubEndpoints.callsUrl(hub)
-        if (url.isEmpty()) return
+        val endpoints = BridgeConfig.resolveEndpoints(BridgeConfig.openPrefs(context))
+        if (endpoints.isEmpty()) return
         val payload = HubEndpoints.callJson(
             direction = if (incoming) "in" else "out",
             number = number,
             startedAt = Instant.ofEpochMilli(startedAtMs).toString(),
             durationSec = durationSec,
+            sessionId = sessionId,
         )
-        val req = Request.Builder()
-            .url(url)
-            .post(payload.toRequestBody(JSON))
-            .build()
-        try {
-            http.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    RedactingLogger.i(TAG, "call record posted $number")
-                    GatewayService.appendLog(context, "Call record uploaded")
-                } else {
-                    val snippet = resp.body?.string().orEmpty().take(160)
-                    Log.w(TAG, "call record HTTP ${resp.code} $snippet")
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "call record failed: ${e.message}")
+        val result = HubHttpWalk(http).run(endpoints, sessionId) { endpoint ->
+            Request.Builder()
+                .url(HubEndpoints.callsUrl(HubEndpoints.httpOrigin(endpoint.url)))
+                .post(payload.toRequestBody(JSON))
+                .build()
+        }
+        if (result.opened) {
+            RedactingLogger.i(TAG, "call record posted $number via ${result.url}")
+            GatewayService.appendLog(
+                context,
+                "Call record uploaded via ${result.url} session=${sessionId.ifBlank { "-" }}",
+            )
+        } else {
+            Log.w(TAG, "call record failed HTTP ${result.code} ${result.detail.take(160)}")
         }
     }
 }

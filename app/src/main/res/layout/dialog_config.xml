@@ -8,7 +8,41 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Hub control URL (token, SMS, WebSocket on this host)"
+        android:text="Hub endpoints, one per line. First that answers is used. Blank uses the public entrance, then Tailscale."
+        android:textSize="12sp"
+        android:paddingBottom="4dp" />
+
+    <EditText
+        android:id="@+id/etHubEndpoints"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="top"
+        android:hint="wss://gsm.ta3leam.com/&#10;ws://100.113.222.47:8787/"
+        android:inputType="textMultiLine|textUri"
+        android:minLines="2"
+        android:importantForAutofill="no" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="Device token (X-Gsm-Device-Token). Leave blank to keep the saved token."
+        android:textSize="12sp"
+        android:paddingBottom="4dp" />
+
+    <EditText
+        android:id="@+id/etDeviceToken"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="unchanged if blank"
+        android:inputType="textPassword"
+        android:importantForAutofill="no" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="Hub control URL (legacy single host; also written from the first endpoint)"
         android:textSize="12sp"
         android:paddingBottom="4dp" />
 

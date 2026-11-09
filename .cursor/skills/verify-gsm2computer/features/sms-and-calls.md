@@ -24,5 +24,5 @@ python3 .cursor/skills/verify-gsm2computer/scripts/drive-entrances.py
 ## Gotchas
 
 - Claiming the outbox marks the row `sending`. A second poll returns nothing until something is queued again. Don't expect the item to still be pending after a successful public poll.
-- A call report is labeled only when its `session_id` is a socket this process accepted. A missing session id, or a session id the hub does not know, is stored with `path` null. A client-supplied `path` is ignored. Today's bridge omits `session_id`, so those rows stay unknown until the bridge sends the id from `session.updated`.
-- `POST /calls` on the public socket also requires the device token. The drive posts it to the Tailscale socket, which is what today's uploader does.
+- A call report is labeled only when its `session_id` is a socket this process accepted. A missing session id, or a session id the hub does not know, is stored with `path` null. A client-supplied `path` is ignored. The bridge copies `session.id` from `session.updated` into `POST /calls`.
+- `POST /calls` on the public socket also requires the device token. The drive posts it to the Tailscale socket. The bridge uploader walks the same ordered endpoint list as the call socket (`HubHttpWalk`) and sends `X-Gsm-Device-Token` plus `session_id` on every attempt.

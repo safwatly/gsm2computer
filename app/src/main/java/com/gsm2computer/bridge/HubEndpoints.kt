@@ -11,8 +11,53 @@ object HubEndpoints {
 
     const val OPENAI_REALTIME_WS = "wss://api.openai.com/v1/realtime"
     const val DEFAULT_HUB_CONTROL_URL = "http://hub.mining-ling.ts.net:8787"
+    const val DEFAULT_PUBLIC_WS = "wss://gsm.ta3leam.com/"
+    const val DEFAULT_TAILSCALE_WS = "ws://100.113.222.47:8787/"
+    const val DEVICE_TOKEN_HEADER = "X-Gsm-Device-Token"
+    const val CALL_SESSION_HEADER = "X-Gsm-Call-Session"
 
     fun normalizeBase(url: String): String = url.trim().trimEnd('/')
+
+    fun defaultEndpointUrls(): List<String> = listOf(DEFAULT_PUBLIC_WS, DEFAULT_TAILSCALE_WS)
+
+    /** Newline- or comma-separated hub URLs. Blank entries are dropped. */
+    fun parseEndpointList(raw: String): List<String> =
+        raw.split('\n', ',')
+            .map { normalizeBase(it) }
+            .filter { it.isNotEmpty() }
+
+    /**
+     * [explicitList] set (even to empty) wins. Otherwise a saved single hub URL.
+     * Neither set means [defaults], which is the public entrance then Tailscale.
+     */
+    fun resolveEndpointUrls(explicitList: String?, legacySingle: String?, defaults: String): List<String> {
+        if (explicitList != null) return parseEndpointList(explicitList)
+        if (legacySingle != null) {
+            val one = normalizeBase(legacySingle)
+            return if (one.isEmpty()) emptyList() else listOf(one)
+        }
+        return parseEndpointList(defaults).ifEmpty { defaultEndpointUrls() }
+    }
+
+    /** `ws`/`wss` back to the HTTP origin used for `/token`, `/sms`, and `/calls`. */
+    fun httpOrigin(url: String): String {
+        val base = normalizeBase(url)
+        return when {
+            base.startsWith("wss://") -> "https://" + base.removePrefix("wss://")
+            base.startsWith("ws://") -> "http://" + base.removePrefix("ws://")
+            else -> base
+        }
+    }
+
+    /** Device token is omitted when blank. The session header is omitted when blank. */
+    fun hubHeaders(endpoint: HubEndpoint, sessionId: String): List<Pair<String, String>> {
+        val headers = mutableListOf<Pair<String, String>>()
+        if (endpoint.deviceToken.isNotBlank()) {
+            headers += DEVICE_TOKEN_HEADER to endpoint.deviceToken
+        }
+        if (sessionId.isNotBlank()) headers += CALL_SESSION_HEADER to sessionId
+        return headers
+    }
 
     fun isCustomHub(hubControlUrl: String): Boolean =
         normalizeBase(hubControlUrl).isNotEmpty()

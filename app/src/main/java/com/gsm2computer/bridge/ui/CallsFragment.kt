@@ -215,6 +215,23 @@ class CallsFragment : Fragment() {
             detailRow.addView(dirIcon)
             detailRow.addView(tvDate)
             detailRow.addView(tvDur)
+            val pathLabel = callPathLabel(entry)
+            if (pathLabel.isNotBlank()) {
+                val tvPath = TextView(ctx).apply {
+                    text = pathLabel
+                    textSize = 13f
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                    setTextColor(0xFF9CA3AF.toInt())
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        marginStart = (12 * dp).toInt()
+                    }
+                }
+                detailRow.addView(tvPath)
+            }
 
             textBlock.addView(tvNum)
             textBlock.addView(detailRow)
@@ -271,6 +288,11 @@ class CallsFragment : Fragment() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    private fun callPathLabel(entry: CallLogEntry): String {
+        val host = entry.endpoint.substringAfter("://", "").substringBefore("/")
+        return listOf(entry.entrance, host).filter { it.isNotBlank() }.joinToString(" ")
     }
 
     private fun formatDurationCompact(totalSeconds: Long): String {

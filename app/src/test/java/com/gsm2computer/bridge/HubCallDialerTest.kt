@@ -1,0 +1,178 @@
+package com.gsm2computer.bridge
+
+import com.gsm2computer.bridge.realtime.HandshakeGate
+import com.gsm2computer.bridge.realtime.HubCallDialer
+import okhttp3.OkHttpClient
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+
+class HubCallDialerTest {
+
+    private val secret = "device-token-test-value"
+
+    @Test
+    fun tokenAndWebsocketCarryTheDeviceTokenAndSession() {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setBody("""{"value":"hub-token","model":"hub"}"""))
+            val opened = AtomicBoolean(false)
+            server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    opened.set(true)
+                }
+            }))
+            val dialer = dialer()
+            val response = dialer.dial(
+                DialRequest(HubEndpoint(server.url("/").toString(), secret), "hub-session"),
+                object : HubCallDialer.Live {
+                    override fun onOpen(webSocket: WebSocket, request: DialRequest) = Unit
+                    override fun onMessage(webSocket: WebSocket, text: String) = Unit
+                    override fun onDead(webSocket: WebSocket, code: Int, detail: String) = Unit
+                },
+            )
+            assertEquals(DialStatus.OPENED, response.status)
+            assertFalse(response.detail.contains(secret))
+            val tokenCall = checkNotNull(server.takeRequest(2, TimeUnit.SECONDS))
+            val socketCall = checkNotNull(server.takeRequest(2, TimeUnit.SECONDS))
+            assertTrue(tokenCall.path!!.endsWith("/token"))
+            assertEquals(secret, tokenCall.getHeader(HubEndpoints.DEVICE_TOKEN_HEADER))
+            assertEquals("hub-session", tokenCall.getHeader(HubEndpoints.CALL_SESSION_HEADER))
+            assertEquals(secret, socketCall.getHeader(HubEndpoints.DEVICE_TOKEN_HEADER))
+            assertEquals("hub-session", socketCall.getHeader(HubEndpoints.CALL_SESSION_HEADER))
+            assertEquals("Bearer hub-token", socketCall.getHeader("Authorization"))
+            assertTrue(socketCall.path == "/" || socketCall.path == "")
+            assertTrue(opened.get())
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun rejectedTokenIsScrubbedAndDoesNotOpenTheSocket() {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setResponseCode(401).setBody(secret))
+            val dialer = dialer()
+            val response = dialer.dial(
+                DialRequest(HubEndpoint(server.url("/").toString(), secret), ""),
+                object : HubCallDialer.Live {
+                    override fun onOpen(webSocket: WebSocket, request: DialRequest) = Unit
+                    override fun onMessage(webSocket: WebSocket, text: String) = Unit
+                    override fun onDead(webSocket: WebSocket, code: Int, detail: String) = Unit
+                },
+            )
+            assertEquals(DialStatus.RETRYABLE, response.status)
+            assertEquals(401, response.httpStatus)
+            assertFalse(response.detail.contains(secret))
+            assertEquals(1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun conflictWithoutASessionStopsAndConflictWithASessionWaits() {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setResponseCode(409).setBody("busy"))
+            val dialer = dialer()
+            val fresh = dialer.dial(
+                DialRequest(HubEndpoint(server.url("/").toString(), secret), ""),
+                quietLive(),
+            )
+            assertEquals(DialStatus.STOP, fresh.status)
+            server.enqueue(MockResponse().setResponseCode(409).setBody("grace"))
+            val relink = dialer.dial(
+                DialRequest(HubEndpoint(server.url("/").toString(), secret), "hub-live"),
+                quietLive(),
+            )
+            assertEquals(DialStatus.LATER, relink.status)
+            assertFalse(relink.detail.contains(secret))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun abandonAfterOpenKeepsTheSocketAndALateOpenIsIgnored() {
+        val gate = HandshakeGate()
+        assertTrue(gate.onOpen())
+        assertFalse(gate.abandon())
+        assertTrue(gate.opened())
+
+        val failed = HandshakeGate()
+        assertTrue(failed.abandon())
+        assertFalse(failed.onOpen())
+        assertFalse(failed.opened())
+    }
+
+    @Test
+    fun handshakeThatOpensAfterCancelDoesNotInstallTheSocket() {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setBody("""{"value":"hub-token","model":"hub"}"""))
+            server.enqueue(
+                MockResponse()
+                    .setHeadersDelay(2, TimeUnit.SECONDS)
+                    .withWebSocketUpgrade(object : WebSocketListener() {}),
+            )
+            val installed = AtomicBoolean(false)
+            val dialer = HubCallDialer(
+                http = OkHttpClient.Builder()
+                    .connectTimeout(2, TimeUnit.SECONDS)
+                    .readTimeout(2, TimeUnit.SECONDS)
+                    .build(),
+                hubOwned = true,
+                openAiTokenUrl = "",
+                model = "hub",
+                handshakeTimeoutMs = 200,
+            )
+            val response = dialer.dial(
+                DialRequest(HubEndpoint(server.url("/").toString(), secret), "hub-session"),
+                object : HubCallDialer.Live {
+                    override fun onOpen(webSocket: WebSocket, request: DialRequest) {
+                        installed.set(true)
+                    }
+                    override fun onMessage(webSocket: WebSocket, text: String) = Unit
+                    override fun onDead(webSocket: WebSocket, code: Int, detail: String) = Unit
+                },
+            )
+            assertEquals(DialStatus.RETRYABLE, response.status)
+            Thread.sleep(2_500)
+            assertFalse(installed.get())
+            assertFalse(response.detail.contains(secret))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    private fun dialer(): HubCallDialer = HubCallDialer(
+        http = OkHttpClient.Builder()
+            .connectTimeout(2, TimeUnit.SECONDS)
+            .readTimeout(2, TimeUnit.SECONDS)
+            .build(),
+        hubOwned = true,
+        openAiTokenUrl = "",
+        model = "hub",
+        handshakeTimeoutMs = 3_000,
+    )
+
+    private fun quietLive(): HubCallDialer.Live = object : HubCallDialer.Live {
+        override fun onOpen(webSocket: WebSocket, request: DialRequest) = Unit
+        override fun onMessage(webSocket: WebSocket, text: String) = Unit
+        override fun onDead(webSocket: WebSocket, code: Int, detail: String) = Unit
+    }
+}
