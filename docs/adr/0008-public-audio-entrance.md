@@ -23,5 +23,5 @@ The handler in `hub.py` is one function (`handle_client`). Existing bridge build
 ## Consequences
 
 - Deploy hub and Caddy together. Leave `GSM2COMPUTER_PUBLIC_ENABLE` unset until the token file, DNS, and firewall are ready. See [CUP_PUBLIC_ENTRANCE.md](../CUP_PUBLIC_ENTRANCE.md).
-- Step 3 (bridge client) uses one connection routine and the ordered origins `[https://gsm.ta3leam.com, http://<tailscale-host>:8787]`, with `X-Gsm-Device-Token` on every phone request. This ADR does not change the phone.
+- The bridge uses one connection routine and the ordered origins `[wss://gsm.ta3leam.com/, ws://100.113.222.47:8787/]`, with `X-Gsm-Device-Token` on every phone request. A mid-call reconnect walks that same list and sends `X-Gsm-Call-Session` so the hub can relink.
 - Do not `tailscale serve` this listener. OpenClaw still owns MagicDNS `:443` on the tailnet ([ADR 0007](0007-hub-machine-name-and-https.md)). Public `:443` is Caddy on the public address, a different interface.

@@ -1,5 +1,7 @@
 package com.gsm2computer.bridge.rtp
 
+import com.gsm2computer.bridge.HubLink
+
 /**
  * Pluggable audio wire for [RtpSession].
  *
@@ -32,6 +34,9 @@ interface MediaTransport {
 
     /** Close the transport. */
     fun stop()
+
+    /** Which entrance the live socket is on. Empty until the handshake opens. */
+    fun currentLink(): HubLink = HubLink()
 
     /** Callbacks from the transport into the owning [RtpSession]. */
     interface Sink {

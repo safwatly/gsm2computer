@@ -35,6 +35,10 @@ hub/portal.sqlite-shm
 # Per-device hub secrets. Generate with hub/device_auth.py; never commit.
 device-tokens.json
 
+# Upload signing key. Path and passwords live in local.properties or the environment.
+*.keystore
+signing/
+
 # IDE / agent local
 .idea/
 *.iml

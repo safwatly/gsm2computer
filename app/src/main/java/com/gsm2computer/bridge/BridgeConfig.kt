@@ -15,6 +15,8 @@ object BridgeConfig {
     const val KEY_AUTOCONNECT = "autoconnect"
     const val KEY_STREAM_ENABLED = "stream_enabled"
     const val KEY_HUB_CONTROL_URL = "hub_control_url"
+    const val KEY_HUB_ENDPOINTS = "hub_endpoints"
+    const val KEY_DEVICE_TOKEN = "device_token"
 
     /** Last hub URL consumed from [com.gsm2computer.bridge.HubControlUrl.DROP_FILE]. */
     const val KEY_HUB_URL_DROP = "hub_control_url_drop"
@@ -41,6 +43,31 @@ object BridgeConfig {
             DEFAULT_AUTOCONNECT
         }
 
+    fun resolveEndpointUrls(prefs: SharedPreferences): List<String> {
+        val explicit = if (prefs.contains(KEY_HUB_ENDPOINTS)) {
+            prefs.getString(KEY_HUB_ENDPOINTS, "")
+        } else {
+            null
+        }
+        val legacy = if (prefs.contains(KEY_HUB_CONTROL_URL)) {
+            prefs.getString(KEY_HUB_CONTROL_URL, "")
+        } else {
+            null
+        }
+        return HubEndpoints.resolveEndpointUrls(explicit, legacy, BuildConfig.DEFAULT_HUB_ENDPOINTS)
+    }
+
+    fun resolveDeviceToken(prefs: SharedPreferences): String {
+        val stored = prefs.getString(KEY_DEVICE_TOKEN, null)?.trim().orEmpty()
+        if (stored.isNotEmpty()) return stored
+        return BuildConfig.DEFAULT_DEVICE_TOKEN.trim()
+    }
+
+    fun resolveEndpoints(prefs: SharedPreferences): List<HubEndpoint> {
+        val token = resolveDeviceToken(prefs)
+        return resolveEndpointUrls(prefs).map { HubEndpoint(it, token) }
+    }
+
     fun resolveHubControlUrl(prefs: SharedPreferences): String {
         if (prefs.contains(KEY_HUB_CONTROL_URL)) {
             return prefs.getString(KEY_HUB_CONTROL_URL, "")?.trim().orEmpty()
@@ -63,6 +90,7 @@ object BridgeConfig {
         }
         if (!on) return false
         return resolveStreamTokenUrl(prefs).isNotBlank() ||
+            resolveEndpointUrls(prefs).isNotEmpty() ||
             resolveHubControlUrl(prefs).isNotBlank()
     }
 
@@ -90,7 +118,8 @@ object BridgeConfig {
         } else {
             null
         }
-        return HubEndpoints.hubOwnedSession(resolveHubControlUrl(prefs), stored)
+        val hub = resolveEndpointUrls(prefs).firstOrNull() ?: resolveHubControlUrl(prefs)
+        return HubEndpoints.hubOwnedSession(hub, stored)
     }
 
     fun isConfigured(prefs: SharedPreferences): Boolean =
@@ -100,6 +129,7 @@ object BridgeConfig {
         val autoconnect: Boolean,
         val streamEnabled: Boolean,
         val hubControlUrl: String,
+        val endpoints: List<HubEndpoint>,
         val streamTokenUrl: String,
         val streamModel: String,
         val streamVoice: String,
@@ -111,6 +141,7 @@ object BridgeConfig {
         autoconnect = resolveAutoconnect(prefs),
         streamEnabled = resolveStreamEnabled(prefs),
         hubControlUrl = resolveHubControlUrl(prefs),
+        endpoints = resolveEndpoints(prefs),
         streamTokenUrl = resolveStreamTokenUrl(prefs),
         streamModel = resolveStreamModel(prefs),
         streamVoice = resolveStreamVoice(prefs),

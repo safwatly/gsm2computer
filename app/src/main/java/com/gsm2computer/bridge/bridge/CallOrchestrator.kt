@@ -6,7 +6,9 @@ import android.telecom.Call
 import android.util.Log
 import android.telecom.DisconnectCause
 import com.gsm2computer.bridge.BridgeConfig
+import com.gsm2computer.bridge.HubEndpoint
 import com.gsm2computer.bridge.HubEndpoints
+import com.gsm2computer.bridge.HubLink
 import com.gsm2computer.bridge.RootShell
 import com.gsm2computer.bridge.audio.MicIsolationGuard
 import com.gsm2computer.bridge.diag.CallTraceSampler
@@ -31,6 +33,7 @@ class CallOrchestrator(
     private var activeSession: RtpSession? = null
     private var activeGsmCall: Call? = null
     @Volatile private var activeClient: HubStreamClient? = null
+    private var lastLink: HubLink = HubLink()
     private var callTrace: CallTraceSampler? = null
     @Volatile private var streamBridgePending = false
     @Volatile private var lastStateChangeTime = 0L
@@ -60,6 +63,17 @@ class CallOrchestrator(
 
     private fun resolveConfig(): BridgeConfig.Resolved =
         BridgeConfig.resolve(BridgeConfig.openPrefs(context))
+
+    fun lastLink(): HubLink {
+        val live = activeClient?.currentLink() ?: HubLink()
+        return if (
+            live.endpointUrl.isNotEmpty() || live.sessionId.isNotEmpty() || live.entrance.isNotEmpty()
+        ) {
+            live
+        } else {
+            lastLink
+        }
+    }
 
     fun start() {
         GsmCallManager.listener = this
@@ -170,21 +184,28 @@ class CallOrchestrator(
 
     private fun startStreamBridge() {
         val cfg = resolveConfig()
+        val endpoints = cfg.endpoints.ifEmpty {
+            listOf(HubEndpoint(HubEndpoints.OPENAI_REALTIME_WS))
+        }
+        if (cfg.endpoints.isNotEmpty() && cfg.endpoints.all { it.deviceToken.isBlank() }) {
+            Log.w(TAG, "device token unset; the public entrance will reject the call")
+        }
         Log.i(
             TAG,
-            "Opening hub stream (hub=${cfg.hubControlUrl} token=${cfg.streamTokenUrl} " +
+            "Opening hub stream (endpoints=${endpoints.joinToString { it.url }} " +
                 "model=${cfg.streamModel} voice=${cfg.streamVoice} hubOwned=${cfg.hubOwnedSession})",
         )
         bridgeState = BridgeState.CONNECTING
         listener?.onStateChanged(bridgeState, "Connecting to hub")
 
         val transport = HubStreamClient(
+            endpoints = endpoints,
             tokenUrl = cfg.streamTokenUrl,
             webSocketUrl = HubEndpoints.webSocketUrl(cfg.hubControlUrl),
             model = cfg.streamModel,
             voice = cfg.streamVoice,
             instructions = HubStreamClient.DEFAULT_INSTRUCTIONS,
-            hubOwnedSession = cfg.hubOwnedSession,
+            hubOwnedSession = cfg.hubOwnedSession && cfg.endpoints.isNotEmpty(),
             linkGraceMs = cfg.hubLinkGraceMs,
             onTrace = { kind, fields -> callTrace?.event(kind, fields) },
         )
@@ -253,6 +274,7 @@ class CallOrchestrator(
                 "call_state" to bridgeState.name,
             ),
         )
+        lastLink = activeClient?.currentLink() ?: lastLink
         bridgeState = BridgeState.TEARING_DOWN
         streamBridgePending = false
 
@@ -354,6 +376,7 @@ class CallOrchestrator(
 
     @Synchronized
     private fun forceReset(reason: String) {
+        lastLink = activeClient?.currentLink() ?: lastLink
         try {
             activeSession?.stop()
         } catch (_: Exception) {}

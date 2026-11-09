@@ -1,8 +1,24 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jlleitschuh.gradle.ktlint")
     id("io.gitlab.arturbosch.detekt")
+}
+
+// Release signing. Env wins over gitignored local.properties. When
+// GSM2COMPUTER_STORE_FILE is unset, the public debug keystore is used so CI
+// stays unchanged. The upload keystore and its password stay off the repo.
+val gsmSigningProps = Properties().apply {
+    val local = rootProject.file("local.properties")
+    if (local.isFile) local.inputStream().use { load(it) }
+}
+
+fun gsmSigning(name: String): String {
+    val fromEnv = System.getenv(name)?.trim().orEmpty()
+    if (fromEnv.isNotEmpty()) return fromEnv
+    return gsmSigningProps.getProperty(name)?.trim().orEmpty()
 }
 
 ktlint {
@@ -22,14 +38,20 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        // versionCode 344 is the build running on the phone.
-        versionCode = 344
-        versionName = "0.2.5"
+        // versionCode 345 walks the ordered hub list on top of build 344.
+        versionCode = 345
+        versionName = "0.2.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("boolean", "DEFAULT_STREAM_ENABLED", "true")
         buildConfigField("String", "DEFAULT_HUB_CONTROL_URL", "\"http://hub.mining-ling.ts.net:8787\"")
+        buildConfigField(
+            "String",
+            "DEFAULT_HUB_ENDPOINTS",
+            "\"wss://gsm.ta3leam.com/\\nws://100.113.222.47:8787/\"",
+        )
+        buildConfigField("String", "DEFAULT_DEVICE_TOKEN", "\"\"")
         buildConfigField("String", "DEFAULT_STREAM_TOKEN_URL", "\"\"")
         buildConfigField("String", "DEFAULT_STREAM_MODEL", "\"gpt-realtime\"")
         buildConfigField("String", "DEFAULT_STREAM_VOICE", "\"marin\"")
@@ -37,10 +59,27 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+            val storePath = gsmSigning("GSM2COMPUTER_STORE_FILE")
+            if (storePath.isEmpty()) {
+                storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            } else {
+                val storePasswordValue = gsmSigning("GSM2COMPUTER_STORE_PASSWORD")
+                val keyPasswordValue = gsmSigning("GSM2COMPUTER_KEY_PASSWORD")
+                if (storePasswordValue.isEmpty() || keyPasswordValue.isEmpty()) {
+                    error(
+                        "GSM2COMPUTER_STORE_PASSWORD and GSM2COMPUTER_KEY_PASSWORD are required " +
+                            "when GSM2COMPUTER_STORE_FILE is set. Put them in local.properties " +
+                            "(gitignored) or the environment. Do not commit them.",
+                    )
+                }
+                storeFile = rootProject.file(storePath)
+                storePassword = storePasswordValue
+                keyAlias = gsmSigning("GSM2COMPUTER_KEY_ALIAS").ifEmpty { "androiddebugkey" }
+                keyPassword = keyPasswordValue
+            }
         }
     }
 
@@ -70,6 +109,21 @@ android {
     }
 }
 
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    val releaseFlag = System.getenv("GSM2COMPUTER_BRIDGE_PATH_RELEASE")
+    if (!releaseFlag.isNullOrEmpty()) {
+        environment("GSM2COMPUTER_BRIDGE_PATH_RELEASE", releaseFlag)
+    }
+    val verifyState = System.getenv("GSM2COMPUTER_VERIFY_STATE")
+    if (!verifyState.isNullOrEmpty()) {
+        environment("GSM2COMPUTER_VERIFY_STATE", verifyState)
+    }
+    val verifyEvidence = System.getenv("GSM2COMPUTER_VERIFY_EVIDENCE")
+    if (!verifyEvidence.isNullOrEmpty()) {
+        environment("GSM2COMPUTER_VERIFY_EVIDENCE", verifyEvidence)
+    }
+}
+
 dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
@@ -77,6 +131,7 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test:runner:1.5.2")
 }

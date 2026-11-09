@@ -8,7 +8,10 @@ data class CallLogEntry(
     val direction: String,  // "IN" or "OUT"
     val number: String,
     val timestamp: Long,    // millis since epoch (call start)
-    val durationSec: Long
+    val durationSec: Long,
+    val endpoint: String = "",
+    val entrance: String = "",
+    val sessionId: String = "",
 )
 
 object CallLogStore {
@@ -27,6 +30,9 @@ object CallLogStore {
             put("num", entry.number)
             put("ts", entry.timestamp)
             put("dur", entry.durationSec)
+            put("endpoint", entry.endpoint)
+            put("entrance", entry.entrance)
+            put("session", entry.sessionId)
         }
         arr.put(obj)
         prefs.edit().putString(KEY, arr.toString()).apply()
@@ -43,7 +49,10 @@ object CallLogStore {
                 direction = obj.getString("dir"),
                 number = obj.getString("num"),
                 timestamp = obj.getLong("ts"),
-                durationSec = obj.getLong("dur")
+                durationSec = obj.getLong("dur"),
+                endpoint = obj.optString("endpoint"),
+                entrance = obj.optString("entrance"),
+                sessionId = obj.optString("session"),
             )
         }.reversed() // newest first
         cachedEntries = entries
