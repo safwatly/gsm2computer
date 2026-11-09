@@ -68,9 +68,12 @@ The command prints the secret once. Put it somewhere the step-3 bridge can read.
 
 ### 3. Hub listener
 
-Edit the user unit (the installed copy, usually `~/.config/systemd/user/gsm2computer-hub.service`) and set:
+Do not put these variables in `gsm2computer-hub.service`. Add them to the drop-in `~/.config/systemd/user/gsm2computer-hub.service.d/cup-private.conf`. Leave Talk and the audio buses on the unit.
 
-```
+```bash
+mkdir -p ~/.config/systemd/user/gsm2computer-hub.service.d
+cat > ~/.config/systemd/user/gsm2computer-hub.service.d/cup-private.conf <<'EOF'
+[Service]
 Environment=GSM2COMPUTER_HUB_HOST=100.113.222.47
 Environment=GSM2COMPUTER_HUB_PORT=8787
 Environment=GSM2COMPUTER_PUBLIC_ENABLE=1
@@ -79,11 +82,7 @@ Environment=GSM2COMPUTER_PUBLIC_PORT=8790
 Environment=GSM2COMPUTER_PUBLIC_HOSTNAME=gsm.ta3leam.com
 Environment=GSM2COMPUTER_DEVICE_TOKENS=%h/.config/gsm2computer/device-tokens.json
 Environment=GSM2COMPUTER_TAILSCALE_TOKEN_REQUIRED=0
-```
-
-Leave Talk and the audio buses as they are.
-
-```bash
+EOF
 systemctl --user daemon-reload
 systemctl --user restart gsm2computer-hub.service
 systemctl --user status gsm2computer-hub.service --no-pager
@@ -104,7 +103,26 @@ sudo cp deploy/cup/public-entrance.env.example /etc/gsm2computer/public-entrance
 sudoedit /etc/gsm2computer/public-entrance.env
 ```
 
-Set `GSM2COMPUTER_ACME_EMAIL` to a mailbox you read, and the hostname if you did not use `gsm.ta3leam.com`. Leave `GSM2COMPUTER_PUBLIC_BIND=62.83.35.197`. The Caddy unit runs `gsm2computer-caddy-pre.sh` first and will not start if that value is empty, `0.0.0.0`, or `::`.
+`GSM2COMPUTER_ACME_EMAIL` is required. It is the Let's Encrypt account contact, and it belongs in this env file. Caddy refuses to start when it is empty, because the Caddyfile's `email` line then has no argument. Set it to a mailbox you read. Set the hostname if you did not use `gsm.ta3leam.com`. Leave `GSM2COMPUTER_PUBLIC_BIND=62.83.35.197`. The Caddy unit runs `gsm2computer-caddy-pre.sh` first and will not start if that bind is empty, `0.0.0.0`, or `::`.
+
+The unit sets `StateDirectory=caddy`, `XDG_DATA_HOME=/var/lib/caddy`, and `XDG_CONFIG_HOME=/var/lib/caddy`. Caddy 2.6 appends `/caddy` to those variables, so the account and certificates live in `/var/lib/caddy/caddy`.
+
+#### One-time copy off `/caddy`
+
+The entrance is already live. The previous unit set no `HOME` and no `XDG_*`, and a system unit's working directory is `/`, so Caddy stored the account and the certificate in `/caddy`. The new unit reads `/var/lib/caddy/caddy`. `/caddy` stays where it is. The old unit still uses it, so putting that unit back does not move either tree.
+
+`deploy/cup/migrate-caddy-state.sh apply` saves the fingerprint at `/var/lib/caddy/gsm-cert.before` and the installed unit at `/var/lib/caddy/gsm2computer-caddy.service.bak`. Neither file is under `/tmp`. It then stops Caddy, runs `cp -a /caddy/. /var/lib/caddy/caddy/`, installs this repo's unit, `daemon-reload`, and `start`. If `/var/lib/caddy/caddy` already has files that differ from `/caddy`, apply exits 1 before the stop and leaves the current unit running. A copy that matches, or an empty destination, is fine. `cp -a` keeps owner, group, and mode.
+
+If the copy, the unit install, `daemon-reload`, `start`, or the fingerprint check fails, the script does not depend on `set -e`. It stops Caddy, writes the backed-up unit back, `daemon-reload`, and starts that unit. A second apply, once the new unit is installed and the copy matches, does nothing.
+
+```bash
+sudo deploy/cup/migrate-caddy-state.sh apply
+sudo journalctl -u gsm2computer-caddy.service -n 50 --no-pager
+```
+
+The script exits 0 only when the fingerprint matches. The journal after the start does not show a new issuance. Leave `/caddy` in place. After a week of renewals that keep using the certificate under `/var/lib/caddy/caddy`, delete `/caddy` by hand.
+
+On a first install there is no `/caddy` directory. Install the unit and start it. The log shows a certificate obtained for the hostname.
 
 ```bash
 sudo install -m 0755 deploy/cup/gsm2computer-caddy-pre.sh /usr/local/sbin/gsm2computer-caddy-pre.sh
@@ -114,7 +132,9 @@ sudo systemctl enable --now gsm2computer-caddy.service
 sudo journalctl -u gsm2computer-caddy.service -n 50 --no-pager
 ```
 
-The log should show a certificate obtained for the hostname. `ss -ltnp 'sport = :443'` should show Caddy on `62.83.35.197:443` and Tailscale Serve still on the tailnet address. Then, from a machine that is **not** on Tailscale:
+`ss -ltnp 'sport = :443'` should show Caddy on `62.83.35.197:443` and Tailscale Serve still on the tailnet address.
+
+Then, from a machine that is **not** on Tailscale:
 
 ```bash
 curl -sS -o /dev/null -w '%{http_code}\n' https://gsm.ta3leam.com/health
@@ -169,7 +189,8 @@ Do these independently. You do not need to undo all of them.
 |---|---|
 | Firewall lockout, timer still running | Wait. It removes the TCP 443 rule. Or from the surviving SSH session: `sudo deploy/cup/gsm2computer-nft.sh revert` |
 | Firewall confirmed, want 443 closed | `sudo /usr/local/sbin/gsm2computer-nft.sh revert` (disables the boot unit, deletes the 443 rule, removes the include) |
-| Caddy certificate or proxy | `sudo systemctl disable --now gsm2computer-caddy.service` |
+| Caddy unit after the copy | `sudo deploy/cup/migrate-caddy-state.sh rollback`. Stops Caddy, restores `/var/lib/caddy/gsm2computer-caddy.service.bak`, `daemon-reload`, and starts that unit. It compares `/var/lib/caddy/gsm-cert.before` when that file exists, and still restores the unit when it does not. It does not move `/caddy` or `/var/lib/caddy/caddy`. `apply` runs the same unit restore if start fails or the fingerprint changes. |
+| Caddy certificate or proxy, storage not moved | `sudo systemctl disable --now gsm2computer-caddy.service` |
 | Public hub socket | Comment out `GSM2COMPUTER_PUBLIC_ENABLE`, `systemctl --user restart gsm2computer-hub.service`. Tailscale `:8787` keeps the previous behavior |
 | Bad hub code | `git checkout <previous>` in the deployed checkout, restart the user unit. With `PUBLIC_ENABLE` unset the new code still serves only the Tailscale socket |
 | SSH keys-only too strict | `sudo rm /etc/ssh/sshd_config.d/99-gsm2computer-key-only.conf && sudo sshd -t && sudo systemctl reload ssh` |
