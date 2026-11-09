@@ -17,7 +17,7 @@ import java.io.OutputStream
  */
 class PhasedInjector(
     private val ctx: Context,
-    private val track: AudioTrack,
+    private val trackRef: () -> AudioTrack,
     private val srcRate: Int,
     private val tapRef: () -> CaptureTap?,
     private val enableIncallMusic: () -> Unit,
@@ -57,7 +57,7 @@ class PhasedInjector(
         val pcm = if (n == buf.size) buf else buf.copyOf(n)
         applyMarker(pcm)
         if (phase == 1 || phase == 4) {
-            track.write(pcm, 0, pcm.size); trackBytes += pcm.size
+            trackRef().write(pcm, 0, pcm.size); trackBytes += pcm.size
         } else {
             val s = synchronized(lock) { stdin }
             if (s != null) try {
@@ -112,18 +112,23 @@ class PhasedInjector(
     // ── phases ──
     private fun phase1(again: Boolean) {
         killInj()
+        val track = trackRef()
         val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         val dev = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)?.firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
-        val pref = if (dev != null) track.setPreferredDevice(dev) else false
-        try { track.play() } catch (e: Exception) { logLine("P1 play failed ${e.message}") }
+        // The session already armed this track while it was stopped. Calling
+        // setPreferredDevice here would recreate the native track via restoreTrack_l.
+        if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+            try { track.play() } catch (e: Exception) { logLine("P1 play failed ${e.message}") }
+        }
         enableIncallMusic()
         phase = if (again) 4 else 1
         beeps(1)
-        phaseMark("P1${if (again) "b" else ""}_pixel_audiotrack telephony_found=${dev != null} id=${dev?.id} setPreferred=$pref")
+        phaseMark("P1${if (again) "b" else ""}_pixel_audiotrack telephony_found=${dev != null} id=${dev?.id} armed=${track.playState}")
         Thread({
             try {
                 Thread.sleep(1500)
-                val s = "routed=${track.routedDevice?.type} playState=${track.playState} state=${track.state} underruns=${track.underrunCount}"
+                val live = trackRef()
+                val s = "routed=${live.routedDevice?.type} playState=${live.playState} state=${live.state} underruns=${live.underrunCount}"
                 put("inject_p1${if (again) "b" else ""}_track", s); logLine("P1 track $s")
             } catch (_: Exception) {}
         }, "p1-check").apply { isDaemon = true }.start()

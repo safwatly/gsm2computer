@@ -24,6 +24,7 @@ import java.net.SocketTimeoutException
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * RTP session: handles bidirectional audio between speaker/mic and remote RTP endpoint.
@@ -61,6 +62,10 @@ class RtpSession(
     private var socket: DatagramSocket? = null
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
+    private val playbackSilence = PlaybackSilenceWatch()
+    private val rxPeak = AtomicInteger(0)
+    private val playbackRebuild = AtomicBoolean(false)
+    private var lastPlayHead = -1
     private var captureTap: CaptureTap? = null
 
     // Codec
@@ -323,47 +328,7 @@ class RtpSession(
             AudioAttributes.USAGE_VOICE_COMMUNICATION -> "VOICE_COMMUNICATION"
             else -> "usage=$usage"
         }
-        val playRates = if (wsMode) listOf(48000, 16000, 8000) else listOf(playbackRate)
-        var track: AudioTrack? = null
-        for (rate in playRates) {
-            val minPlayBuf = AudioTrack.getMinBufferSize(
-                rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
-            )
-            if (minPlayBuf <= 0) {
-                Log.w(TAG, "AudioTrack @$rate: invalid minBuf=$minPlayBuf")
-                continue
-            }
-            val candidate = try {
-                AudioTrack.Builder()
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(usage)
-                            .setContentType(contentType)
-                            .build()
-                    )
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setSampleRate(rate)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(minPlayBuf)
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .build()
-            } catch (e: Exception) {
-                Log.w(TAG, "AudioTrack @$rate failed: ${e.message}")
-                null
-            }
-            if (candidate != null && candidate.state == AudioTrack.STATE_INITIALIZED) {
-                track = candidate
-                playbackRate = rate
-                Log.i(TAG, "AudioTrack OK @$rate Hz (buf=$minPlayBuf)")
-                break
-            }
-            Log.w(TAG, "AudioTrack @$rate: state=${candidate?.state}")
-            candidate?.release()
-        }
+        val track = createPlaybackTrack(usage, contentType)
         if (track == null) {
             Log.e(TAG, "AudioTrack failed at all rates")
             listener?.onRtpError("AudioTrack init failed")
@@ -372,21 +337,6 @@ class RtpSession(
             return false
         }
         audioTrack = track
-
-        // Route playback to TYPE_TELEPHONY (modem TX uplink) on devices where
-        // the audio HAL needs an active PCM stream on the telephony endpoint
-        // (Pixel/Tensor aoc-snd-card).  Requires MODIFY_PHONE_STATE permission.
-        if (profile.routing.playbackToTelephony) {
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-            val telephonyDev = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                ?.firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
-            if (telephonyDev != null) {
-                val routed = track.setPreferredDevice(telephonyDev)
-                Log.i(TAG, "AudioTrack routed to TYPE_TELEPHONY: $routed (id=${telephonyDev.id})")
-            } else {
-                Log.w(TAG, "TYPE_TELEPHONY device not found — playback will use default device")
-            }
-        }
 
         // No platform AEC — AudioTrack is on USAGE_MEDIA (different stream
         // from AudioRecord), so platform AEC can't reference it anyway.
@@ -543,6 +493,8 @@ class RtpSession(
                 val end = minOf(off + frameBytes, frame.size)
                 val slice = frame.copyOfRange(off, end)
                 off = end
+                val energy = FrameEnergy.rms(slice, inboundFormat)
+                rxPeak.updateAndGet { cur -> maxOf(cur, energy) }
                 rxPacketCount++
                 if (!jitterBuffer.offer(slice)) {
                     jitterBuffer.poll()
@@ -692,22 +644,25 @@ class RtpSession(
                 val dev = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
                     ?.firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
                 if (t != null && dev != null) {
-                    // 337: never clear the preference first. setPreferredDevice(null)
-                    // (336) moved the track to low-latency-playback/handset and the
-                    // incall_music_uplink stream got no data. Only re-assert if the
-                    // track is not already on Telephony Tx.
-                    val cur = t.routedDevice?.type
-                    val ok = if (cur == AudioDeviceInfo.TYPE_TELEPHONY) true else t.setPreferredDevice(dev)
-                    captureTap?.putMeta("play_preferred_telephony", ok)
-                    captureTap?.putMeta("play_routed_at_start", cur ?: -1)
-                    Log.i(TAG, "AudioTrack route at call start: type=$cur, telephony ok=$ok")
+                    // Do not call setPreferredDevice on a playing track. AudioFlinger
+                    // then logs "dead IAudioTrack, creating a new one from
+                    // setOutputDevice" and the replacement drops in-call-music.
+                    // A fresh track is armed while stopped; a later route change
+                    // rebuilds it on the playback thread.
+                    val cur = t.routedDevice?.type ?: -1
+                    captureTap?.putMeta("play_routed_at_start", cur)
+                    Log.i(TAG, "AudioTrack route at call start: type=$cur")
+                    if (cur != -1 && cur != AudioDeviceInfo.TYPE_TELEPHONY) {
+                        playbackRebuild.set(true)
+                    }
                 }
                 t?.addOnRoutingChangedListener({ r ->
                     val ty = (r as? AudioTrack)?.routedDevice?.type ?: -1
                     Log.i(TAG, "AudioTrack routing changed -> type=$ty")
                     captureTap?.putMeta("play_routed_last", ty)
-                    if (ty != AudioDeviceInfo.TYPE_TELEPHONY && dev != null && running.get()) {
-                        try { (r as AudioTrack).setPreferredDevice(dev) } catch (_: Exception) {}
+                    if (ty != -1 && ty != AudioDeviceInfo.TYPE_TELEPHONY && dev != null && running.get()) {
+                        Log.w(TAG, "AudioTrack left TYPE_TELEPHONY; will rebuild")
+                        playbackRebuild.set(true)
                     }
                 }, null)
             } catch (e: Exception) {
@@ -1103,6 +1058,150 @@ class RtpSession(
     private val jbMaxFrames = 75      // >1.5 s behind -> drop oldest
     private val jbCatchupFrames = 25  // catch up to 500 ms
 
+    /**
+     * New track every call, and again when playback goes silent. Preferred
+     * device is set only while the track is stopped. setPreferredDevice on a
+     * playing track is what produces restoreTrack_l.
+     */
+    private fun createPlaybackTrack(usage: Int, contentType: Int): AudioTrack? {
+        val playRates = if (wsMode) listOf(48000, 16000, 8000) else listOf(playbackRate)
+        for (rate in playRates) {
+            val minPlayBuf = AudioTrack.getMinBufferSize(
+                rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT,
+            )
+            if (minPlayBuf <= 0) {
+                Log.w(TAG, "AudioTrack @$rate: invalid minBuf=$minPlayBuf")
+                continue
+            }
+            val candidate = try {
+                AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(usage)
+                            .setContentType(contentType)
+                            .build(),
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setSampleRate(rate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .build(),
+                    )
+                    .setBufferSizeInBytes(minPlayBuf)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build()
+            } catch (e: Exception) {
+                Log.w(TAG, "AudioTrack @$rate failed: ${e.message}")
+                null
+            }
+            if (candidate != null && candidate.state == AudioTrack.STATE_INITIALIZED) {
+                playbackRate = rate
+                Log.i(TAG, "AudioTrack OK @$rate Hz (buf=$minPlayBuf)")
+                return candidate
+            }
+            Log.w(TAG, "AudioTrack @$rate: state=${candidate?.state}")
+            candidate?.release()
+        }
+        return null
+    }
+
+    private fun telephonyOutput(): AudioDeviceInfo? {
+        if (!profile.routing.playbackToTelephony) return null
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return null
+        return am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
+    }
+
+    private fun armPlaybackTrack(track: AudioTrack) {
+        try {
+            track.setVolume(1f)
+        } catch (_: Exception) {
+        }
+        val dev = telephonyOutput()
+        if (dev != null && track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+            val ok = try {
+                track.setPreferredDevice(dev)
+            } catch (e: Exception) {
+                Log.w(TAG, "setPreferredDevice failed: ${e.message}")
+                false
+            }
+            Log.i(TAG, "AudioTrack armed on TYPE_TELEPHONY: $ok (id=${dev.id})")
+        } else if (profile.routing.playbackToTelephony && dev == null) {
+            Log.w(TAG, "TYPE_TELEPHONY device not found — playback will use default device")
+        }
+        if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+            track.play()
+        }
+    }
+
+    private fun rebuildPlaybackTrack(reason: String) {
+        val line = "playback silence: rebuilding AudioTrack ($reason)"
+        Log.w(TAG, line)
+        BridgeLog.w(line)
+        listener?.onRtpStats(line)
+        val old = audioTrack
+        try {
+            old?.pause()
+        } catch (_: Exception) {
+        }
+        try {
+            old?.flush()
+        } catch (_: Exception) {
+        }
+        try {
+            old?.stop()
+        } catch (_: Exception) {
+        }
+        try {
+            old?.release()
+        } catch (_: Exception) {
+        }
+        val usage = if (profile.routing.playbackUsage >= 0) profile.routing.playbackUsage
+        else AudioAttributes.USAGE_MEDIA
+        val contentType = if (usage == AudioAttributes.USAGE_VOICE_COMMUNICATION) {
+            AudioAttributes.CONTENT_TYPE_SPEECH
+        } else {
+            AudioAttributes.CONTENT_TYPE_MUSIC
+        }
+        val fresh = createPlaybackTrack(usage, contentType)
+        if (fresh == null) {
+            audioTrack = null
+            Log.e(TAG, "playback silence: replacement AudioTrack failed")
+            return
+        }
+        audioTrack = fresh
+        lastPlayHead = -1
+        armPlaybackTrack(fresh)
+        enableIncallMusic()
+        enableIncallMusicViaMixer()
+    }
+
+    private fun notePlaybackHealth() {
+        val track = audioTrack ?: return
+        val head = try {
+            track.playbackHeadPosition
+        } catch (_: Exception) {
+            -1
+        }
+        val advanced = lastPlayHead >= 0 && head >= 0 && head != lastPlayHead
+        if (head >= 0) lastPlayHead = head
+        val rx = rxPeak.getAndSet(0)
+        val decision = playbackSilence.observe(
+            System.currentTimeMillis(),
+            rx,
+            playbackRms,
+            advanced,
+        )
+        val leftTelephony = playbackRebuild.getAndSet(false)
+        if (!running.get()) return
+        if (decision.rebuild) {
+            rebuildPlaybackTrack(decision.reason)
+        } else if (leftTelephony) {
+            rebuildPlaybackTrack("left TYPE_TELEPHONY")
+        }
+    }
+
     private fun playbackLoop() {
         val track = audioTrack ?: return
         var dlSecStart = System.currentTimeMillis()
@@ -1116,19 +1215,17 @@ class RtpSession(
         // Build 343: Moto g84 uses PhasedInjector P1 (AudioTrack onto Telephony Tx)
         // when pcminject3 and the AFE helper are both on the phone. Build 341's
         // RootPcmInjector was constructed nowhere, so playback does not start it.
+        armPlaybackTrack(track)
         val phased: PhasedInjector? = if (profile.name.startsWith("Moto g84") && PhasedInjector.available())
-            PhasedInjector(context, track, playbackRate, { captureTap }, { enableIncallMusic() },
+            PhasedInjector(context, { audioTrack ?: track }, playbackRate, { captureTap }, { enableIncallMusic() },
                 { b -> resamplePcm16(b, playbackRate, 48000) }) else null
-        var trackPlaying = phased != null
+        var trackPlaying = true
         if (phased != null) phased.start()
-        else {
-            trackPlaying = true
-            track.play()
-        }
         Log.i(TAG, "Playback started (rate=$playbackRate usage=$playbackUsageName deepBuffer=true inject=false)")
+        fun liveTrack(): AudioTrack = audioTrack ?: track
         fun out(buf: ByteArray, n: Int) {
             if (phased != null) { phased.write(buf, n); return }
-            track.write(buf, 0, n)
+            liveTrack().write(buf, 0, n)
         }
 
         // CRITICAL: Set incall_music_enabled=true AFTER AudioTrack.play().
@@ -1200,10 +1297,11 @@ class RtpSession(
                     if (wsMode && !wasPlayingSilence) { dlUnderruns++; dlSecUnder++ }
                     // Write silence to keep AudioTrack fed and prevent underruns.
                     out(silenceFrame, silenceFrame.size)
-                    captureTap?.writePlay(silenceFrame, silenceFrame.size, track.sampleRate)
+                    captureTap?.writePlay(silenceFrame, silenceFrame.size, liveTrack().sampleRate)
                     playbackRms = 0
                     currentPlaybackActive = false
                     wasPlayingSilence = true
+                    notePlaybackHealth()
                     continue
                 }
 
@@ -1253,9 +1351,10 @@ class RtpSession(
 
                 playbackRms = if (playbackGain > 1) pcmRms(pcm) else rawRms
                 out(pcm, pcm.size)
-                captureTap?.writePlay(pcm, pcm.size, track.sampleRate)
+                captureTap?.writePlay(pcm, pcm.size, liveTrack().sampleRate)
                 playbackFrames++
                 dlSecPlayed++
+                notePlaybackHealth()
             } catch (e: InterruptedException) {
                 break
             } catch (e: Exception) {
