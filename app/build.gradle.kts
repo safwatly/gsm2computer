@@ -38,9 +38,9 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        // versionCode 348 keeps the greeting: volume after the idle restore, no 3s
-        // incall_music teardown once the track is on telephony, call-start silence
-        // rebuilds in about a second.
+        // versionCode 348: a loud frame clears the call-start silence watch. A stalled
+        // downlink keeps the newest 2s of speech, drops the quietest gap next, and
+        // crossfades every join. The inject marker stays off unless the property is set.
         versionCode = 348
         versionName = "0.2.9"
 
