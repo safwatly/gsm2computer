@@ -109,11 +109,11 @@ class DownlinkCatchupTest {
     }
 
     @Test
-    fun injectMarkerStaysOffUnlessTheFlagIsOne() {
-        assertEquals(0, injectMarkerBeeps(null))
-        assertEquals(0, injectMarkerBeeps(""))
-        assertEquals(0, injectMarkerBeeps("0"))
+    fun injectMarkerDefaultsOnUnlessTheFlagIsZero() {
+        assertEquals(1, injectMarkerBeeps(null))
+        assertEquals(1, injectMarkerBeeps(""))
         assertEquals(1, injectMarkerBeeps("1"))
+        assertEquals(0, injectMarkerBeeps("0"))
     }
 
     @Test
