@@ -69,11 +69,19 @@ EOF
 chmod 755 "$BIN/systemctl" "$BIN/adb" "$BIN/rsync" "$BIN/curl"
 
 write_units() {
-  local host=$1 port=$2 moto=${3-100.64.0.8}
+  local host=$1 port=$2 adb=${3-192.0.2.55:5555} moto=${4-}
   local dir=$GSM2COMPUTER_CUTOVER_UNIT_DIR
   cat >"$dir/gsm2computer-hub.service" <<EOF
-Environment=GSM2COMPUTER_HUB_HOST=$host GSM2COMPUTER_HUB_PORT=$port MOTO_TS_IP=$moto
+Environment=GSM2COMPUTER_HUB_HOST=$host GSM2COMPUTER_HUB_PORT=$port
 EOF
+  local watch="Environment=GSM2COMPUTER_HUB_HTTP=http://$host:$port"
+  if [[ -n "$adb" ]]; then
+    watch+=" GSM2COMPUTER_CALL_END_ADB=$adb"
+  fi
+  if [[ -n "$moto" ]]; then
+    watch+=" MOTO_TS_IP=$moto"
+  fi
+  printf '%s\n' "$watch" >"$dir/gsm2computer-hub-call-watch.service"
   cat >"$dir/gsm2computer-call-end-watch.service" <<EOF
 Environment=GSM2COMPUTER_CALL_END_ADB=192.0.2.55:5555 GSM2COMPUTER_HUB_HTTP=http://$host:$port
 EOF
@@ -196,13 +204,13 @@ kill "$HUB_PID" 2>/dev/null || true
 wait "$HUB_PID" 2>/dev/null || true
 HUB_PID=""
 
-note "missing MOTO_TS_IP"
+note "missing phone address on hub-call-watch"
 start_hub false
 PORT=$(cat "$WORK/hub.port")
 write_units 127.0.0.1 "$PORT" ""
 rc=$(run_cutover apply)
 [[ "$rc" -eq 1 ]] || fail "missing env rc=$rc $(cat "$WORK/err")"
-grep -q 'missing MOTO_TS_IP' "$WORK/err" || fail "missing env message: $(cat "$WORK/err")"
+grep -q 'gsm2computer-hub-call-watch.service needs MOTO_TS_IP or GSM2COMPUTER_CALL_END_ADB' "$WORK/err" || fail "missing env message: $(cat "$WORK/err")"
 assert_no_mutate
 note "  apply aborted rc=1"
 kill "$HUB_PID" 2>/dev/null || true
@@ -216,8 +224,21 @@ write_units 127.0.0.1 "$PORT"
 rc=$(run_cutover apply)
 [[ "$rc" -eq 0 ]] || fail "idle apply rc=$rc $(cat "$WORK/err")"
 grep -q 'rsync ' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle apply did not rsync"
-grep -q 'restart gsm2computer-hub.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle apply did not restart"
+grep -q 'restart gsm2computer-hub.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle apply did not restart the hub"
+grep -q 'restart gsm2computer-hub-call-watch.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle apply did not restart the call watcher"
 note "  apply rc=0 after the gate"
+printf 'applied-marker\n' >"$WORK/live/marker.txt"
+
+note "idle rollback"
+: >"$GSM2COMPUTER_CUTOVER_ACTION_LOG"
+rc=$(run_cutover rollback)
+[[ "$rc" -eq 0 ]] || fail "idle rollback rc=$rc $(cat "$WORK/err")"
+grep -q 'stop gsm2computer-hub.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle rollback did not stop the hub"
+grep -q 'stop gsm2computer-hub-call-watch.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle rollback did not stop the call watcher"
+grep -q 'start gsm2computer-hub.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle rollback did not start the hub"
+grep -q 'start gsm2computer-hub-call-watch.service' "$GSM2COMPUTER_CUTOVER_ACTION_LOG" || fail "idle rollback did not start the call watcher"
+grep -q 'live-marker' "$WORK/live/marker.txt" || fail "idle rollback did not restore the live tree"
+note "  rollback rc=0"
 
 note "busy rollback"
 : >"$GSM2COMPUTER_CUTOVER_ACTION_LOG"

@@ -9,6 +9,7 @@ LIVE=${GSM2COMPUTER_CUTOVER_LIVE:-$HOME/gsm2computer-hub}
 REPO=${GSM2COMPUTER_CUTOVER_REPO:-$HOME/gsm2computer/hub}
 HUB_UNIT=${GSM2COMPUTER_CUTOVER_HUB_UNIT:-gsm2computer-hub.service}
 CALL_END_UNIT=${GSM2COMPUTER_CUTOVER_CALL_END_UNIT:-gsm2computer-call-end-watch.service}
+CALL_WATCH_UNIT=${GSM2COMPUTER_CUTOVER_CALL_WATCH_UNIT:-gsm2computer-hub-call-watch.service}
 E2E_UNIT=${GSM2COMPUTER_CUTOVER_E2E_UNIT:-gsm2computer-openclaw-e2e.service}
 WATCHDOG_UNIT=${GSM2COMPUTER_CUTOVER_WATCHDOG_UNIT:-cup-watchdog.service}
 
@@ -57,10 +58,22 @@ require_key() {
   fi
 }
 
+require_phone_on_call_watch() {
+  local peer="" adb="" host=""
+  peer=$(unit_env_get "$CALL_WATCH_UNIT" MOTO_TS_IP || true)
+  adb=$(unit_env_get "$CALL_WATCH_UNIT" GSM2COMPUTER_CALL_END_ADB || true)
+  host=${adb%%:*}
+  if [[ -n "$peer" || -n "$host" ]]; then
+    return 0
+  fi
+  echo "cutover: $CALL_WATCH_UNIT needs MOTO_TS_IP or GSM2COMPUTER_CALL_END_ADB" >&2
+  exit 1
+}
+
 require_private_env() {
   require_key "$HUB_UNIT" GSM2COMPUTER_HUB_HOST
   require_key "$HUB_UNIT" GSM2COMPUTER_HUB_PORT
-  require_key "$HUB_UNIT" MOTO_TS_IP
+  require_phone_on_call_watch
   require_key "$CALL_END_UNIT" GSM2COMPUTER_CALL_END_ADB
   require_key "$CALL_END_UNIT" GSM2COMPUTER_HUB_HTTP
   require_key "$E2E_UNIT" GSM2COMPUTER_E2E_HUB
@@ -106,7 +119,10 @@ if body.get("busy") is not False:
   fi
 
   local serial=""
-  serial=$(unit_env_get "$CALL_END_UNIT" GSM2COMPUTER_CALL_END_ADB || true)
+  serial=$(unit_env_get "$CALL_WATCH_UNIT" GSM2COMPUTER_CALL_END_ADB || true)
+  if [[ -z "$serial" ]]; then
+    serial=$(unit_env_get "$CALL_END_UNIT" GSM2COMPUTER_CALL_END_ADB || true)
+  fi
   if [[ -z "$serial" ]]; then
     return 0
   fi
@@ -145,6 +161,7 @@ apply_tree() {
     --exclude __pycache__/ \
     "$REPO"/ "$LIVE"/
   systemctl --user restart gsm2computer-hub.service
+  systemctl --user restart "$CALL_WATCH_UNIT"
   echo "cutover: applied, rollback tree $backup"
 }
 
@@ -160,10 +177,12 @@ rollback_tree() {
     exit 1
   fi
   systemctl --user stop gsm2computer-hub.service
+  systemctl --user stop "$CALL_WATCH_UNIT"
   rm -rf "$LIVE"
   mv "$backup" "$LIVE"
   rm -f "${LIVE}.rollback-latest"
   systemctl --user start gsm2computer-hub.service
+  systemctl --user start "$CALL_WATCH_UNIT"
   echo "cutover: restored $LIVE"
 }
 

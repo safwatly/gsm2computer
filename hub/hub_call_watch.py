@@ -8,7 +8,31 @@ from pathlib import Path
 from alert_webhook import post_alert_event
 
 STATE = Path.home() / "gsm2computer-call-end-watch" / "state.json"
-PEER = os.environ.get("MOTO_TS_IP", "")
+
+
+def host_of_adb(serial: str) -> str:
+    """Host from an adb serial. `192.0.2.8:5555` -> `192.0.2.8`. A bare host stays."""
+    text = (serial or "").strip()
+    host, sep, port = text.rpartition(":")
+    if sep and port.isdigit():
+        return host.strip().strip("[]")
+    return text
+
+
+def phone_peer(environ: dict | None = None) -> str:
+    """Tailscale address of the phone.
+
+    `MOTO_TS_IP` wins. Otherwise the host part of `GSM2COMPUTER_CALL_END_ADB`
+    on this process, which is how the cup hub-call-watch unit names the phone.
+    """
+    env = os.environ if environ is None else environ
+    explicit = (env.get("MOTO_TS_IP") or "").strip()
+    if explicit:
+        return explicit
+    return host_of_adb(env.get("GSM2COMPUTER_CALL_END_ADB") or "")
+
+
+PEER = phone_peer()
 GRACE_S = 25
 OFFLINE_S = 600
 log = lambda *a: print(datetime.now().isoformat(timespec="seconds"), *a, flush=True)
@@ -35,7 +59,7 @@ def on_end(start, tap, reason):
 
 def ts_monitor():
     if not PEER:
-        log("MOTO_TS_IP unset; phone reachability check off")
+        log("phone address unset (MOTO_TS_IP or GSM2COMPUTER_CALL_END_ADB); reachability check off")
         return
     off_since, alerted = None, False
     while True:
