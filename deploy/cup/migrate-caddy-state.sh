@@ -8,6 +8,8 @@
 # apply refuses, without stopping Caddy, when the destination already has
 # different files. The fingerprint and the unit backup are stored under
 # /var/lib/caddy. Any failure after the stop restores that unit explicitly.
+# systemctl start returns before the TLS listener answers, so the post-start
+# fingerprint read retries until a certificate is printed.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -24,6 +26,8 @@ BEFORE=${GSM2COMPUTER_CADDY_FINGERPRINT_BEFORE:-$STATE_PARENT/gsm-cert.before}
 AFTER=${GSM2COMPUTER_CADDY_FINGERPRINT_AFTER:-$STATE_PARENT/gsm-cert.after}
 CONNECT=${GSM2COMPUTER_CADDY_CONNECT:-62.83.35.197:443}
 SERVERNAME=${GSM2COMPUTER_CADDY_SERVERNAME:-gsm.ta3leam.com}
+# Backoff after start: 1, 2, 4, then 8 seconds, and never past this cap.
+FINGERPRINT_WAIT_SECS=${GSM2COMPUTER_CADDY_FINGERPRINT_WAIT_SECS:-30}
 
 die() {
   echo "migrate-caddy-state: $*" >&2
@@ -45,6 +49,36 @@ read_fingerprint() {
   fi
   echo | openssl s_client -connect "$CONNECT" -servername "$SERVERNAME" 2>/dev/null \
     | openssl x509 -noout -fingerprint -sha256
+}
+
+# Used only after start. Empty and failed reads mean TLS is not up yet, so
+# they are not compared. Prints the fingerprint once TLS answers.
+read_fingerprint_after_start() {
+  local delay=1 waited=0 out rc
+  while true; do
+    out=""
+    rc=0
+    # Keep trailing newlines so the later cmp matches the saved file.
+    out=$(read_fingerprint && printf x) || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      out=${out%x}
+      if [[ -n "${out//[[:space:]]/}" ]]; then
+        printf '%s' "$out"
+        return 0
+      fi
+    fi
+    if (( waited >= FINGERPRINT_WAIT_SECS )); then
+      return 1
+    fi
+    if (( waited + delay > FINGERPRINT_WAIT_SECS )); then
+      delay=$((FINGERPRINT_WAIT_SECS - waited))
+    fi
+    sleep "$delay"
+    waited=$((waited + delay))
+    if (( delay < 8 )); then
+      delay=$((delay * 2))
+    fi
+  done
 }
 
 # Non-empty destination whose files are not the source tree.
@@ -108,10 +142,16 @@ restore_old_unit() {
   exit 1
 }
 
+# 0 match, 1 TLS answered with a different certificate, 2 TLS stayed silent.
 fingerprints_match() {
   install -d -m 0755 "$(dirname "$AFTER")"
-  read_fingerprint >"$AFTER" || return 1
-  cmp -s "$BEFORE" "$AFTER"
+  if ! read_fingerprint_after_start >"$AFTER"; then
+    return 2
+  fi
+  if cmp -s "$BEFORE" "$AFTER"; then
+    return 0
+  fi
+  return 1
 }
 
 apply_copy() {
@@ -138,7 +178,12 @@ apply_copy() {
   if ! systemctl start "$UNIT_NAME"; then
     restore_old_unit "start failed"
   fi
-  if ! fingerprints_match; then
+  local match=0
+  fingerprints_match || match=$?
+  if [[ "$match" -eq 2 ]]; then
+    restore_old_unit "certificate did not answer on TLS"
+  fi
+  if [[ "$match" -eq 1 ]]; then
     restore_old_unit "fingerprint changed"
   fi
   echo "migrate-caddy-state: applied, certificate unchanged; $OLD left in place"
@@ -156,7 +201,13 @@ rollback_unit() {
     echo "migrate-caddy-state: no saved fingerprint; restored the previous unit"
     return 0
   fi
-  if ! fingerprints_match; then
+  local match=0
+  fingerprints_match || match=$?
+  if [[ "$match" -eq 2 ]]; then
+    echo "migrate-caddy-state: certificate did not answer on TLS" >&2
+    exit 1
+  fi
+  if [[ "$match" -eq 1 ]]; then
     echo "migrate-caddy-state: fingerprint differs from $BEFORE" >&2
     exit 1
   fi

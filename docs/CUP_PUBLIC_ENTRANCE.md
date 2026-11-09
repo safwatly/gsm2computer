@@ -115,6 +115,8 @@ The entrance is already live. The previous unit set no `HOME` and no `XDG_*`, an
 
 If the copy, the unit install, `daemon-reload`, `start`, or the fingerprint check fails, the script does not depend on `set -e`. It stops Caddy, writes the backed-up unit back, `daemon-reload`, and starts that unit. A second apply, once the new unit is installed and the copy matches, does nothing.
 
+`systemctl start` returns before Caddy accepts TLS. The post-start fingerprint read retries until a certificate is printed, sleeping 1, 2, 4, then 8 seconds and stopping at 30 seconds. It compares only after that read succeeds. An empty read is not a certificate change. If TLS never answers, apply restores the previous unit.
+
 ```bash
 sudo deploy/cup/migrate-caddy-state.sh apply
 sudo journalctl -u gsm2computer-caddy.service -n 50 --no-pager
@@ -189,7 +191,7 @@ Do these independently. You do not need to undo all of them.
 |---|---|
 | Firewall lockout, timer still running | Wait. It removes the TCP 443 rule. Or from the surviving SSH session: `sudo deploy/cup/gsm2computer-nft.sh revert` |
 | Firewall confirmed, want 443 closed | `sudo /usr/local/sbin/gsm2computer-nft.sh revert` (disables the boot unit, deletes the 443 rule, removes the include) |
-| Caddy unit after the copy | `sudo deploy/cup/migrate-caddy-state.sh rollback`. Stops Caddy, restores `/var/lib/caddy/gsm2computer-caddy.service.bak`, `daemon-reload`, and starts that unit. It compares `/var/lib/caddy/gsm-cert.before` when that file exists, and still restores the unit when it does not. It does not move `/caddy` or `/var/lib/caddy/caddy`. `apply` runs the same unit restore if start fails or the fingerprint changes. |
+| Caddy unit after the copy | `sudo deploy/cup/migrate-caddy-state.sh rollback`. Stops Caddy, restores `/var/lib/caddy/gsm2computer-caddy.service.bak`, `daemon-reload`, and starts that unit. It waits up to 30 seconds for TLS, then compares `/var/lib/caddy/gsm-cert.before` when that file exists, and still restores the unit when it does not. It does not move `/caddy` or `/var/lib/caddy/caddy`. `apply` runs the same unit restore if start fails, TLS never answers, or the fingerprint changes. |
 | Caddy certificate or proxy, storage not moved | `sudo systemctl disable --now gsm2computer-caddy.service` |
 | Public hub socket | Comment out `GSM2COMPUTER_PUBLIC_ENABLE`, `systemctl --user restart gsm2computer-hub.service`. Tailscale `:8787` keeps the previous behavior |
 | Bad hub code | `git checkout <previous>` in the deployed checkout, restart the user unit. With `PUBLIC_ENABLE` unset the new code still serves only the Tailscale socket |

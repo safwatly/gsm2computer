@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The copy leaves /caddy in place. A failed start or a new fingerprint puts
 # the previous unit back without moving either tree. The fingerprint lives
-# under the state dir, so wiping /tmp does not matter.
+# under the state dir, so wiping /tmp does not matter. A slow TLS listener
+# is retried until it answers; silence until the wait cap is a failure.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -36,14 +37,37 @@ fi
 if [[ "${1:-}" == "start" && -f "${GSM2COMPUTER_CADDY_FINGERPRINT_ON_START:-}" ]]; then
   cp "$GSM2COMPUTER_CADDY_FINGERPRINT_ON_START" "$GSM2COMPUTER_CADDY_FINGERPRINT_NOW"
 fi
+if [[ "${1:-}" == "start" && -n "${GSM2COMPUTER_CADDY_TLS_SLOW_READS:-}" ]]; then
+  printf '%s\n' "$GSM2COMPUTER_CADDY_TLS_SLOW_READS" >"$GSM2COMPUTER_CADDY_TLS_SLOW_LEFT"
+fi
 exit 0
 EOF
 cat >"$BIN/fingerprint" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+left=${GSM2COMPUTER_CADDY_TLS_SLOW_LEFT:-}
+if [[ -n "$left" && -f "$left" ]]; then
+  n=$(cat "$left")
+  if [[ "$n" -gt 0 ]]; then
+    printf '%s\n' $((n - 1)) >"$left"
+    # The last miss is an empty read (what left gsm-cert.after empty).
+    # Earlier misses are connection refused, which is what openssl s_client
+    # returns before the listener accepts.
+    if [[ "$n" -eq 1 ]]; then
+      exit 0
+    fi
+    exit 1
+  fi
+fi
 cat "$GSM2COMPUTER_CADDY_FINGERPRINT_NOW"
 EOF
-chmod 755 "$BIN/systemctl" "$BIN/fingerprint"
+cat >"$BIN/sleep" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'sleep %s\n' "$1" >>"$GSM2COMPUTER_CADDY_ACTION_LOG"
+exit 0
+EOF
+chmod 755 "$BIN/systemctl" "$BIN/fingerprint" "$BIN/sleep"
 
 export PATH="$BIN:/usr/bin:/bin"
 export GSM2COMPUTER_CADDY_STATE_OLD=$WORK/caddy
@@ -57,6 +81,7 @@ export GSM2COMPUTER_CADDY_FINGERPRINT_BEFORE=$WORK/var/lib/caddy/gsm-cert.before
 export GSM2COMPUTER_CADDY_FINGERPRINT_AFTER=$WORK/var/lib/caddy/gsm-cert.after
 export GSM2COMPUTER_CADDY_FINGERPRINT_CMD=$BIN/fingerprint
 export GSM2COMPUTER_CADDY_FINGERPRINT_NOW=$WORK/fingerprint
+export GSM2COMPUTER_CADDY_TLS_SLOW_LEFT=$WORK/tls-slow-left
 export GSM2COMPUTER_CADDY_ACTION_LOG=$WORK/actions
 export GSM2COMPUTER_CADDY_FAIL_START_FLAG=$WORK/fail-start
 
@@ -69,8 +94,13 @@ reset_tree() {
   printf 'SHA256 Fingerprint=AA:AA\n' >"$WORK/good-fingerprint"
   printf 'SHA256 Fingerprint=BB:BB\n' >"$WORK/bad-fingerprint"
   : >"$GSM2COMPUTER_CADDY_ACTION_LOG"
-  rm -f "$GSM2COMPUTER_CADDY_FAIL_START_FLAG"
+  rm -f "$GSM2COMPUTER_CADDY_FAIL_START_FLAG" "$GSM2COMPUTER_CADDY_TLS_SLOW_LEFT"
   unset GSM2COMPUTER_CADDY_FINGERPRINT_ON_START
+  unset GSM2COMPUTER_CADDY_TLS_SLOW_READS
+}
+
+sleep_total() {
+  awk '/^sleep / { s += $2 } END { print s + 0 }' "$GSM2COMPUTER_CADDY_ACTION_LOG"
 }
 
 run_migrate() {
@@ -114,6 +144,7 @@ export GSM2COMPUTER_CADDY_FINGERPRINT_ON_START=$WORK/good-fingerprint
 rc=$(run_migrate apply)
 [[ "$rc" -eq 1 ]] || fail "start-fail rc=$rc $(cat "$WORK/err") $(cat "$WORK/out")"
 grep -q 'start failed' "$WORK/err" || fail "start-fail message: $(cat "$WORK/err")"
+[[ "$(sleep_total)" -eq 0 ]] || fail "start-fail waited for TLS: $(cat "$GSM2COMPUTER_CADDY_ACTION_LOG")"
 [[ "$(cat "$WORK/caddy/acme/account.json")" == "account" ]] || fail "start-fail touched /caddy"
 [[ "$(cat "$GSM2COMPUTER_CADDY_STATE_NEW/acme/account.json")" == "account" ]] || fail "start-fail did not keep the copy"
 [[ "$(cat "$GSM2COMPUTER_CADDY_UNIT_DEST")" == "OLD UNIT" ]] || fail "start-fail left the new unit"
@@ -127,10 +158,40 @@ export GSM2COMPUTER_CADDY_FINGERPRINT_ON_START=$WORK/bad-fingerprint
 rc=$(run_migrate apply)
 [[ "$rc" -eq 1 ]] || fail "mismatch rc=$rc $(cat "$WORK/out") $(cat "$WORK/err")"
 grep -q 'fingerprint changed' "$WORK/err" || fail "mismatch message: $(cat "$WORK/err")"
+[[ "$(sleep_total)" -eq 0 ]] || fail "mismatch retried a certificate that already answered: $(cat "$GSM2COMPUTER_CADDY_ACTION_LOG")"
 [[ "$(cat "$WORK/caddy/acme/account.json")" == "account" ]] || fail "mismatch touched /caddy"
 [[ "$(cat "$GSM2COMPUTER_CADDY_STATE_NEW/acme/account.json")" == "account" ]] || fail "mismatch removed the copy"
 [[ "$(cat "$GSM2COMPUTER_CADDY_UNIT_DEST")" == "OLD UNIT" ]] || fail "mismatch left the new unit"
 note "  old unit restored rc=1"
+
+note "tls slow to answer, then the same certificate"
+reset_tree
+export GSM2COMPUTER_CADDY_FINGERPRINT_ON_START=$WORK/good-fingerprint
+export GSM2COMPUTER_CADDY_TLS_SLOW_READS=3
+rc=$(run_migrate apply)
+[[ "$rc" -eq 0 ]] || fail "slow-tls rc=$rc $(cat "$WORK/err") $(cat "$WORK/out")"
+[[ "$(sleep_total)" -eq 7 ]] || fail "slow-tls backoff was $(sleep_total), want 1+2+4: $(cat "$GSM2COMPUTER_CADDY_ACTION_LOG")"
+[[ "$(grep -c '^start ' "$GSM2COMPUTER_CADDY_ACTION_LOG")" -eq 1 ]] || fail "slow-tls restored the unit: $(cat "$GSM2COMPUTER_CADDY_ACTION_LOG")"
+grep -q 'XDG_DATA_HOME=/var/lib/caddy' "$GSM2COMPUTER_CADDY_UNIT_DEST" || fail "slow-tls did not keep the new unit"
+cmp -s "$GSM2COMPUTER_CADDY_FINGERPRINT_BEFORE" "$GSM2COMPUTER_CADDY_FINGERPRINT_AFTER" || fail "slow-tls compared before TLS answered"
+[[ "$(cat "$WORK/caddy/acme/account.json")" == "account" ]] || fail "slow-tls touched /caddy"
+[[ "$(cat "$GSM2COMPUTER_CADDY_STATE_NEW/acme/account.json")" == "account" ]] || fail "slow-tls missed the copy"
+note "  apply rc=0 after refused and empty reads"
+
+note "tls silent for the whole wait restores the old unit"
+reset_tree
+export GSM2COMPUTER_CADDY_FINGERPRINT_ON_START=$WORK/good-fingerprint
+export GSM2COMPUTER_CADDY_TLS_SLOW_READS=1000
+rc=$(run_migrate apply)
+[[ "$rc" -eq 1 ]] || fail "tls-silent rc=$rc $(cat "$WORK/out") $(cat "$WORK/err")"
+grep -q 'did not answer' "$WORK/err" || fail "tls-silent message: $(cat "$WORK/err")"
+[[ "$(sleep_total)" -eq 30 ]] || fail "tls-silent waited $(sleep_total)s, want 30: $(cat "$GSM2COMPUTER_CADDY_ACTION_LOG")"
+[[ ! -s "$GSM2COMPUTER_CADDY_FINGERPRINT_AFTER" ]] || fail "tls-silent wrote a fingerprint: $(cat "$GSM2COMPUTER_CADDY_FINGERPRINT_AFTER")"
+[[ "$(cat "$GSM2COMPUTER_CADDY_UNIT_DEST")" == "OLD UNIT" ]] || fail "tls-silent left the new unit"
+[[ "$(grep -c '^start ' "$GSM2COMPUTER_CADDY_ACTION_LOG")" -eq 2 ]] || fail "tls-silent did not restart the old unit: $(cat "$GSM2COMPUTER_CADDY_ACTION_LOG")"
+[[ "$(cat "$WORK/caddy/acme/account.json")" == "account" ]] || fail "tls-silent touched /caddy"
+[[ "$(cat "$GSM2COMPUTER_CADDY_STATE_NEW/acme/account.json")" == "account" ]] || fail "tls-silent removed the copy"
+note "  old unit restored after 30s rc=1"
 
 note "rollback with both trees, after /tmp is wiped"
 reset_tree
