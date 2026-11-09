@@ -36,17 +36,103 @@ call_verified_idle() {
         log_msg "watchdog: dumpsys telephony.registry unusable; not restarting Tailscale"
     elif ! [ -s "$_dumpf" ]; then
         log_msg "watchdog: dumpsys telephony.registry unusable; not restarting Tailscale"
-    # Any active, off-hook, or ringing value blocks a restart, even when
-    # another line says mCallState=0. Word boundaries keep mRingingCallState=0
-    # from matching RINGING. A contradictory dump is not idle.
-    elif grep -E -q -i \
-        '(^|[^A-Za-z0-9_])(OFFHOOK|RINGING|FG_ACTIVE|BG_ACTIVE|DIALING|ALERTING|INCOMING|WAITING|HOLDING|DISCONNECTING)([^A-Za-z0-9_]|$)|mCallState=[1-9]|mRingingCallState=[1-9]|mForegroundCallState=[1-9]|mBackgroundCallState=[1-9]|PreciseCallState=ACTIVE([^A-Za-z0-9_]|$)' \
-        "$_dumpf"; then
-        log_msg "watchdog: call active or contradictory; not restarting Tailscale"
-    elif grep -E -q 'mCallState=0' "$_dumpf"; then
-        _idle=1
     else
-        log_msg "watchdog: telephony state is not an explicit idle; not restarting Tailscale"
+        # Only the current per-subscription fields count. An idle Moto dump
+        # still contains "Ringing call state: -1" and data-connection history
+        # ("state: DISCONNECTING") plus older OFFHOOK/RINGING log lines.
+        # Those are not a live call. A value on mCallState, the three
+        # m*CallState fields, or mPreciseCallState is. -1, 0, and precise
+        # DISCONNECTED (7) are idle. Anything else, or no mCallState at all,
+        # is not idle.
+        _verdict=$(awk '
+function trim(v) {
+    sub(/^[ \t]+/, "", v)
+    sub(/[ \t]+$/, "", v)
+    return v
+}
+function first_token(v) {
+    v = trim(v)
+    sub(/[, \t].*/, "", v)
+    return v
+}
+function callstate_idle(v) {
+    v = first_token(v)
+    return (v == "0" || v == "IDLE")
+}
+function substate_idle(v) {
+    v = first_token(v)
+    return (v == "0" || v == "-1" || v == "IDLE" || v == "NOT_VALID")
+}
+function precise_num_idle(v) {
+    v = first_token(v)
+    if (v == "-1" || v == "0" || v == "7") return 1
+    if (v == "IDLE" || v == "NOT_VALID" || v == "DISCONNECTED") return 1
+    return 0
+}
+function value_after(s, label, i, rest, n) {
+    i = index(s, label)
+    if (i == 0) return ""
+    rest = substr(s, i + length(label))
+    sub(/^[ \t]+/, "", rest)
+    n = index(rest, ",")
+    if (n > 0) rest = substr(rest, 1, n - 1)
+    sub(/[ \t]+$/, "", rest)
+    return rest
+}
+function consider_precise(v, r, f, b) {
+    if (index(v, "Ringing call state:") > 0) {
+        r = value_after(v, "Ringing call state:")
+        f = value_after(v, "Foreground call state:")
+        b = value_after(v, "Background call state:")
+        if (!precise_num_idle(r) || !precise_num_idle(f) || !precise_num_idle(b)) bad = 1
+        return
+    }
+    v = trim(v)
+    if (!(v == "IDLE" || v == "NOT_VALID" || v == "-1" || v == "0")) bad = 1
+}
+function take(line, key,    v) {
+    matched = 0
+    if (index(line, key) != 1) return ""
+    matched = 1
+    v = substr(line, length(key) + 1)
+    sub(/\r$/, "", v)
+    return v
+}
+{
+    line = $0
+    sub(/\r$/, "", line)
+    sub(/^[ \t]+/, "", line)
+    v = take(line, "mForegroundCallState=")
+    if (matched) { if (!substate_idle(v)) bad = 1; next }
+    v = take(line, "mBackgroundCallState=")
+    if (matched) { if (!substate_idle(v)) bad = 1; next }
+    v = take(line, "mRingingCallState=")
+    if (matched) { if (!substate_idle(v)) bad = 1; next }
+    v = take(line, "mPreciseCallState=")
+    if (matched) { consider_precise(v); next }
+    v = take(line, "PreciseCallState=")
+    if (matched) { consider_precise(v); next }
+    v = take(line, "mCallState=")
+    if (matched) {
+        seen = 1
+        if (!callstate_idle(v)) bad = 1
+    }
+}
+END {
+    if (bad) print "active"
+    else if (seen) print "idle"
+    else print "unknown"
+}
+' "$_dumpf" 2>/dev/null || true)
+        case ${_verdict:-unknown} in
+            idle) _idle=1 ;;
+            active)
+                log_msg "watchdog: call active or contradictory; not restarting Tailscale"
+                ;;
+            *)
+                log_msg "watchdog: telephony state is not an explicit idle; not restarting Tailscale"
+                ;;
+        esac
     fi
     fi
     rm -f "$_dumpf"

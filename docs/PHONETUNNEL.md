@@ -225,9 +225,14 @@ of the config is next to it as `sshd_config.bak.phonetunnel`.
 - The watchdog only force-stops `com.tailscale.ipn`. Any other
   `TS_PACKAGE` is rejected, so a bad config cannot aim it at
   `com.gsm2computer.bridge`. It restarts only when `dumpsys
-  telephony.registry` contains `mCallState=0` and no active precise or
-  legacy call state (`mPreciseCallState=FG_ACTIVE` counts as a call).
-  Empty output, a dumpsys error, or an unrecognized dump is not idle.
+  telephony.registry` shows every subscription's current `mCallState`
+  as `0` and the current precise-call fields as idle. History lines
+  (`state: OFFHOOK`, `CallState: RINGING`, `state: DISCONNECTING` on a
+  data connection) and the label `Ringing call state: -1` are not a
+  live call. `mCallState=2`, `mForegroundCallState=1`, a precise value
+  other than `-1`, `0`, or disconnected `7`, and
+  `mPreciseCallState=FG_ACTIVE` are a live call. Empty output, a
+  dumpsys error, or a dump with no `mCallState` is not idle.
   The dump is written to a file and grepped there, so a large
   `telephony.registry` does not die with `Argument list too long`.
   Tailscale is up when `ip addr show` lists a `tunN` or `tailscaleN`

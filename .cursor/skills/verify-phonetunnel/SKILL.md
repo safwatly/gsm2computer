@@ -82,7 +82,7 @@ Each drive writes a file under `/opt/cursor/artifacts/verify-phonetunnel/`
 | `adb-forward.txt` | `adb_reply=adb-standin-ok` through the cup adb port |
 | `reconnect.txt` | shell works after killing the client, after an iptables drop, and after restarting the stand-in sshd |
 | `supervise.txt` | dropbear restarts under the same tunnel pid; a dead dropbear makes `tunnel=down` while `tunnel_session=up` |
-| `watchdog.txt` | streak restart, rate limit, call states, `ip` error, and a bridge package do not over-restart; `tun1` with a CGNAT address is up; carrier CGNAT alone is down; a dumpsys bigger than 200KB still counts as idle under `mksh` |
+| `watchdog.txt` | streak restart, rate limit, call states, `ip` error, and a bridge package do not over-restart; `tun1` with a CGNAT address is up; carrier CGNAT alone is down; a ~250KB idle dump with historical `OFFHOOK`/`RINGING` still counts as idle under `mksh`, and a current precise foreground of `1` does not |
 | `nopasswd.txt` | Dropbear accepts `root` when `/etc/passwd` has no root line, and rejects any other missing name |
 | `policy.txt` | zero timers are raised, an earlier Include Match is refused and the config restored, key and Match block the extra `-R`, `-L`, and unix-socket forward, and ForceCommand runs |
 | `account.txt` | real `useradd` in a private mount namespace: a loose Match writes nothing, a failure after the hold script rolls the new user back, a fresh account has shell `/bin/sh`, and a second run reuses the key. Host passwd is unchanged. Uninstall does not kill a reused pid |
