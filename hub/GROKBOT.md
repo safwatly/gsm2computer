@@ -31,9 +31,12 @@ call_end_watch, cup_watchdog reply_audio and the post-call silent check read
 the grok-* taps for these calls.
 
 Every call, not only Grok Bot, also writes `phone-downlink-8k-mono.wav`: the
-mono PCM the hub handed to the phone, stored at 8 kHz. Existing stems and the
-room MP3s stay. The file is not deleted when those rooms are mixed. Retention
-is still `GSM2COMPUTER_CALL_RECORD_KEEP` directories (default 20).
+mono PCM the hub handed to the phone, stored at 8 kHz. The pump queues those
+frames and a side task writes the WAV, so a slow disk does not stall the
+downlink. Existing stems and the room MP3s stay. The file is not deleted when
+those rooms are mixed. Retention is still `GSM2COMPUTER_CALL_RECORD_KEEP`
+directories (default 20). The queue drops frames if it gets about two seconds
+behind.
 
 ```bash
 ffprobe ~/gsm2computer-calls/<call-id>/phone-downlink-8k-mono.wav
@@ -47,17 +50,29 @@ that remains for every mode, including loopback.
 ## Voice transcript
 
 After `patchbay off` (never during the live session), the hub reads the Grok
-page over CDP, opens the newest voice-session entry if the transcript is not
-already on screen, and writes `transcript.json` next to the recordings. The
-next `patchbay switch` waits for that read, which gives up after about 12
-seconds. A failure logs the reason, records `transcript_status`, and does not
-fail the call or the `call_ended` alert.
+page over a loopback CDP debugger URL. It accepts only a voice-session link
+whose start time falls in this call's window (30s of slack on either side) and
+clicks that link only when it is not already open. An unlabeled `/c/` chat is
+not opened. Zero matches are `unmatched`. Two sessions that share the newest
+in-window start are `ambiguous`. Turns that are not clearly the caller or the
+assistant are dropped. The page host must be `grok.com`, `grok.x.ai`, or
+`x.com/i/grok` — a host that merely contains the name is ignored — and
+`webSocketDebuggerUrl` must be loopback.
+
+The read gives up after about 12 seconds. A new call does not wait that out:
+it aborts the reader (about 1 second) and then runs `patchbay switch`, so the
+click cannot land on the next caller's session. A failure logs the reason,
+records `transcript_status` (`no_cdp`, `off_failed`, `empty`, `unmatched`,
+`ambiguous`, `aborted`, `error`), and does not fail the call.
+
+`call_ended` is posted on the existing path and is not held for this read. If
+the file is not ready yet the alert says `transcript_status=pending`. When the
+file is written the hub posts a follow-up `call_transcript` event with the
+pointer.
 
 `patchbay status --json` must expose a loopback CDP base (`cdp_http`,
 `cdp_url`, or `cdp_port`). Otherwise set `GSM2COMPUTER_GROKBOT_CDP` to
-`http://127.0.0.1:<port>`. The reader ignores any CDP URL that is not
-loopback, and it ignores pages that are not Grok, so it will not click the
-OpenClaw Talk browser.
+`http://127.0.0.1:<port>`. The reader will not click the OpenClaw Talk browser.
 
 ```bash
 jq -r '.turns[] | [.speaker, (.timestamp // "-"), .text] | @tsv' \
@@ -65,11 +80,12 @@ jq -r '.turns[] | [.speaker, (.timestamp // "-"), .text] | @tsv' \
 ```
 
 `speaker` is `caller` or `assistant`. `timestamp` is null when the page had
-none. The `call_ended` payload (adb watcher and hub watcher) includes
-`transcript.status`, `transcript.path`, `transcript.turns`, `transcript.error`,
-and a short `transcript.preview`. `GET /portal/api/calls` adds the same
-pointer when the file is on disk, including for a call row posted before the
-read finished.
+none. The `call_ended` payload (adb watcher and hub watcher) and the follow-up
+`call_transcript` event include `transcript.status`, `transcript.path`,
+`transcript.turns`, `transcript.error`, and a short `transcript.preview`.
+`GET /portal/api/calls` adds the same pointer when the file is on disk,
+including for a call row posted before the read finished. The Calls card reads
+that pointer from the bundle `hub/portal/dist/index.html` loads.
 
 ## Self-test
 
@@ -90,6 +106,8 @@ read finished.
 | GSM2COMPUTER_GROKBOT_SWITCH_TIMEOUT_S | 60 |
 | GSM2COMPUTER_GROKBOT_CDP | unset; loopback URL from `patchbay status --json` |
 | GSM2COMPUTER_GROKBOT_TRANSCRIPT_TIMEOUT_S | 12 |
+| GSM2COMPUTER_GROKBOT_TRANSCRIPT_ABORT_S | 1 (max extra wait before the next switch) |
+| GSM2COMPUTER_GROKBOT_TRANSCRIPT_SLACK_S | 30 (call window around the voice-session start) |
 | GSM2COMPUTER_CALL_RECORD_KEEP | 20 call directories, including the downlink and transcript |
 
 ## Deploy / rollback (only while /health idle)

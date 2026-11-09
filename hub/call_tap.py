@@ -69,6 +69,8 @@ RECORD_DIR = Path(
 KEEP_CALLS = int(os.environ.get("GSM2COMPUTER_CALL_RECORD_KEEP", "20"))
 PHONE_DOWNLINK = "phone-downlink-8k-mono"
 PHONE_DOWNLINK_RATE = 8000
+# About two seconds of 20 ms frames. A stalled disk drops audio instead of stalling the pump.
+_DOWNLINK_QUEUE_MAX = 100
 MIX_TIMEOUT_S = 30.0
 
 # out name, left stem, right stem, mix sample rate
@@ -262,6 +264,12 @@ class CallTap:
         self._closed = False
         self._downlink_ratecv: Any = None
         self._downlink_src_rate: Optional[int] = None
+        self._down_q: list[bytes] = []
+        self._down_scheduled = False
+        self._down_task: Optional[asyncio.Task] = None
+        self._down_drop_logged = False
+        self._down_stop = False
+        self.started_wall = datetime.now(timezone.utc).timestamp()
         LOG.info("call tap dir %s", self.dir)
 
     @classmethod
@@ -332,7 +340,47 @@ class CallTap:
             self._downlink_src_rate = rate
         if not pcm:
             return
-        self.write_s16(PHONE_DOWNLINK, pcm, PHONE_DOWNLINK_RATE, 1)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None or self._down_stop:
+            self.write_s16(PHONE_DOWNLINK, pcm, PHONE_DOWNLINK_RATE, 1)
+            return
+        if len(self._down_q) >= _DOWNLINK_QUEUE_MAX:
+            self._down_q.pop(0)
+            if not self._down_drop_logged:
+                self._down_drop_logged = True
+                LOG.warning("phone downlink record fell behind; dropping frames")
+        self._down_q.append(pcm)
+        if not self._down_scheduled:
+            self._down_scheduled = True
+            self._down_task = loop.create_task(self._drain_phone_downlink())
+
+    async def _drain_phone_downlink(self) -> None:
+        try:
+            while self._down_q:
+                chunk = self._down_q.pop(0)
+                await asyncio.to_thread(self.write_s16, PHONE_DOWNLINK, chunk, PHONE_DOWNLINK_RATE, 1)
+        finally:
+            self._down_scheduled = False
+            if self._down_q and not self._closed:
+                self._down_scheduled = True
+                self._down_task = asyncio.create_task(self._drain_phone_downlink())
+
+    async def flush_phone_downlink(self) -> None:
+        """Write queued phone-downlink frames before the WAV is closed."""
+        for _ in range(20):
+            task = self._down_task
+            if not self._down_q and (task is None or task.done()):
+                return
+            if task is not None and not task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    return
+            else:
+                await asyncio.sleep(0)
 
     def write_ulaw(self, name: str, ulaw: bytes, rate: int = 8000) -> None:
         if self._closed or not ulaw:
@@ -421,9 +469,42 @@ class CallTap:
             "streams": {name: stream.stats() for name, stream in self._streams.items()},
         }
 
+    def _summary_with_transcript(self, summary: dict[str, Any]) -> dict[str, Any]:
+        """Keep a transcript already saved, including one written into levels.json."""
+        try:
+            from grokbot_transcript import load_saved_pointer
+
+            pointer = load_saved_pointer(self.dir)
+        except Exception:
+            pointer = None
+        if pointer:
+            summary["transcript"] = pointer
+            return summary
+        levels = self.dir / "levels.json"
+        if not levels.is_file():
+            return summary
+        try:
+            existing = json.loads(levels.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return summary
+        if isinstance(existing, dict) and isinstance(existing.get("transcript"), dict):
+            summary["transcript"] = existing["transcript"]
+        return summary
+
+    def write_levels(self, summary: dict[str, Any]) -> dict[str, Any]:
+        """Rewrite levels.json without dropping a transcript pointer already stored."""
+        summary = self._summary_with_transcript(dict(summary))
+        path = self.dir / "levels.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        return summary
+
     async def close(self) -> dict[str, Any]:
         if self._closed and not self._procs and not self._tasks:
-            return self.summary()
+            summary = self._summary_with_transcript(self.summary())
+            summary["meta"] = self.meta
+            return summary
         await self.stop_capture()
         mixes: dict[str, Any] = {}
         try:
@@ -433,15 +514,9 @@ class CallTap:
         summary = self.summary()
         summary["meta"] = self.meta
         summary["mixes"] = mixes
-        try:
-            from grokbot_transcript import load_saved_pointer
-
-            pointer = load_saved_pointer(self.dir)
-        except Exception:
-            pointer = None
-        if pointer:
-            summary["transcript"] = pointer
-        (self.dir / "levels.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        # Load the pointer immediately before the write so a transcript that
+        # landed during the mix is not overwritten away.
+        summary = self.write_levels(summary)
         LOG.info("call tap closed %s mixes=%s", json.dumps(summary["streams"]), json.dumps(mixes))
         return summary
 
@@ -449,6 +524,8 @@ class CallTap:
         """Stop pw-record helpers and close WAV stems. Does not mix."""
         if self._closed and not self._procs and not self._tasks:
             return
+        self._down_stop = True
+        await self.flush_phone_downlink()
         self._closed = True
         for proc in self._procs:
             if proc.returncode is None:

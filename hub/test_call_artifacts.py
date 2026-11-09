@@ -4,11 +4,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import wave
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +30,8 @@ class NormalizeTests(unittest.TestCase):
                 {"testid": "user-message", "text": "  Hello Suzie  ", "timestamp": "0:01"},
                 {"role": "Assistant", "text": "Hi.", "timestamp": None},
                 {"speaker": "caller", "text": "", "timestamp": "0:02"},
+                {"speaker": "unknown", "text": "mystery bubble"},
+                {"role": "narrator", "text": "stage direction"},
                 "skip",
             ],
             "20261109T120000Z-grokbot",
@@ -130,13 +135,23 @@ class CdpBaseTests(unittest.TestCase):
         with patch.dict(os.environ, {"GSM2COMPUTER_GROKBOT_CDP": "http://127.0.0.1:9444"}):
             self.assertEqual(gt.cdp_base_from_status({"cdp_port": 1}), "http://127.0.0.1:9444")
 
-    def test_page_must_be_grok(self) -> None:
+    def test_page_must_be_grok_on_loopback(self) -> None:
         targets = [
-            {"type": "page", "url": "http://127.0.0.1:18789/chat", "webSocketDebuggerUrl": "ws://talk"},
-            {"type": "page", "url": "https://grok.com/", "webSocketDebuggerUrl": "ws://grok"},
+            {"type": "page", "url": "http://127.0.0.1:18789/chat", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/1"},
+            {"type": "page", "url": "https://notgrok.com/", "webSocketDebuggerUrl": "ws://127.0.0.1:9333/devtools/page/9"},
+            {"type": "page", "url": "https://grok.com/", "webSocketDebuggerUrl": "ws://203.0.113.5:9333/devtools/page/1"},
+            {"type": "page", "url": "https://grok.com/c/abc", "webSocketDebuggerUrl": "ws://127.0.0.1:9333/devtools/page/2"},
         ]
-        self.assertEqual(gt._grok_page(targets)["webSocketDebuggerUrl"], "ws://grok")
+        self.assertEqual(gt._grok_page(targets)["webSocketDebuggerUrl"], "ws://127.0.0.1:9333/devtools/page/2")
         self.assertIsNone(gt._grok_page(targets[:1]))
+        self.assertFalse(gt._is_grok_url("https://notgrok.com/c/abc"))
+        self.assertFalse(gt._is_grok_url("https://evil.example/?next=https://grok.com"))
+        self.assertTrue(gt._is_grok_url("https://grok.com/c/abc"))
+        self.assertTrue(gt._is_grok_url("https://www.grok.com/"))
+        self.assertTrue(gt._is_grok_url("https://x.com/i/grok"))
+        self.assertFalse(gt._is_grok_url("https://x.com/home"))
+        self.assertFalse(gt._loopback_ws("ws://203.0.113.5:9333/devtools/page/1"))
+        self.assertTrue(gt._loopback_ws("ws://127.0.0.1:9333/devtools/page/2"))
 
 
 class DomJsTests(unittest.TestCase):
@@ -192,8 +207,9 @@ const root = new El({}, '', [
     ]),
   ]),
   new El({ 'data-testid': 'assistant-message', 'data-timestamp': '0:04' }, 'On the way', []),
+  new El({ class: 'message-bubble' }, 'mystery bubble', []),
   new El({ href: '/c/old', 'aria-label': 'Start voice' }, 'Start voice', []),
-  new El({ href: '/c/voice-1', 'aria-label': 'Voice call with Suzie' }, 'Voice call', []),
+  new El({ href: '/c/voice-1', 'aria-label': 'Voice call with Suzie', 'data-started': '2026-11-09T12:00:30Z' }, 'Voice call', []),
   new El({ href: '/c/text-1' }, 'Notes', []),
 ]);
 const turns = gsm2VoiceTurns(root);
@@ -204,7 +220,9 @@ assert.strictEqual(turns[0].timestamp, '0:02');
 assert.strictEqual(turns[1].speaker, 'assistant');
 assert.strictEqual(turns[1].text, 'On the way');
 assert.strictEqual(turns[1].timestamp, '0:04');
-assert.strictEqual(gsm2VoiceSessionHref(root), '/c/voice-1');
+const sessions = gsm2VoiceSessions(root);
+assert.deepStrictEqual(sessions.map((s) => s.href), ['/c/voice-1']);
+assert.strictEqual(sessions[0].started, '2026-11-09T12:00:30Z');
 """ % gt.VOICE_DOM_JS
         proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
@@ -350,6 +368,158 @@ class AlertAndCallLogTests(unittest.TestCase):
                 store.close()
 
 
+class SessionMatchTests(unittest.TestCase):
+    def test_newest_in_window_ignores_text_chats_and_ties(self) -> None:
+        start = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc).timestamp()
+        end = start + 180
+        sessions = [
+            {"href": "/c/notes", "label": "Notes", "started": "2026-11-09T12:00:10Z"},
+            {"href": "/c/old", "label": "Voice call", "started": "2026-11-09T10:00:00Z"},
+            {"href": "/c/this", "label": "Voice call", "started": "2026-11-09T12:00:30Z"},
+            {"href": "/c/newer", "label": "Voice call", "started": "2026-11-09T12:01:00Z"},
+        ]
+        # The DOM helper already drops unlabeled chats. A session with no parseable
+        # start, or one outside the call window, is not this call.
+        choice = gt.select_voice_session(sessions[1:], start, end)
+        self.assertEqual(choice["status"], "chosen")
+        self.assertEqual(choice["href"], "/c/newer")
+        self.assertEqual(gt.select_voice_session([], start, end)["status"], "unmatched")
+        self.assertEqual(gt.select_voice_session(sessions[1:2], start, end)["status"], "unmatched")
+        tied = [
+            {"href": "/c/a", "started": "2026-11-09T12:00:30Z"},
+            {"href": "/c/b", "started": "2026-11-09T12:00:30Z"},
+        ]
+        self.assertEqual(gt.select_voice_session(tied, start, end)["status"], "ambiguous")
+        self.assertEqual(gt.select_voice_session(tied, None, end)["status"], "unmatched")
+
+    def test_unmatched_is_saved_not_ok(self) -> None:
+        async def reader(_url: str) -> dict:
+            return {"status": "unmatched", "error": "no voice session started during this call"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pointer = asyncio.run(
+                gt.capture_call_transcript(
+                    Path(tmp),
+                    "call-9",
+                    cdp_http="http://127.0.0.1:9333",
+                    read_turns=reader,
+                )
+            )
+        self.assertEqual(pointer["status"], "unmatched")
+        self.assertEqual(pointer["turns"], 0)
+
+    def test_pending_until_the_file_exists_then_follow_up(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pointer = gt.transcript_for_alert(
+                {"id": "20261109T120000Z-grokbot", "dir": tmp, "meta": {"mode": "grokbot"}}
+            )
+            self.assertEqual(pointer["status"], "pending")
+            self.assertIn("call_transcript", pointer["error"])
+            saved = gt.save_transcript_result(
+                Path(tmp),
+                "20261109T120000Z-grokbot",
+                "ok",
+                [{"speaker": "assistant", "text": "Here", "timestamp": None}],
+            )
+        with patch("alert_webhook.post_alert_event") as post:
+            gt.announce_transcript(saved)
+        payload = post.call_args.args[0]
+        self.assertEqual(payload["event"], "call_transcript")
+        self.assertEqual(payload["transcript_status"], "ok")
+        self.assertEqual(payload["call_id"], "20261109T120000Z-grokbot")
+
+
+class LevelMergeTests(unittest.TestCase):
+    def test_rewrite_keeps_the_saved_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tap = CallTap("20261109T120000Z-grokbot", {"mode": "grokbot"}, record_dir=Path(tmp))
+            gt.save_transcript_result(
+                tap.dir,
+                tap.call_id,
+                "ok",
+                [{"speaker": "caller", "text": "Hi", "timestamp": None}],
+            )
+            (tap.dir / "levels.json").write_text(
+                json.dumps({"mixes": {"gsm.mp3": {"seconds": 1}}, "transcript": {"status": "empty"}}) + "\n"
+            )
+            summary = tap.summary()
+            summary["mixes"] = {"gsm.mp3": {"seconds": 4}}
+            written = tap.write_levels(summary)
+            self.assertEqual(written["transcript"]["status"], "ok")
+            self.assertEqual(written["mixes"]["gsm.mp3"]["seconds"], 4)
+            disk = json.loads((tap.dir / "levels.json").read_text())
+            self.assertEqual(disk["transcript"]["status"], "ok")
+            self.assertEqual(disk["mixes"]["gsm.mp3"]["seconds"], 4)
+
+    def test_early_close_does_not_drop_levels(self) -> None:
+        async def scenario(tap: CallTap) -> dict:
+            tap.write_s16("gsm-uplink-8k-mono", b"\x00\x10" * 8, 8000, 1)
+            await tap.stop_capture()
+            return await tap.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tap = CallTap("20261109T120000Z-grokbot", {"mode": "grokbot"}, record_dir=Path(tmp))
+            gt.save_transcript_result(
+                tap.dir,
+                tap.call_id,
+                "ok",
+                [{"speaker": "caller", "text": "Hi", "timestamp": None}],
+            )
+            (tap.dir / "levels.json").write_text(
+                json.dumps({"mixes": {"gsm.mp3": {"seconds": 1}}, "note": "keep"}) + "\n"
+            )
+            summary = asyncio.run(scenario(tap))
+            self.assertEqual(summary["transcript"]["status"], "ok")
+            disk = json.loads((tap.dir / "levels.json").read_text())
+            self.assertEqual(disk["mixes"]["gsm.mp3"]["seconds"], 1)
+            self.assertEqual(disk["note"], "keep")
+
+
+class QueuedDownlinkTests(unittest.TestCase):
+    def test_loop_queues_the_wav_write(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                tap = CallTap("id", {}, record_dir=Path(tmp))
+                calls: list[str] = []
+                original = tap.write_s16
+
+                def wrapped(name: str, pcm: bytes, rate: int, channels: int = 1) -> None:
+                    calls.append(name)
+                    original(name, pcm, rate, channels)
+
+                tap.write_s16 = wrapped  # type: ignore[method-assign]
+                tap.write_phone_downlink(b"\x00\x10" * 8, 8000)
+                self.assertEqual(calls, [])
+                await tap.flush_phone_downlink()
+                self.assertEqual(calls, [PHONE_DOWNLINK])
+                tap._streams[PHONE_DOWNLINK].close()
+                self.assertGreater((tap.dir / f"{PHONE_DOWNLINK}.wav").stat().st_size, 44)
+
+        asyncio.run(scenario())
+
+
+class ServedBundleTests(unittest.TestCase):
+    def test_entry_bundle_has_the_transcript_label(self) -> None:
+        dist = HERE / "portal" / "dist"
+        html = (dist / "index.html").read_text(encoding="utf-8")
+        scripts = re.findall(r'src="([^"]+\.js)"', html)
+        self.assertTrue(scripts)
+        self.assertFalse(any("calls-" in src for src in scripts))
+        blob = ""
+        for src in scripts:
+            rel = src.split("/portal/", 1)[-1] if "/portal/" in src else src.lstrip("/")
+            path = dist / rel
+            self.assertTrue(path.is_file(), src)
+            blob += path.read_text(encoding="utf-8")
+        self.assertIn("meta transcript", blob)
+        self.assertIn("transcript ${", blob)
+        # calls-*.js is the offline mock list, not the calls page. The hub serves
+        # the script named by dist/index.html, and that bundle has the label.
+        mock = list((dist / "assets").glob("calls-*.js"))
+        self.assertTrue(mock)
+        self.assertNotIn("meta transcript", mock[0].read_text(encoding="utf-8"))
+
+
 class StopLaterHookTests(unittest.TestCase):
     def test_hook_runs_after_off_and_a_failed_hook_is_swallowed(self) -> None:
         from test_grokbot_mode import FakePatchbay, voice
@@ -377,6 +547,76 @@ class StopLaterHookTests(unittest.TestCase):
 
         asyncio.run(scenario())
         self.assertEqual(pb.calls().count("off --json"), 2)
+
+    def test_new_call_aborts_the_reader_before_switch(self) -> None:
+        from test_grokbot_mode import FakePatchbay, voice
+
+        pb = FakePatchbay()
+        v = voice(pb)
+        order: list[str] = []
+
+        async def scenario() -> None:
+            await v.start()
+            started = asyncio.Event()
+
+            async def hook(_res: dict) -> None:
+                started.set()
+                try:
+                    while not v.transcript_abort.is_set():
+                        await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    order.append("cancelled")
+                    return
+                if v.transcript_abort.is_set():
+                    order.append("aborted")
+                    return
+                order.append("click")
+
+            v.transcript_abort_s = 0.5
+            task = v.stop_later(on_stopped=hook)
+            await asyncio.wait_for(started.wait(), timeout=2)
+            t0 = time.monotonic()
+            await v.start()
+            self.assertLess(time.monotonic() - t0, 1.5)
+            await asyncio.wait_for(task, timeout=1)
+            self.assertNotIn("click", order)
+            self.assertTrue(set(order) & {"aborted", "cancelled"})
+            self.assertEqual(pb.calls()[-1], "switch suzie --json")
+
+        asyncio.run(scenario())
+
+    def test_stubborn_reader_does_not_hold_the_next_switch(self) -> None:
+        from test_grokbot_mode import FakePatchbay, voice
+
+        pb = FakePatchbay()
+        v = voice(pb)
+        order: list[str] = []
+
+        async def scenario() -> None:
+            await v.start()
+            started = asyncio.Event()
+
+            async def hook(_res: dict) -> None:
+                started.set()
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    try:
+                        await asyncio.sleep(30)
+                    except asyncio.CancelledError:
+                        return
+                order.append("click")
+
+            v.transcript_abort_s = 0.3
+            v.stop_later(on_stopped=hook)
+            await asyncio.wait_for(started.wait(), timeout=2)
+            t0 = time.monotonic()
+            await v.start()
+            self.assertLess(time.monotonic() - t0, 1.0)
+            self.assertNotIn("click", order)
+            self.assertEqual(pb.calls()[-1], "switch suzie --json")
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":

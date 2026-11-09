@@ -1,9 +1,9 @@
 """Save a Grok Bot voice-session transcript after the call has ended.
 
 The live session is never clicked. ``patchbay off`` runs first; only then does
-this module open the newest voice-session entry on the Grok page and read both
+this module open the voice session that started during this call and read both
 sides. A failure is written as ``transcript.json`` with ``status`` and ``error``
-and is not raised to the call or the alert.
+and is not raised to the call or the alert. A new call aborts the read.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlsplit
@@ -20,6 +21,9 @@ LOG = logging.getLogger("gsm2computer-hub.grokbot")
 
 TRANSCRIPT_NAME = "transcript.json"
 READ_TIMEOUT_S = float(os.environ.get("GSM2COMPUTER_GROKBOT_TRANSCRIPT_TIMEOUT_S", "12"))
+# Session start may be stamped a little outside the hub's call clock.
+CALL_WINDOW_SLACK_S = float(os.environ.get("GSM2COMPUTER_GROKBOT_TRANSCRIPT_SLACK_S", "30"))
+_KEPT_STATUSES = {"unmatched", "ambiguous", "aborted", "no_cdp", "error", "off_failed", "empty", "pending"}
 
 # Runs in the Grok page. ``root`` defaults to document so tests can pass a fake tree.
 VOICE_DOM_JS = r"""
@@ -37,6 +41,17 @@ function gsm2Stamp(node) {
   if (!time) return null;
   return time.getAttribute("datetime") || String(time.textContent || "").trim() || null;
 }
+function gsm2Speaker(node) {
+  const testid = String((node.getAttribute && node.getAttribute("data-testid")) || "").toLowerCase();
+  if (testid === "user-message") return "caller";
+  if (testid === "assistant-message") return "assistant";
+  const role = String(
+    (node.getAttribute && (node.getAttribute("data-role") || node.getAttribute("data-author") || node.getAttribute("data-speaker"))) || ""
+  ).toLowerCase();
+  if (role === "user" || role === "caller" || role === "human") return "caller";
+  if (role === "assistant" || role === "grok" || role === "suzie") return "assistant";
+  return null;
+}
 function gsm2VoiceTurns(root) {
   const doc = root || document;
   const nodes = Array.from(doc.querySelectorAll(
@@ -45,13 +60,8 @@ function gsm2VoiceTurns(root) {
   const outer = nodes.filter((node) => !nodes.some((other) => other !== node && node.contains && node.contains(other)));
   const turns = [];
   for (const node of outer) {
-    const testid = String((node.getAttribute && node.getAttribute("data-testid")) || "").toLowerCase();
-    const role = String(
-      (node.getAttribute && (node.getAttribute("data-role") || node.getAttribute("data-author"))) || ""
-    ).toLowerCase();
-    let speaker = "unknown";
-    if (testid === "user-message" || /user|caller|human/.test(role)) speaker = "caller";
-    else if (testid === "assistant-message" || /assistant|grok|suzie|bot/.test(role)) speaker = "assistant";
+    const speaker = gsm2Speaker(node);
+    if (!speaker) continue;
     const text = gsm2Text(node);
     if (!text) continue;
     turns.push({ speaker: speaker, text: text, timestamp: gsm2Stamp(node) });
@@ -63,23 +73,125 @@ function gsm2Visible(el) {
   const rect = el.getBoundingClientRect();
   return rect.width > 0 && rect.height > 0;
 }
-function gsm2VoiceSessionHref(root) {
+function gsm2SessionStarted(el) {
+  const own = el.getAttribute && (el.getAttribute("data-started") || el.getAttribute("data-timestamp") || el.getAttribute("data-time"));
+  if (own) return own;
+  const time = el.querySelector && el.querySelector("time");
+  if (!time) return null;
+  return time.getAttribute("datetime") || null;
+}
+function gsm2VoiceSessions(root) {
   const doc = root || document;
   const links = Array.from(doc.querySelectorAll('a[href^="/c/"]')).filter(gsm2Visible);
   const voice = /voice|call|phone/i;
   const start = /^(start|new|begin)\b|start voice|new voice/i;
-  const labeled = links.filter((el) => {
-    const label = String(el.innerText || "") + " " + String(el.getAttribute("aria-label") || "");
-    return voice.test(label) && !start.test(label);
-  });
-  const pool = labeled.length ? labeled : links;
-  if (!pool.length) return null;
-  return pool[0].getAttribute("href");
+  const sessions = [];
+  for (const el of links) {
+    const href = String((el.getAttribute && el.getAttribute("href")) || "");
+    if (!href.startsWith("/c/")) continue;
+    const label = String(el.innerText || "") + " " + String((el.getAttribute && el.getAttribute("aria-label")) || "");
+    if (!voice.test(label) || start.test(label)) continue;
+    sessions.push({ href: href, label: label.trim(), started: gsm2SessionStarted(el) });
+  }
+  return sessions;
 }
 """
 
 _READ_EXPR = VOICE_DOM_JS + "\ngsm2VoiceTurns(document)"
-_HREF_EXPR = VOICE_DOM_JS + "\ngsm2VoiceSessionHref(document)"
+_SESSIONS_EXPR = VOICE_DOM_JS + "\ngsm2VoiceSessions(document)"
+
+
+def _is_grok_url(url: str) -> bool:
+    """True for the Grok origin itself, not a host that merely contains the name."""
+    parts = urlsplit(url or "")
+    host = (parts.hostname or "").lower()
+    if host == "grok.com" or host.endswith(".grok.com"):
+        return True
+    if host == "grok.x.ai" or host.endswith(".grok.x.ai"):
+        return True
+    if host in {"x.com", "www.x.com"} and (parts.path == "/i/grok" or parts.path.startswith("/i/grok/")):
+        return True
+    return False
+
+
+def _loopback_ws(url: str) -> bool:
+    parts = urlsplit(url or "")
+    host = (parts.hostname or "").lower()
+    return parts.scheme in {"ws", "wss"} and host in {"127.0.0.1", "localhost", "::1"}
+
+
+def _parse_started(value: Any) -> Optional[float]:
+    """Wall-clock epoch seconds. Media offsets and unlabeled text are not starts."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number > 1e12:
+            return number / 1000.0
+        if number > 1e9:
+            return number
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        number = float(text)
+    except ValueError:
+        number = None
+    if number is not None:
+        return _parse_started(number)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def select_voice_session(
+    sessions: Any,
+    started_at: Optional[float],
+    ended_at: Optional[float],
+) -> dict[str, Any]:
+    """Pick the newest voice session that started during this call.
+
+    No unlabeled ``/c/`` fallback. Zero matches are ``unmatched``. Two sessions
+    that share the newest in-window start are ``ambiguous``.
+    """
+    if started_at is None:
+        return {"status": "unmatched", "error": "call start time is unknown"}
+    end = time_now() if ended_at is None else float(ended_at)
+    window_start = float(started_at) - CALL_WINDOW_SLACK_S
+    window_end = end + CALL_WINDOW_SLACK_S
+    rows = sessions if isinstance(sessions, list) else []
+    chosen: list[tuple[float, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        href = str(row.get("href") or "")
+        if not href.startswith("/c/"):
+            continue
+        started = _parse_started(row.get("started"))
+        if started is None or started < window_start or started > window_end:
+            continue
+        chosen.append((started, href))
+    if not chosen:
+        return {"status": "unmatched", "error": "no voice session started during this call"}
+    chosen.sort()
+    if len(chosen) >= 2 and chosen[-1][0] == chosen[-2][0]:
+        return {
+            "status": "ambiguous",
+            "error": f"{len(chosen)} voice sessions share the newest start in the call window",
+        }
+    started, href = chosen[-1]
+    return {"status": "chosen", "href": href, "started": started}
+
+
+def time_now() -> float:
+    return datetime.now(timezone.utc).timestamp()
 
 
 def _loopback_http(url: str) -> Optional[str]:
@@ -123,13 +235,14 @@ def cdp_base_from_status(status: Optional[dict[str, Any]]) -> Optional[str]:
     return None
 
 
-def _speaker(raw: Any) -> str:
+def _speaker(raw: Any) -> Optional[str]:
+    """Caller or assistant. Anything else is dropped, not stored as a turn."""
     text = str(raw or "").strip().lower()
     if text in {"caller", "user", "human", "you"}:
         return "caller"
     if text in {"assistant", "grok", "suzie", "bot", "model"}:
         return "assistant"
-    return text or "unknown"
+    return None
 
 
 def _timestamp(raw: Any) -> Any:
@@ -144,9 +257,27 @@ def _timestamp(raw: Any) -> Any:
 
 
 def normalize_turns(raw: Any, call_id: str) -> dict[str, Any]:
-    """Normalize CDP nodes or already-shaped turns. Empty input is status ``empty``."""
+    """Normalize CDP nodes or already-shaped turns. Empty input is status ``empty``.
+
+    A reader result of ``unmatched`` or ``ambiguous`` stays that status. Turns
+    whose speaker is not caller or assistant are dropped.
+    """
+    if isinstance(raw, dict) and raw.get("status") in _KEPT_STATUSES and "turns" not in raw:
+        return {
+            "call_id": call_id,
+            "status": str(raw.get("status")),
+            "error": raw.get("error"),
+            "turns": [],
+        }
     rows: list[Any]
     if isinstance(raw, dict):
+        if raw.get("status") in _KEPT_STATUSES and not raw.get("turns"):
+            return {
+                "call_id": call_id,
+                "status": str(raw.get("status")),
+                "error": raw.get("error"),
+                "turns": [],
+            }
         rows = list(raw.get("turns") or [])
     elif isinstance(raw, list):
         rows = raw
@@ -164,14 +295,15 @@ def normalize_turns(raw: Any, call_id: str) -> dict[str, Any]:
                 speaker = "caller"
             elif testid == "assistant-message" or role in {"assistant", "grok", "suzie"}:
                 speaker = "assistant"
-            else:
-                speaker = "unknown"
+        mapped = _speaker(speaker)
+        if mapped is None:
+            continue
         text = str(row.get("text") or "").strip()
         if not text:
             continue
         turns.append(
             {
-                "speaker": _speaker(speaker),
+                "speaker": mapped,
                 "text": text,
                 "timestamp": _timestamp(row.get("timestamp")),
             }
@@ -264,17 +396,21 @@ def load_saved_pointer(directory: Path) -> Optional[dict[str, Any]]:
 
 
 def attach_levels(directory: Path, pointer: dict[str, Any]) -> None:
+    """Merge the pointer into levels.json. Other keys already in the file stay."""
     levels = directory / "levels.json"
-    if not levels.is_file():
-        return
-    try:
-        data = json.loads(levels.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(data, dict):
-        return
+    data: dict[str, Any] = {}
+    if levels.is_file():
+        try:
+            parsed = json.loads(levels.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(parsed, dict):
+            return
+        data = parsed
     data["transcript"] = pointer
-    levels.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp = levels.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(levels)
 
 
 def _safe_folder(record_dir: Path, name: str) -> Optional[Path]:
@@ -350,10 +486,12 @@ def _grok_page(targets: Any) -> Optional[dict[str, Any]]:
         return None
     pages = [t for t in targets if isinstance(t, dict) and t.get("type") == "page"]
     for page in pages:
-        url = str(page.get("url") or "").lower()
-        if "grok.com" in url or "grok.x.ai" in url or "x.com/i/grok" in url:
-            if page.get("webSocketDebuggerUrl"):
-                return page
+        if not _is_grok_url(str(page.get("url") or "")):
+            continue
+        ws_url = str(page.get("webSocketDebuggerUrl") or "")
+        if not _loopback_ws(ws_url):
+            continue
+        return page
     return None
 
 
@@ -396,35 +534,70 @@ def _loads_list(value: Any) -> list[Any]:
     return []
 
 
-async def read_voice_turns(cdp_http: str, timeout_s: float = READ_TIMEOUT_S) -> list[dict[str, Any]]:
-    """Open the newest voice session if the transcript is not already on screen, then read it."""
+def _raise_if_abort(abort: Optional[asyncio.Event]) -> None:
+    if abort is not None and abort.is_set():
+        raise asyncio.CancelledError()
+
+
+def _same_session(page_url: str, href: str) -> bool:
+    path = urlsplit(page_url or "").path.rstrip("/") or "/"
+    target = (href or "").rstrip("/") or "/"
+    return path == target
+
+
+def _click_js(href: str) -> str:
+    return (
+        "(function(){const href=%s;const link=Array.from(document.querySelectorAll('a[href]')).find("
+        "(el)=>el.getAttribute('href')===href);if(!link)return false;link.click();return true;})()"
+    ) % json.dumps(href)
+
+
+async def read_voice_turns(
+    cdp_http: str,
+    timeout_s: float = READ_TIMEOUT_S,
+    *,
+    abort: Optional[asyncio.Event] = None,
+    started_at: Optional[float] = None,
+    ended_at: Optional[float] = None,
+) -> Any:
+    """Read the voice session that started during this call. Never raises CancelledError past the caller.
+
+    Returns turns, or ``{"status": "unmatched"|"ambiguous", ...}``. Does not click
+    an unlabeled conversation, and does not click after ``abort`` is set.
+    """
     base = _loopback_http(cdp_http)
     if not base:
         raise RuntimeError("CDP URL is not a loopback HTTP endpoint")
     list_url = base if base.endswith("/json/list") else base + "/json/list"
 
-    async def _once() -> list[dict[str, Any]]:
+    async def _turns_from(ws: Any, nid: list[int]) -> list[dict[str, Any]]:
+        _raise_if_abort(abort)
+        turns = _loads_list(await _cdp_eval(ws, nid, _READ_EXPR))
+        return [t for t in turns if isinstance(t, dict)]
+
+    async def _once() -> Any:
         import websockets
 
+        _raise_if_abort(abort)
         targets = await asyncio.to_thread(_http_json, list_url, 4)
         page = _grok_page(targets)
         if page is None:
-            raise RuntimeError("no Grok page on CDP")
+            raise RuntimeError("no Grok page on a loopback CDP debugger URL")
         ws_url = str(page["webSocketDebuggerUrl"])
         nid = [0]
         async with websockets.connect(ws_url, open_timeout=4, max_size=4_000_000) as ws:
-            turns = _loads_list(await _cdp_eval(ws, nid, _READ_EXPR))
-            if turns:
-                return [t for t in turns if isinstance(t, dict)]
-            href = await _cdp_eval(ws, nid, _HREF_EXPR)
-            if not isinstance(href, str) or not href.startswith("/"):
-                return []
-            click = (
-                "(function(){const href=%s;const link=Array.from(document.querySelectorAll('a[href]')).find("
-                "(el)=>el.getAttribute('href')===href);if(!link)return false;link.click();return true;})()"
-            ) % json.dumps(str(href))
-            await _cdp_eval(ws, nid, click)
+            _raise_if_abort(abort)
+            sessions = await _cdp_eval(ws, nid, _SESSIONS_EXPR)
+            choice = select_voice_session(sessions, started_at, ended_at)
+            if choice.get("status") != "chosen":
+                return choice
+            href = str(choice.get("href") or "")
+            if _same_session(str(page.get("url") or ""), href):
+                return await _turns_from(ws, nid)
+            _raise_if_abort(abort)
+            await _cdp_eval(ws, nid, _click_js(href))
         await asyncio.sleep(0.6)
+        _raise_if_abort(abort)
         targets = await asyncio.to_thread(_http_json, list_url, 4)
         page = _grok_page(targets)
         if page is None:
@@ -432,9 +605,10 @@ async def read_voice_turns(cdp_http: str, timeout_s: float = READ_TIMEOUT_S) -> 
         async with websockets.connect(str(page["webSocketDebuggerUrl"]), open_timeout=4, max_size=4_000_000) as ws:
             nid = [0]
             for _ in range(8):
-                turns = _loads_list(await _cdp_eval(ws, nid, _READ_EXPR))
+                _raise_if_abort(abort)
+                turns = await _turns_from(ws, nid)
                 if turns:
-                    return [t for t in turns if isinstance(t, dict)]
+                    return turns
                 await asyncio.sleep(0.4)
         return []
 
@@ -447,10 +621,20 @@ async def capture_call_transcript(
     *,
     cdp_http: Optional[str] = None,
     status: Optional[dict[str, Any]] = None,
-    read_turns: Optional[Callable[[str], Awaitable[Any]]] = None,
+    read_turns: Optional[Callable[..., Awaitable[Any]]] = None,
+    abort: Optional[asyncio.Event] = None,
+    started_at: Optional[float] = None,
+    ended_at: Optional[float] = None,
 ) -> dict[str, Any]:
     """Read and save the transcript. Always returns a pointer; never raises."""
     try:
+        if abort is not None and abort.is_set():
+            return save_transcript_result(
+                directory,
+                call_id,
+                "aborted",
+                error="new call started before the transcript read",
+            )
         base = cdp_http or cdp_base_from_status(status)
         if not base:
             return save_transcript_result(
@@ -459,8 +643,15 @@ async def capture_call_transcript(
                 "no_cdp",
                 error="patchbay status has no loopback CDP endpoint; set GSM2COMPUTER_GROKBOT_CDP",
             )
-        reader = read_turns or read_voice_turns
-        raw = await reader(base)
+        if read_turns is None:
+            raw = await read_voice_turns(
+                base,
+                abort=abort,
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+        else:
+            raw = await read_turns(base)
         document = normalize_turns(raw, call_id)
         return save_transcript_result(
             directory,
@@ -469,6 +660,8 @@ async def capture_call_transcript(
             list(document["turns"]),
             document.get("error"),
         )
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         LOG.warning("grok transcript read failed call_id=%s: %s", call_id, exc)
         try:
@@ -484,6 +677,44 @@ async def capture_call_transcript(
                 "call_id": call_id,
                 "preview": [],
             }
+
+
+def announce_transcript(pointer: dict[str, Any]) -> None:
+    """Tell ops the transcript landed. Does not run on the live-call path."""
+    try:
+        from alert_webhook import post_alert_event
+
+        call_id = str(pointer.get("call_id") or "")
+        text = (
+            f"call_transcript call_id={call_id} "
+            f"transcript_status={pointer.get('status')} "
+            f"transcript={pointer.get('path') or '-'}"
+        )
+        payload: dict[str, Any] = {
+            "event": "call_transcript",
+            "call_id": call_id,
+            "transcript_status": pointer.get("status"),
+            "transcript": pointer,
+            "text": text,
+        }
+        if "e2e" in call_id:
+            payload["e2e"] = True
+        post_alert_event(payload)
+    except Exception:
+        LOG.warning("call_transcript alert failed", exc_info=True)
+
+
+def pointer_or_aborted(directory: Path, call_id: str) -> dict[str, Any]:
+    """The saved pointer, or a new ``aborted`` file when the read never finished."""
+    existing = load_saved_pointer(directory)
+    if existing is not None:
+        return existing
+    return save_transcript_result(
+        directory,
+        call_id,
+        "aborted",
+        error="new call started before the transcript read finished",
+    )
 
 
 def transcript_for_alert(tap: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -503,11 +734,11 @@ def transcript_for_alert(tap: Optional[dict[str, Any]]) -> Optional[dict[str, An
     if not grok:
         return None
     return {
-        "status": "missing",
+        "status": "pending",
         "file": TRANSCRIPT_NAME,
         "path": str(Path(directory) / TRANSCRIPT_NAME) if directory else None,
         "turns": 0,
-        "error": None,
+        "error": "transcript not saved yet; call_transcript follows",
         "call_id": tap.get("id"),
         "preview": [],
     }

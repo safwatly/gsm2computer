@@ -58,9 +58,12 @@ from call_slot import (
 )
 from link_gap_log import append_link_gap
 from grokbot_transcript import (
+    announce_transcript,
     attach_levels,
     capture_call_transcript,
     cdp_base_from_status,
+    load_saved_pointer,
+    pointer_or_aborted,
     save_transcript_result,
 )
 from grokbot_voice import (
@@ -1597,11 +1600,33 @@ def _request_live_e2e(call_id: str) -> None:
         LOG.warning("could not write live e2e request: %s", exc)
 
 
-async def _finish_grok_transcript(voice: Any, call_dir: Path, call_id: str, off_res: dict[str, Any]) -> None:
-    """After patchbay off: read the voice transcript. Failures stay off the call."""
+def _remember_transcript(call_id: str, pointer: dict[str, Any]) -> None:
     global last_call_tap
+    if isinstance(last_call_tap, dict) and last_call_tap.get("id") == call_id:
+        updated = dict(last_call_tap)
+        updated["transcript"] = pointer
+        last_call_tap = updated
+
+
+async def _finish_grok_transcript(
+    voice: Any,
+    call_dir: Path,
+    call_id: str,
+    off_res: dict[str, Any],
+    started_at: Optional[float] = None,
+) -> None:
+    """After patchbay off: read the voice transcript. Failures stay off the call.
+
+    A new call sets ``voice.transcript_abort``. This read checks that flag and
+    does not click the Grok page once it is set. ``call_ended`` is not delayed;
+    ops get a ``call_transcript`` event when the file is written.
+    """
+    pointer: Optional[dict[str, Any]] = None
+    abort = getattr(voice, "transcript_abort", None)
     try:
-        if not off_res.get("ok"):
+        if abort is not None and abort.is_set():
+            pointer = pointer_or_aborted(call_dir, call_id)
+        elif not off_res.get("ok"):
             pointer = save_transcript_result(
                 call_dir,
                 call_id,
@@ -1610,27 +1635,44 @@ async def _finish_grok_transcript(voice: Any, call_dir: Path, call_id: str, off_
             )
         else:
             status = await run_patchbay("status", "--json", timeout_s=8, binary=voice.binary)
-            pointer = await capture_call_transcript(
-                call_dir,
-                call_id,
-                cdp_http=cdp_base_from_status(status),
-                status=status,
-            )
+            if abort is not None and abort.is_set():
+                pointer = pointer_or_aborted(call_dir, call_id)
+            else:
+                pointer = await capture_call_transcript(
+                    call_dir,
+                    call_id,
+                    cdp_http=cdp_base_from_status(status),
+                    status=status,
+                    abort=abort,
+                    started_at=started_at,
+                    ended_at=time.time(),
+                )
+    except asyncio.CancelledError:
+        if pointer is None:
+            try:
+                pointer = pointer_or_aborted(call_dir, call_id)
+            except Exception:
+                LOG.warning("grok transcript abort write failed", exc_info=True)
+        raise
     except Exception as exc:
         LOG.warning("grok transcript capture failed: %s", exc)
         try:
             pointer = save_transcript_result(call_dir, call_id, "error", error=str(exc))
         except Exception:
             LOG.warning("grok transcript status write failed", exc_info=True)
-            return
+            pointer = None
+    if pointer is None:
+        return
     try:
         attach_levels(call_dir, pointer)
     except Exception:
         LOG.warning("grok transcript levels update failed", exc_info=True)
-    if isinstance(last_call_tap, dict) and last_call_tap.get("id") == call_id:
-        updated = dict(last_call_tap)
-        updated["transcript"] = pointer
-        last_call_tap = updated
+    _remember_transcript(call_id, pointer)
+    try:
+        announce_transcript(pointer)
+    except Exception:
+        LOG.warning("grok transcript announce failed", exc_info=True)
+    setattr(voice, "_transcript_announced", True)
 
 
 async def _grokbot_call_start(
@@ -2457,15 +2499,42 @@ async def handle_websocket(
         if grok_voice is not None:
             # Call is over (clean hangup, abort, or relink grace expired).
             # patchbay off runs after any still-running switch, off the hot path.
-            # The transcript read is inside that same task, after off, so it
-            # cannot click the live session and the next switch waits for it.
+            # The transcript read starts only after off. A new call aborts it
+            # before patchbay switch, so the click cannot land on the next session.
             on_transcript = None
             if tap is not None:
                 transcript_dir = tap.dir
                 transcript_id = tap.call_id
+                transcript_started = tap.started_wall
+
+                def on_abort(
+                    directory: Path = transcript_dir,
+                    call_id: str = transcript_id,
+                    voice: Any = grok_voice,
+                ) -> None:
+                    if getattr(voice, "_transcript_announced", False):
+                        return
+                    existing = load_saved_pointer(directory)
+                    pointer = existing if existing is not None else pointer_or_aborted(directory, call_id)
+                    try:
+                        attach_levels(directory, pointer)
+                    except Exception:
+                        LOG.warning("grok transcript levels update failed", exc_info=True)
+                    _remember_transcript(call_id, pointer)
+                    announce_transcript(pointer)
+                    voice._transcript_announced = True
+
+                grok_voice._transcript_announced = False
+                grok_voice.on_transcript_abort = on_abort
 
                 async def on_transcript(res: dict[str, Any], voice: Any = grok_voice) -> None:
-                    await _finish_grok_transcript(voice, transcript_dir, transcript_id, res)
+                    await _finish_grok_transcript(
+                        voice,
+                        transcript_dir,
+                        transcript_id,
+                        res,
+                        started_at=transcript_started,
+                    )
 
             grok_voice.stop_later(after=grok_switch_task, on_stopped=on_transcript)
         live_call.release()

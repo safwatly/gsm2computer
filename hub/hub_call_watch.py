@@ -70,6 +70,16 @@ def on_end(start, tap, reason):
     if pointer:
         p["transcript"] = pointer
         p["transcript_status"] = pointer.get("status")
+    elif str(tap or "").endswith("-grokbot"):
+        p["transcript"] = {
+            "status": "pending",
+            "file": "transcript.json",
+            "turns": 0,
+            "error": "transcript not saved yet; call_transcript follows",
+            "call_id": tap,
+            "preview": [],
+        }
+        p["transcript_status"] = "pending"
     try:
         post_alert_event(p); log("posted", p)
     except Exception as e:
