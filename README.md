@@ -75,6 +75,10 @@ Manual test:
 3. App log should show `SMS forwarded from …` or `SMS forward failed: …`.
 4. On the hub, confirm `POST /sms` received the JSON. Hub `/health` should already be up (SAF-15).
 
+## Public entrance (cup)
+
+The phone-facing WebSocket can also be reached at `https://gsm.ta3leam.com` once DNS, Caddy, and the firewall are installed. Same hub handler as Tailscale. Deploy and rollback: [docs/CUP_PUBLIC_ENTRANCE.md](docs/CUP_PUBLIC_ENTRANCE.md).
+
 ## Development
 
 ```bash

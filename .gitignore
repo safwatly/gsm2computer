@@ -31,6 +31,9 @@ hub/portal.sqlite-shm
 *.sqlite-wal
 *.sqlite-shm
 
+# Per-device hub secrets. Generate with hub/device_auth.py; never commit.
+device-tokens.json
+
 # IDE / agent local
 .idea/
 *.iml

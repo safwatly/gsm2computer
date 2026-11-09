@@ -1,0 +1,39 @@
+# TLS edge for the phone-facing hub entrance.
+#
+# The hub itself stays plain HTTP on 127.0.0.1:8790. This process is the only
+# thing that should bind public :443. Do not tailscale serve the hub, and do
+# not publish port 8790.
+#
+# DNS: A/AAAA {$GSM2COMPUTER_PUBLIC_HOSTNAME} → 62.83.35.197
+# Cloudflare proxy MUST be off (grey cloud). An orange-cloud record sends the
+# phone through Cloudflare and Let's Encrypt TLS-ALPN will not reach cup.
+# Port 80 stays closed. Renewal is TLS-ALPN-01 on 443.
+{
+	email {$GSM2COMPUTER_ACME_EMAIL}
+	admin off
+	# Port 80 stays closed. Certs renew with TLS-ALPN-01 on 443.
+	auto_https disable_redirects
+	# WebSocket audio is TCP. Do not open a UDP :443 listener.
+	servers {
+		protocols h1 h2
+	}
+}
+
+# Bind the public address only. A wildcard :443 would sit next to Tailscale
+# Serve, which already owns the tailnet address on :443. The ACME issuer's
+# bind_host follows this site bind, so the TLS-ALPN challenge listener is the
+# same address. GSM2COMPUTER_PUBLIC_BIND is required (cup: 62.83.35.197).
+{$GSM2COMPUTER_PUBLIC_HOSTNAME} {
+	bind {$GSM2COMPUTER_PUBLIC_BIND}
+	tls {
+		issuer acme {
+			disable_http_challenge
+		}
+	}
+	reverse_proxy {$GSM2COMPUTER_PUBLIC_UPSTREAM:127.0.0.1:8790} {
+		flush_interval -1
+		transport http {
+			versions 1.1
+		}
+	}
+}

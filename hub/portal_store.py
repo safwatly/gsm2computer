@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS calls (
     duration_sec INTEGER NOT NULL,
     switchboard_mode TEXT,
     session_id TEXT,
-    tap_summary TEXT
+    tap_summary TEXT,
+    path TEXT
 );
 CREATE INDEX IF NOT EXISTS calls_started ON calls (started_at);
 
@@ -43,7 +44,8 @@ CREATE TABLE IF NOT EXISTS call_link_events (
     close_code INTEGER,
     close_reason TEXT,
     initiator TEXT,
-    detail TEXT
+    detail TEXT,
+    entrance TEXT
 );
 CREATE INDEX IF NOT EXISTS call_link_events_ts ON call_link_events (ts);
 
@@ -117,6 +119,7 @@ def _row_call(row: sqlite3.Row) -> dict[str, Any]:
         "switchboard_mode": row["switchboard_mode"],
         "session_id": row["session_id"],
         "tap_summary": row["tap_summary"],
+        "path": row["path"] if "path" in row.keys() else None,
     }
 
 
@@ -252,6 +255,12 @@ class PortalStore:
                 "CREATE INDEX IF NOT EXISTS outbox_destination_queue "
                 "ON outbox (to_number, status, available_at, created_at)"
             )
+            call_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(calls)")}
+            if "path" not in call_columns:
+                self._conn.execute("ALTER TABLE calls ADD COLUMN path TEXT")
+            link_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(call_link_events)")}
+            if "entrance" not in link_columns:
+                self._conn.execute("ALTER TABLE call_link_events ADD COLUMN entrance TEXT")
             self._conn.commit()
 
     def close(self) -> None:
@@ -439,6 +448,7 @@ class PortalStore:
         session_id: Optional[str] = None,
         tap_summary: Optional[str] = None,
         call_id: Optional[str] = None,
+        path: Optional[str] = None,
     ) -> dict[str, Any]:
         dir_n = (direction or "").strip().lower()
         if dir_n in {"in", "incoming", "inbound"}:
@@ -455,12 +465,13 @@ class PortalStore:
             "switchboard_mode": switchboard_mode or None,
             "session_id": session_id or None,
             "tap_summary": tap_summary or None,
+            "path": path if path in ("public", "tailscale") else None,
         }
         with self._lock:
             self._conn.execute(
                 """INSERT INTO calls
-                   (id, direction, number, started_at, duration_sec, switchboard_mode, session_id, tap_summary)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (id, direction, number, started_at, duration_sec, switchboard_mode, session_id, tap_summary, path)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item["id"],
                     item["direction"],
@@ -470,6 +481,7 @@ class PortalStore:
                     item["switchboard_mode"],
                     item["session_id"],
                     item["tap_summary"],
+                    item["path"],
                 ),
             )
             self._conn.commit()
@@ -496,6 +508,7 @@ class PortalStore:
         initiator: Optional[str] = None,
         detail: Optional[str] = None,
         ts: Optional[str] = None,
+        entrance: Optional[str] = None,
     ) -> dict[str, Any]:
         item = {
             "ts": ts or utc_now(),
@@ -505,12 +518,13 @@ class PortalStore:
             "close_reason": close_reason or None,
             "initiator": initiator or None,
             "detail": detail or None,
+            "entrance": entrance if entrance in ("public", "tailscale") else None,
         }
         with self._lock:
             cur = self._conn.execute(
                 """INSERT INTO call_link_events
-                   (ts, session_id, kind, close_code, close_reason, initiator, detail)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (ts, session_id, kind, close_code, close_reason, initiator, detail, entrance)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item["ts"],
                     item["session_id"],
@@ -519,6 +533,7 @@ class PortalStore:
                     item["close_reason"],
                     item["initiator"],
                     item["detail"],
+                    item["entrance"],
                 ),
             )
             self._conn.commit()

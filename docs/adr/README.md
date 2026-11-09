@@ -11,5 +11,6 @@ Read these before changing voice routing, PipeWire, or the OpenClaw Talk path.
 | [0005](0005-native-pcm-hub-wire.md) | Phone sends native PCM; hub resamples to 48 kHz. Missing fields stay 8 kHz μ-law |
 | [0006](0006-portal-messaging.md) | Hub PWA + SQLite for SMS/call log; Pixel polls SMS outbox; Tailscale auth |
 | [0007](0007-hub-machine-name-and-https.md) | Machine name `hub`; no nested `portal.hub…`; do not Serve `/` to gsm2computer |
+| [0008](0008-public-audio-entrance.md) | Public phone entrance: same handler, device token, Caddy TLS, nftables |
 
 Operational runbook (commands, first login): [`hub/TALK_WEBRTC.md`](../../hub/TALK_WEBRTC.md). Tailscale URLs/certs: [`docs/TAILSCALE_PORTAL_HTTPS.md`](../TAILSCALE_PORTAL_HTTPS.md).

@@ -124,14 +124,19 @@ function renderCalls() {
       const incoming = c.direction !== "out";
       const dir = incoming ? "Incoming" : "Outgoing";
       const mode = c.switchboard_mode || "idle";
+      const entrance = c.path === "public" || c.path === "tailscale" ? c.path : "";
       const session = c.session_id
         ? `<div class="meta session-id">${escapeHtml(c.session_id)}</div>`
+        : "";
+      const entranceChip = entrance
+        ? `<span class="preset-chip" data-entrance="${escapeAttr(entrance)}">${escapeHtml(entrance)}</span>`
         : "";
       return `<article class="call-card">
         <div class="call-card-head">
           <span class="lamp ${incoming ? "good" : "warn"}"></span>
           <h2>${escapeHtml(dir)}</h2>
           <span class="preset-chip">${escapeHtml(mode)}</span>
+          ${entranceChip}
         </div>
         <p class="fixture-num">${escapeHtml(formatFixturePeer(c.number) || c.number || "")}</p>
         <div class="call-dur">${escapeHtml(fmtDuration(c.duration_sec))}</div>

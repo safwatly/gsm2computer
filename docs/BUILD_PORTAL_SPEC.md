@@ -29,7 +29,7 @@ Inbound SMS forwarder is already shipped: [SAF-18](https://linear.app/safwatly/i
 
 ## Hub machine
 
-- Tailscale bind IP: `100.101.181.110:8787` (hub process listens here)
+- Tailscale bind IP: `100.113.222.47:8787` (hub process listens here; the old `100.101.181.110` address is not cup)
 - MagicDNS: `hub.mining-ling.ts.net` (HTTPS via OpenClaw Serve — Talk/Control UI only, not `:8787`)
 - Portal / Pixel default: `http://hub.mining-ling.ts.net:8787` (no nested `portal.hub…`; see [TAILSCALE_PORTAL_HTTPS.md](TAILSCALE_PORTAL_HTTPS.md))
 - Service: `hub/gsm2computer-hub.service`, working dir `~/gsm2computer-hub`

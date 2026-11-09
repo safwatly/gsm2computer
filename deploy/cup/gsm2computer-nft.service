@@ -1,0 +1,16 @@
+[Unit]
+Description=gsm2computer public-interface firewall
+After=network-pre.target
+Before=network.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gsm2computer-nft.sh boot
+# No ExecStop. Stopping or restarting this unit must not delete the table
+# while Caddy is still serving the public address. gsm2computer-nft.sh revert
+# is the only way to remove the table.
+
+[Install]
+WantedBy=multi-user.target
