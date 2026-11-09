@@ -57,12 +57,21 @@ from call_slot import (
     wait_or_abort,
 )
 from link_gap_log import append_link_gap
+from grokbot_transcript import (
+    attach_levels,
+    capture_call_transcript,
+    cdp_base_from_status,
+    load_saved_pointer,
+    pointer_or_aborted,
+    save_transcript_result,
+)
 from grokbot_voice import (
     GROKBOT_MIC_SINK,
     GROKBOT_MIC_SOURCE,
     GROKBOT_SPK_SINK,
     UPLINK_GAIN as GROKBOT_UPLINK_GAIN,
     get_grokbot_voice,
+    run_patchbay,
 )
 from urllib.parse import parse_qs, urlsplit
 from call_tap import RECORD_DIR, CallTap
@@ -139,6 +148,8 @@ active_openclaw: Optional[Any] = None
 live_call = CallSlot(CALL_WATCHDOG)
 relink_gate = RelinkGate()
 last_call_tap: Optional[dict[str, Any]] = None
+# Set when the tap directory is created, before close() mixes. Survives a slow mix.
+open_call_tap: Optional[dict[str, Any]] = None
 # session_id -> (entrance, monotonic time the socket finished)
 _finished_call_entrances: dict[str, tuple[str, float]] = {}
 _finished_call_order: list[str] = []
@@ -1003,6 +1014,9 @@ class PipewireBridge:
             payload_pcm, self._out_ratecv = _resample_pcm(
                 mono_pcm, self.rate, out_rate, self._out_ratecv
             )
+            # What the caller should hear, every mode. Independent of the
+            # existing bus-rate gsm-downlink stem and of the app-specific taps.
+            self.note_phone_downlink(payload_pcm, out_rate)
             if out_fmt == "audio/pcm":
                 payload = payload_pcm
                 wire_fmt = "audio/pcm"
@@ -1183,6 +1197,18 @@ class PipewireBridge:
         except (BrokenPipeError, ConnectionResetError, OSError) as exc:
             LOG.error("gsm playback write failed: %s (pw-cat rc=%s)", exc, proc.returncode)
             self._signal_abort(f"hub pw-cat write failed: {exc}")
+
+    def note_phone_downlink(self, pcm: bytes, rate: int) -> None:
+        """Record phone-bound audio. Disk or WAV errors stay off the audio path."""
+        tap = self.tap
+        if tap is None or not pcm:
+            return
+        try:
+            tap.write_phone_downlink(pcm, rate)
+        except Exception:
+            if not getattr(self, "_downlink_record_warned", False):
+                self._downlink_record_warned = True
+                LOG.warning("phone downlink record failed", exc_info=True)
 
     def to_ulaw_8k(self, audio: bytes, fmt: str = "", rate: int = 0) -> bytes:
         """8 kHz μ-law for the legacy relay Talk path."""
@@ -1575,6 +1601,78 @@ def _request_live_e2e(call_id: str) -> None:
         LOG.warning("could not write live e2e request: %s", exc)
 
 
+def _remember_transcript(call_id: str, pointer: dict[str, Any]) -> None:
+    global last_call_tap
+    if isinstance(last_call_tap, dict) and last_call_tap.get("id") == call_id:
+        updated = dict(last_call_tap)
+        updated["transcript"] = pointer
+        last_call_tap = updated
+
+
+async def _finish_grok_transcript(
+    voice: Any,
+    call_dir: Path,
+    call_id: str,
+    off_res: dict[str, Any],
+    started_at: Optional[float] = None,
+) -> None:
+    """After patchbay off: read the voice transcript. Failures stay off the call.
+
+    A new call sets ``voice.transcript_abort``. This read checks that flag and
+    does not click the Grok page once it is set. ``call_ended`` is not delayed.
+    The process that posts ``call_ended`` posts ``call_transcript`` after this
+    file is written. The hub does not post that alert.
+    """
+    pointer: Optional[dict[str, Any]] = None
+    abort = getattr(voice, "transcript_abort", None)
+    try:
+        if abort is not None and abort.is_set():
+            pointer = pointer_or_aborted(call_dir, call_id)
+        elif not off_res.get("ok"):
+            pointer = save_transcript_result(
+                call_dir,
+                call_id,
+                "off_failed",
+                error=off_res.get("error") or off_res.get("meaning") or "patchbay off failed",
+            )
+        else:
+            status = await run_patchbay("status", "--json", timeout_s=8, binary=voice.binary)
+            if abort is not None and abort.is_set():
+                pointer = pointer_or_aborted(call_dir, call_id)
+            else:
+                pointer = await capture_call_transcript(
+                    call_dir,
+                    call_id,
+                    cdp_http=cdp_base_from_status(status),
+                    status=status,
+                    abort=abort,
+                    started_at=started_at,
+                    ended_at=time.time(),
+                )
+    except asyncio.CancelledError:
+        if pointer is None:
+            try:
+                pointer = pointer_or_aborted(call_dir, call_id)
+            except Exception:
+                LOG.warning("grok transcript abort write failed", exc_info=True)
+        raise
+    except Exception as exc:
+        LOG.warning("grok transcript capture failed: %s", exc)
+        try:
+            pointer = save_transcript_result(call_dir, call_id, "error", error=str(exc))
+        except Exception:
+            LOG.warning("grok transcript status write failed", exc_info=True)
+            pointer = None
+    if pointer is None:
+        return
+    try:
+        attach_levels(call_dir, pointer)
+    except Exception:
+        LOG.warning("grok transcript levels update failed", exc_info=True)
+    _remember_transcript(call_id, pointer)
+    setattr(voice, "_transcript_announced", True)
+
+
 async def _grokbot_call_start(
     voice: Any,
     tap: Optional[CallTap],
@@ -1897,7 +1995,7 @@ async def handle_websocket(
     headers: dict,
     path: str,
 ) -> None:
-    global active_bridge, active_openclaw, active_ws_writer, last_call_tap
+    global active_bridge, active_openclaw, active_ws_writer, last_call_tap, open_call_tap
 
     tap: Optional[CallTap] = None
     e2e = CallSlot.path_is_e2e(path)
@@ -2060,6 +2158,9 @@ async def handle_websocket(
             mode="off" if loopback else ("grokbot" if GROKBOT_ON_CALL else OPENCLAW_TALK_MODE),
             e2e=e2e,
         )
+        if tap is not None:
+            # Known before the MP3 mix. call_ended must not wait on last_call_tap.
+            open_call_tap = {"id": tap.call_id, "dir": str(tap.dir), "meta": dict(tap.meta)}
         if loopback:
             result = await set_switchboard_mode("loopback")
             LOG.info("loopback call: %s", result.get("applied") or result.get("error"))
@@ -2315,6 +2416,11 @@ async def handle_websocket(
                     # close frame. Relink never runs while this handler is stuck.
                     bridge.offer_uplink(audio, fmt, rate)
                     if loopback:
+                        echo_fmt = _normalize_format(fmt) or bridge.client_in_format
+                        bridge.note_phone_downlink(
+                            _to_pcm16(audio, echo_fmt),
+                            _as_rate(rate, bridge.client_in_rate),
+                        )
                         energy = (
                             _pcm_rms_energy(_to_pcm16(audio, _normalize_format(fmt) or bridge.client_in_format))
                             if (_normalize_format(fmt) or bridge.client_in_format) == "audio/pcm"
@@ -2373,29 +2479,68 @@ async def handle_websocket(
                 await rollover_task
             except asyncio.CancelledError:
                 pass
-        if bridge is not None:
-            try:
-                await asyncio.wait_for(bridge.stop(), timeout=5.0)
-            except Exception:
-                LOG.warning("bridge stop in finally failed", exc_info=True)
-        if tap is not None:
-            try:
-                await asyncio.wait_for(tap.stop_capture(), timeout=5.0)
-            except Exception:
-                LOG.warning("tap stop in finally failed", exc_info=True)
-        if openclaw_bridge is not None:
-            try:
-                await asyncio.wait_for(openclaw_bridge.stop(), timeout=8.0)
-            except Exception:
-                LOG.warning("openclaw stop in finally failed", exc_info=True)
-            active_openclaw = None
-            LOG.info("openclaw talk stopped (mode=%s)", OPENCLAW_TALK_MODE)
-        remember_finished_call(live_call.session_id, live_call.entrance)
-        if grok_voice is not None:
-            # Call is over (clean hangup, abort, or relink grace expired).
-            # patchbay off runs after any still-running switch, off the hot path.
-            grok_voice.stop_later(after=grok_switch_task)
-        live_call.release()
+        try:
+            if bridge is not None:
+                try:
+                    await asyncio.wait_for(bridge.stop(), timeout=5.0)
+                except Exception:
+                    LOG.warning("bridge stop in finally failed", exc_info=True)
+            if tap is not None:
+                try:
+                    await asyncio.wait_for(tap.stop_capture(), timeout=5.0)
+                except Exception:
+                    LOG.warning("tap stop in finally failed", exc_info=True)
+            if openclaw_bridge is not None:
+                try:
+                    await asyncio.wait_for(openclaw_bridge.stop(), timeout=8.0)
+                except Exception:
+                    LOG.warning("openclaw stop in finally failed", exc_info=True)
+                active_openclaw = None
+                LOG.info("openclaw talk stopped (mode=%s)", OPENCLAW_TALK_MODE)
+            remember_finished_call(live_call.session_id, live_call.entrance)
+            if grok_voice is not None:
+                # Call is over (clean hangup, abort, or relink grace expired).
+                # patchbay off runs after any still-running switch, off the hot path.
+                # The transcript read starts only after off. A new call aborts it
+                # before patchbay switch, so the click cannot land on the next session.
+                on_transcript = None
+                if tap is not None:
+                    transcript_dir = tap.dir
+                    transcript_id = tap.call_id
+                    transcript_started = tap.started_wall
+
+                    def on_abort(
+                        directory: Path = transcript_dir,
+                        call_id: str = transcript_id,
+                        voice: Any = grok_voice,
+                    ) -> None:
+                        if getattr(voice, "_transcript_announced", False):
+                            return
+                        existing = load_saved_pointer(directory)
+                        pointer = existing if existing is not None else pointer_or_aborted(directory, call_id)
+                        try:
+                            attach_levels(directory, pointer)
+                        except Exception:
+                            LOG.warning("grok transcript levels update failed", exc_info=True)
+                        _remember_transcript(call_id, pointer)
+                        voice._transcript_announced = True
+
+                    grok_voice._transcript_announced = False
+                    grok_voice.on_transcript_abort = on_abort
+
+                    async def on_transcript(res: dict[str, Any], voice: Any = grok_voice) -> None:
+                        await _finish_grok_transcript(
+                            voice,
+                            transcript_dir,
+                            transcript_id,
+                            res,
+                            started_at=transcript_started,
+                        )
+
+                grok_voice.stop_later(after=grok_switch_task, on_stopped=on_transcript)
+        finally:
+            # A stuck downlink write must not keep the slot after the stop cap.
+            live_call.release()
         if abort_reason:
             LOG.info("WebSocket disconnected after watchdog: %s", abort_reason)
         else:
@@ -2536,6 +2681,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 body["grokbot"] = get_grokbot_voice().snapshot()
             if last_call_tap:
                 body["last_call_tap"] = last_call_tap
+            if open_call_tap:
+                body["open_call_tap"] = open_call_tap
             if OPENCLAW_TALK_MODE == "webrtc-ui" and get_talk_ui is not None:
                 try:
                     ui = get_talk_ui()

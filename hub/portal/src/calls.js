@@ -154,6 +154,9 @@ function renderCallList() {
       const session = c.session_id
         ? `<div class="meta session-id">${escapeHtml(c.session_id)}</div>`
         : "";
+      const transcript = transcriptLabel(c.transcript)
+        ? `<div class="meta transcript" title="${escapeAttr(c.transcript.path || "")}">${escapeHtml(transcriptLabel(c.transcript))}</div>`
+        : "";
       const playLabel = playing ? "Pause" : "Play";
       const playIcon = playing ? "❚❚" : "▶";
       return `<button type="button" class="call-card${playing ? " playing" : ""}" data-call-id="${escapeAttr(c.id)}" aria-pressed="${playing ? "true" : "false"}" title="Play OpenClaw recording">
@@ -169,6 +172,7 @@ function renderCallList() {
         <div class="call-dur">${escapeHtml(fmtDuration(c.duration_sec))}</div>
         <div class="meta">${escapeHtml(fmtTime(c.started_at))}</div>
         ${session}
+        ${transcript}
       </button>`;
     })
     .join("")}</div>${
@@ -183,6 +187,14 @@ function bindCallCards(app) {
       if (id) toggleCallPlayback(id);
     });
   });
+}
+
+export function transcriptLabel(pointer) {
+  if (!pointer || !pointer.status) return "";
+  const turns = Number(pointer.turns);
+  const count = Number.isFinite(turns) ? `${turns} turn${turns === 1 ? "" : "s"}` : "no turns";
+  const where = pointer.file ? ` · ${pointer.file}` : "";
+  return `transcript ${pointer.status} · ${count}${where}`;
 }
 
 function fmtTime(iso) {

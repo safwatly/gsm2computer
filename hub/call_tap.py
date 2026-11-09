@@ -18,6 +18,17 @@ Internal stem names are unchanged:
 
 relay graph also writes openclaw-append-24k-mono.wav and openclaw-tts-24k-mono.wav.
 
+Every call, in every mode, also writes phone-downlink-8k-mono.wav: the mono PCM
+handed to the phone, resampled to 8 kHz. That file is not part of a room mix,
+so close() leaves it in place. Listen with any WAV player, or
+``ffprobe <call-dir>/phone-downlink-8k-mono.wav``.
+
+Grok Bot calls may also contain transcript.json. Read it with
+``jq -r '.turns[] | [.speaker, (.timestamp // "-"), .text] | @tsv' <call-dir>/transcript.json``.
+
+Directories are pruned to GSM2COMPUTER_CALL_RECORD_KEEP (default 20), oldest
+name first, including the downlink and the transcript.
+
 Disable with GSM2COMPUTER_CALL_RECORD=0.
 """
 from __future__ import annotations
@@ -27,6 +38,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +68,12 @@ RECORD_DIR = Path(
     )
 )
 KEEP_CALLS = int(os.environ.get("GSM2COMPUTER_CALL_RECORD_KEEP", "20"))
+PHONE_DOWNLINK = "phone-downlink-8k-mono"
+PHONE_DOWNLINK_RATE = 8000
+# About two seconds of 20 ms frames. A stalled disk drops audio instead of stalling the pump.
+_DOWNLINK_QUEUE_MAX = 100
+# Shorter than the hub's 5s stop_capture cap. A stuck write returns so the call slot can be released.
+DOWNLINK_FLUSH_S = float(os.environ.get("GSM2COMPUTER_DOWNLINK_FLUSH_S", "1"))
 MIX_TIMEOUT_S = 30.0
 
 # out name, left stem, right stem, mix sample rate
@@ -247,6 +265,14 @@ class CallTap:
         self._procs: list[asyncio.subprocess.Process] = []
         self._tasks: list[asyncio.Task] = []
         self._closed = False
+        self._downlink_ratecv: Any = None
+        self._downlink_src_rate: Optional[int] = None
+        self._down_q: list[bytes] = []
+        self._down_scheduled = False
+        self._down_task: Optional[asyncio.Task] = None
+        self._down_drop_logged = False
+        self._down_stop = False
+        self.started_wall = datetime.now(timezone.utc).timestamp()
         LOG.info("call tap dir %s", self.dir)
 
     @classmethod
@@ -292,6 +318,109 @@ class CallTap:
             stream = _Stream(path, rate, channels)
             self._streams[name] = stream
         stream.write(pcm)
+
+    def write_phone_downlink(self, pcm: bytes, rate: int) -> None:
+        """Record mono s16 that the hub is handing to the phone, at 8 kHz.
+
+        Used for every mode, including loopback. Existing stems are unchanged.
+        """
+        if self._closed or not pcm or rate <= 0:
+            return
+        extra = len(pcm) % 2
+        if extra:
+            pcm = pcm[:-extra]
+        if not pcm:
+            return
+        if rate != PHONE_DOWNLINK_RATE:
+            if self._downlink_src_rate != rate:
+                self._downlink_ratecv = None
+                self._downlink_src_rate = rate
+            pcm, self._downlink_ratecv = audioop.ratecv(
+                pcm, 2, 1, rate, PHONE_DOWNLINK_RATE, self._downlink_ratecv
+            )
+        else:
+            self._downlink_ratecv = None
+            self._downlink_src_rate = rate
+        if not pcm:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None or self._down_stop:
+            self.write_s16(PHONE_DOWNLINK, pcm, PHONE_DOWNLINK_RATE, 1)
+            return
+        if len(self._down_q) >= _DOWNLINK_QUEUE_MAX:
+            self._down_q.pop(0)
+            if not self._down_drop_logged:
+                self._down_drop_logged = True
+                LOG.warning("phone downlink record fell behind; dropping frames")
+        self._down_q.append(pcm)
+        if not self._down_scheduled:
+            self._down_scheduled = True
+            self._down_task = loop.create_task(self._drain_phone_downlink())
+
+    async def _drain_phone_downlink(self) -> None:
+        try:
+            while self._down_q:
+                chunk = self._down_q.pop(0)
+                await asyncio.to_thread(self.write_s16, PHONE_DOWNLINK, chunk, PHONE_DOWNLINK_RATE, 1)
+        finally:
+            self._down_scheduled = False
+            if self._down_q and not self._closed and not self._down_stop:
+                self._down_scheduled = True
+                self._down_task = asyncio.create_task(self._drain_phone_downlink())
+
+    async def _join_downlink_writer(self, task: "asyncio.Task[None]", timeout_s: float) -> bool:
+        """Wait up to timeout_s. Cancellation stays in place; this never calls uncancel."""
+        if task.done() or timeout_s <= 0:
+            return task.done()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def flush_phone_downlink(self) -> None:
+        """Join the downlink writer for a bounded time, then the caller may close the WAV.
+
+        A stuck ``write_s16`` returns so ``stop_capture`` can finish and the hub
+        can release the call slot. An outer ``wait_for`` cancellation is not cleared.
+        """
+        self._down_stop = True
+        deadline = time.monotonic() + DOWNLINK_FLUSH_S
+        while True:
+            task = self._down_task
+            if task is not None and not task.done():
+                remaining = deadline - time.monotonic()
+                if not await self._join_downlink_writer(task, remaining):
+                    LOG.warning(
+                        "phone downlink writer still running after %.1fs; leaving it",
+                        DOWNLINK_FLUSH_S,
+                    )
+                    return
+                continue
+            if not self._down_q:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                LOG.warning(
+                    "phone downlink writer still running after %.1fs; leaving it",
+                    DOWNLINK_FLUSH_S,
+                )
+                return
+            chunk = self._down_q.pop(0)
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self.write_s16, PHONE_DOWNLINK, chunk, PHONE_DOWNLINK_RATE, 1),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "phone downlink write still running after %.1fs; leaving it",
+                    DOWNLINK_FLUSH_S,
+                )
+                return
 
     def write_ulaw(self, name: str, ulaw: bytes, rate: int = 8000) -> None:
         if self._closed or not ulaw:
@@ -380,9 +509,42 @@ class CallTap:
             "streams": {name: stream.stats() for name, stream in self._streams.items()},
         }
 
+    def _summary_with_transcript(self, summary: dict[str, Any]) -> dict[str, Any]:
+        """Keep a transcript already saved, including one written into levels.json."""
+        try:
+            from grokbot_transcript import load_saved_pointer
+
+            pointer = load_saved_pointer(self.dir)
+        except Exception:
+            pointer = None
+        if pointer:
+            summary["transcript"] = pointer
+            return summary
+        levels = self.dir / "levels.json"
+        if not levels.is_file():
+            return summary
+        try:
+            existing = json.loads(levels.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return summary
+        if isinstance(existing, dict) and isinstance(existing.get("transcript"), dict):
+            summary["transcript"] = existing["transcript"]
+        return summary
+
+    def write_levels(self, summary: dict[str, Any]) -> dict[str, Any]:
+        """Rewrite levels.json without dropping a transcript pointer already stored."""
+        summary = self._summary_with_transcript(dict(summary))
+        path = self.dir / "levels.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        return summary
+
     async def close(self) -> dict[str, Any]:
         if self._closed and not self._procs and not self._tasks:
-            return self.summary()
+            summary = self._summary_with_transcript(self.summary())
+            summary["meta"] = self.meta
+            return summary
         await self.stop_capture()
         mixes: dict[str, Any] = {}
         try:
@@ -392,7 +554,9 @@ class CallTap:
         summary = self.summary()
         summary["meta"] = self.meta
         summary["mixes"] = mixes
-        (self.dir / "levels.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        # Load the pointer immediately before the write so a transcript that
+        # landed during the mix is not overwritten away.
+        summary = self.write_levels(summary)
         LOG.info("call tap closed %s mixes=%s", json.dumps(summary["streams"]), json.dumps(mixes))
         return summary
 
@@ -400,6 +564,9 @@ class CallTap:
         """Stop pw-record helpers and close WAV stems. Does not mix."""
         if self._closed and not self._procs and not self._tasks:
             return
+        self._down_stop = True
+        await self.flush_phone_downlink()
+        writer_busy = self._down_task is not None and not self._down_task.done()
         self._closed = True
         for proc in self._procs:
             if proc.returncode is None:
@@ -426,7 +593,9 @@ class CallTap:
                 pass
         self._tasks = []
         self._procs = []
-        for stream in self._streams.values():
+        for name, stream in self._streams.items():
+            if writer_busy and name == PHONE_DOWNLINK:
+                continue
             try:
                 stream.close()
             except Exception:

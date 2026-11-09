@@ -274,9 +274,14 @@ def check_pixel_ping(ctx: Ctx):
 
 
 def check_webhook_env(ctx: Ctx):
-    rc, out = run(["systemctl", "--user", "show", "gsm2computer-hub", "-p", "Environment", "--value"], 8)
+    # call_ended and call_transcript are posted by the adb call-end watcher,
+    # not by gsm2computer-hub. The hub unit is expected to lack this URL.
+    rc, out = run(
+        ["systemctl", "--user", "show", "gsm2computer-call-end-watch", "-p", "Environment", "--value"],
+        8,
+    )
     if rc != 0:
-        return False, "cannot read hub unit environment"
+        return False, "cannot read call-end unit environment"
     try:
         parts = shlex.split(out)
     except ValueError:
@@ -284,7 +289,7 @@ def check_webhook_env(ctx: Ctx):
     env = dict(p.split("=", 1) for p in parts if "=" in p)
     missing = [k for k in (URL_ENV, KEY_ENV) if not env.get(k, "").strip()]
     if missing:
-        return False, "hub unit missing " + ",".join(missing)
+        return False, "call-end unit missing " + ",".join(missing)
     return True, "present"
 
 

@@ -122,6 +122,10 @@ class WatchState:
     # kept after the hub recovers so a reconnect does not hide the dead air.
     hub_gap_max_s: float = 0.0
     downlink_stall_open_s: float = 0.0  # last polled downlink_stalled_s (not persisted)
+    # Tap identity seen while this phone call was up. Known at call start,
+    # before close() mixes, so call_ended does not read the previous last_call_tap.
+    tap_id: Optional[str] = None
+    tap_dir: Optional[str] = None
     last_hub: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
@@ -144,6 +148,8 @@ class WatchState:
             "uplink_dead_at": self.uplink_dead_at,
             "phone_idle_at": self.phone_idle_at,
             "hub_gap_max_s": self.hub_gap_max_s,
+            "tap_id": self.tap_id,
+            "tap_dir": self.tap_dir,
         }
 
     @classmethod
@@ -168,6 +174,8 @@ class WatchState:
         st.uplink_dead_at = _ago(data.get("uplink_dead_at"))
         st.phone_idle_at = _ago(data.get("phone_idle_at"))
         st.hub_gap_max_s = _ago(data.get("hub_gap_max_s")) or 0.0
+        st.tap_id = str(data.get("tap_id") or "") or None
+        st.tap_dir = str(data.get("tap_dir") or "") or None
         return st
 
     def reset_call_observations(self) -> None:
@@ -181,6 +189,8 @@ class WatchState:
         self.phone_idle_at = None
         self.hub_gap_max_s = 0.0
         self.downlink_stall_open_s = 0.0
+        self.tap_id = None
+        self.tap_dir = None
         self.last_hub = {}
 
 
@@ -403,6 +413,11 @@ def observe_hub_during_call(
         "cdp": (health.get("talk") or {}).get("cdp"),
         "cdp_wedged": (health.get("talk") or {}).get("cdp_wedged"),
     }
+    opened = health.get("open_call_tap")
+    if isinstance(opened, dict) and opened.get("id") and opened.get("dir"):
+        # Latest hub tap while this phone call is still up, including a relink.
+        st.tap_id = str(opened.get("id"))
+        st.tap_dir = str(opened.get("dir"))
 
 
 def journal_summary(since_s: float = 600.0) -> dict[str, Any]:
@@ -559,6 +574,32 @@ def assess_drop(
     }
 
 
+def transcript_source(st: WatchState, health: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """This call's tap, captured at start. ``last_call_tap`` only when it is the same id.
+
+    ``close()`` mixes after the phone is already idle, and the mix can outlast
+    the 5s cap, so ``/health`` ``last_call_tap`` is often still the previous call.
+    """
+    opened = health.get("open_call_tap")
+    opened = opened if isinstance(opened, dict) else None
+    tap_id = str(st.tap_id or "")
+    tap_dir = str(st.tap_dir or "")
+    meta: dict[str, Any] = {}
+    if not tap_id and opened is not None:
+        tap_id = str(opened.get("id") or "")
+        tap_dir = str(opened.get("dir") or "")
+    if opened is not None and str(opened.get("id") or "") == tap_id:
+        tap_dir = tap_dir or str(opened.get("dir") or "")
+        if isinstance(opened.get("meta"), dict):
+            meta = opened["meta"]
+    if not tap_id and not tap_dir:
+        return None
+    last = health.get("last_call_tap")
+    if isinstance(last, dict) and tap_id and str(last.get("id") or "") == tap_id:
+        return last
+    return {"id": tap_id or None, "dir": tap_dir, "meta": meta}
+
+
 def _safe_link_gaps() -> list:
     try:
         return read_recent(limit=30)
@@ -587,7 +628,29 @@ def build_payload(
     drop = assess_drop(st, health, now=now_ts)
     dropped = drop["dropped_suspected"]
 
-    return {
+    transcript = None
+    source = None
+    try:
+        from grokbot_transcript import transcript_for_alert
+
+        source = transcript_source(st, health)
+        transcript = transcript_for_alert(source)
+    except Exception:
+        LOG.debug("transcript pointer failed", exc_info=True)
+    text = (
+        f"call_ended duration_s={duration_s:.0f} "
+        f"dropped_suspected={dropped} "
+        f"hub_end_lead_s={drop['hub_end_lead_s']} "
+        f"hub_gap_max_s={drop['hub_gap_max_s']} "
+        f"call_id={st.call_id or '-'}"
+        + (
+            f" transcript_status={transcript.get('status')} transcript={transcript.get('path') or '-'}"
+            if transcript
+            else ""
+        )
+        + (" TEST" if test else "")
+    )
+    payload = {
         "event": "call_ended",
         "test": bool(test),
         "call_id": st.call_id,
@@ -635,15 +698,14 @@ def build_payload(
         },
         "call_summary": summary,
         "link_gaps": _safe_link_gaps(),
-        "text": (
-            f"call_ended duration_s={duration_s:.0f} "
-            f"dropped_suspected={dropped} "
-            f"hub_end_lead_s={drop['hub_end_lead_s']} "
-            f"hub_gap_max_s={drop['hub_gap_max_s']} "
-            f"call_id={st.call_id or '-'}"
-            + (" TEST" if test else "")
-        ),
+        "text": text,
     }
+    if transcript:
+        payload["transcript"] = transcript
+    if source and source.get("dir"):
+        payload["tap_dir"] = source.get("dir")
+        payload["tap_id"] = source.get("id")
+    return payload
 
 
 def fire_call_ended(
@@ -658,6 +720,7 @@ def fire_call_ended(
     payload = build_payload(st=st, duration_s=duration_s, test=test, health=health, now_ts=now_ts)
     if post:
         post_alert_event(payload)
+        _schedule_transcript_followup(payload)
     st.last_fired_call_id = st.call_id or f"anon-{payload['ended_at_utc']}"
     st.last_fired_at = payload["ended_at_utc"]
     if not test:
@@ -676,6 +739,29 @@ def fire_call_ended(
         payload["hub_gap_max_s"],
     )
     return payload
+
+
+def _schedule_transcript_followup(payload: dict[str, Any]) -> None:
+    """Watch transcript.json from this process, which already posted call_ended.
+
+    Dry-run ``test: true`` payloads do not follow up. The wait runs in a daemon
+    thread so the phone state machine is not held for the transcript read.
+    """
+    if payload.get("test") is True:
+        return
+    transcript = payload.get("transcript")
+    if not isinstance(transcript, dict) or not transcript.get("status"):
+        return
+    directory = None
+    raw_dir = str(payload.get("tap_dir") or "").strip()
+    if raw_dir:
+        directory = Path(raw_dir)
+    try:
+        from grokbot_transcript import schedule_transcript_followup
+
+        schedule_transcript_followup(transcript, directory=directory)
+    except Exception:
+        LOG.warning("call_transcript follow-up failed to start", exc_info=True)
 
 
 def on_snapshot(st: WatchState, snap: PhoneSnapshot) -> None:
@@ -725,6 +811,11 @@ def on_snapshot(st: WatchState, snap: PhoneSnapshot) -> None:
         return
 
     if (not snap.in_call) and st.in_call:
+        if not st.tap_id and not (health.get("call") or {}).get("busy"):
+            opened = health.get("open_call_tap")
+            if isinstance(opened, dict) and opened.get("id") and opened.get("dir"):
+                st.tap_id = str(opened.get("id"))
+                st.tap_dir = str(opened.get("dir"))
         st.idle_streak += 1
         if st.phone_idle_at is None:
             # Phone hung up at most one poll before this.

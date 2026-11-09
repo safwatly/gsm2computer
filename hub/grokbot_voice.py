@@ -32,6 +32,9 @@ GROKBOT_SPK_SINK = os.environ.get("GSM2COMPUTER_GROKBOT_SPK_SINK", "grok_bus")
 SWITCH_TIMEOUT_S = float(os.environ.get("GSM2COMPUTER_GROKBOT_SWITCH_TIMEOUT_S", "60"))
 OFF_TIMEOUT_S = float(os.environ.get("GSM2COMPUTER_GROKBOT_OFF_TIMEOUT_S", "20"))
 LOCK_RETRY_DELAY_S = float(os.environ.get("GSM2COMPUTER_GROKBOT_LOCK_RETRY_S", "2"))
+# How long a new call waits for the post-off transcript reader to abort.
+# The reader is cancelled; the next switch does not wait out the CDP read.
+TRANSCRIPT_ABORT_S = float(os.environ.get("GSM2COMPUTER_GROKBOT_TRANSCRIPT_ABORT_S", "1"))
 # Linear gain on caller audio before it reaches the bot (1.0 = unity).
 UPLINK_GAIN = float(os.environ.get("GSM2COMPUTER_GROKBOT_UPLINK_GAIN", "1.0"))
 
@@ -83,6 +86,16 @@ async def run_patchbay(*args: str, timeout_s: float, binary: Optional[str] = Non
         return {"rc": 127, "meaning": "missing binary", "json": None, "ms": 0, "error": str(exc)}
     try:
         out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except asyncio.CancelledError:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        await proc.wait()
+        raise
     except asyncio.TimeoutError:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -133,6 +146,10 @@ class GrokBotVoice:
         self.last_off: Optional[dict[str, Any]] = None
         self._lock = asyncio.Lock()
         self._pending_off: Optional[asyncio.Task] = None
+        self._off_done: Optional[asyncio.Event] = None
+        self.transcript_abort: Optional[asyncio.Event] = None
+        self.transcript_abort_s = TRANSCRIPT_ABORT_S
+        self.on_transcript_abort: Optional[Any] = None
 
     async def _run_with_lock_retry(self, *args: str, timeout_s: float) -> dict[str, Any]:
         res = await run_patchbay(*args, timeout_s=timeout_s, binary=self.binary)
@@ -144,16 +161,40 @@ class GrokBotVoice:
         return res
 
     async def wait_pending_off(self, timeout_s: float = 25.0) -> None:
+        """Wait until ``patchbay off`` has returned. Does not wait for the transcript read."""
+        done = self._off_done
         task = self._pending_off
-        if task is None or task.done():
+        if task is None or task.done() or done is None or done.is_set():
             return
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=timeout_s)
+            await asyncio.wait_for(done.wait(), timeout=timeout_s)
         except Exception:
             LOG.warning("pending grokbot off did not finish in %.0fs", timeout_s)
 
+    async def _abort_transcript_reader(self) -> None:
+        """Stop a post-off transcript read so the next switch cannot overlap a click."""
+        abort = self.transcript_abort
+        if abort is not None:
+            abort.set()
+        done = self._off_done
+        task = self._pending_off
+        # Off still owns patchbay. Leave that task alone; the hook sees the abort flag.
+        if done is None or not done.is_set() or task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=self.transcript_abort_s)
+        except Exception:
+            LOG.warning(
+                "transcript reader still running after %.1fs; new call proceeds",
+                self.transcript_abort_s,
+            )
+
     async def start(self) -> dict[str, Any]:
-        await self.wait_pending_off()
+        # Off must finish (it owns patchbay). The transcript read is aborted
+        # and does not add more than transcript_abort_s before this switch.
+        await self.wait_pending_off(timeout_s=self.off_timeout_s + self.lock_retry_delay_s + 5)
+        await self._abort_transcript_reader()
         async with self._lock:
             self.switching = True
             try:
@@ -188,8 +229,17 @@ class GrokBotVoice:
                 LOG.error("grokbot off FAILED rc=%s (%s) err=%s", res["rc"], res["meaning"], res.get("error"))
             return res
 
-    def stop_later(self, after: Optional[asyncio.Task] = None) -> asyncio.Task:
-        """End live voice in the background (after a still-running switch)."""
+    def stop_later(self, after: Optional[asyncio.Task] = None, on_stopped: Optional[Any] = None) -> asyncio.Task:
+        """End live voice in the background (after a still-running switch).
+
+        ``on_stopped`` runs only after ``off`` returns, so a transcript read
+        cannot click the Grok page while the voice session is still live.
+        A new ``start`` aborts that read instead of waiting it out.
+        """
+        abort = asyncio.Event()
+        off_done = asyncio.Event()
+        self.transcript_abort = abort
+        self._off_done = off_done
 
         async def _go() -> None:
             if after is not None and not after.done():
@@ -197,7 +247,23 @@ class GrokBotVoice:
                     await asyncio.wait_for(asyncio.shield(after), timeout=self.switch_timeout_s + 5)
                 except Exception:
                     after.cancel()
-            await self.stop()
+            res = await self.stop()
+            off_done.set()
+            if on_stopped is None:
+                return
+            try:
+                await on_stopped(res)
+            except asyncio.CancelledError:
+                LOG.info("grok transcript aborted for a new call")
+                callback = self.on_transcript_abort
+                if callback is not None:
+                    try:
+                        callback()
+                    except Exception:
+                        LOG.warning("grok transcript abort callback failed", exc_info=True)
+                return
+            except Exception:
+                LOG.warning("grokbot post-off hook failed", exc_info=True)
 
         task = asyncio.create_task(_go())
         self._pending_off = task
