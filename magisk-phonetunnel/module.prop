@@ -1,0 +1,6 @@
+id=gsm2computer-phonetunnel
+name=GSM2Computer phone tunnel
+version=v0.1.2
+versionCode=3
+author=gsm2computer
+description=Outbound key-only SSH reverse tunnel to cup, localhost sshd, adb forward, and a Tailscale watchdog. Does not modify gsm2computer-bridge.

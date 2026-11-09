@@ -1,0 +1,6 @@
+#!/system/bin/sh
+# Magisk unzip does not reliably restore symlinks, so this wrapper
+# selects the Dropbear applet. $0's basename is the applet name.
+here=${0%/*}
+name=${0##*/}
+exec "$here/dropbearmulti" "$name" "$@"
