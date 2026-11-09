@@ -197,20 +197,75 @@ if [ "$DRY" -eq 1 ]; then
     exit 0
 fi
 
-install -d -m 755 "$(dirname "$HOLD_DST")"
-install -m 755 "$HOLD_SRC" "$HOLD_DST"
+# Nothing under the live paths is written until sshd -T accepts a staged
+# config. A failure before that commit leaves the system untouched. A
+# failure after it rolls back the user, hold script, key bundle, and
+# sshd config this run changed, so a second run starts clean.
+STAGE=$(mktemp -d)
+STAGE_BUNDLE="$STAGE/bundle"
+STAGE_SSHD="$STAGE/sshd_config"
+USER_CREATED=0
+USER_HAD_PREV=0
+PREV_SHELL=""
+HOLD_COMMITTED=0
+HOLD_HAD_PREV=0
+BUNDLE_COMMITTED=0
+BUNDLE_HAD_PREV=0
+AUTH_COMMITTED=0
+AUTH_HAD_PREV=0
+SSHD_COMMITTED=0
 
-if [ "$APPLY_SYSTEM" -eq 1 ]; then
-    if ! id "$USER_NAME" >/dev/null 2>&1; then
-        useradd --system --create-home --home-dir "/home/${USER_NAME}" --shell "$NL" "$USER_NAME"
+remove_stage() {
+    rm -rf "$STAGE"
+}
+
+rollback_commit() {
+    local rc=$?
+    trap - EXIT
+    echo "phonetunnel setup failed; rolling back this run" >&2
+    if [ "$SSHD_COMMITTED" -eq 1 ] && [ -f "$STAGE/sshd.prev" ]; then
+        cp -a "$STAGE/sshd.prev" "$SSHD_CONFIG"
+        echo "restored $SSHD_CONFIG; sshd was not reloaded" >&2
     fi
-    usermod -s "$SHELL_BIN" "$USER_NAME"
-    # shellcheck disable=SC2016
-    usermod -p '*' "$USER_NAME"
-    chmod 750 "/home/${USER_NAME}"
-fi
+    if [ "$HOLD_COMMITTED" -eq 1 ]; then
+        if [ "$HOLD_HAD_PREV" -eq 1 ]; then
+            cp -a "$STAGE/hold.prev" "$HOLD_DST"
+        else
+            rm -f "$HOLD_DST"
+        fi
+    fi
+    if [ "$BUNDLE_COMMITTED" -eq 1 ]; then
+        rm -rf "$BUNDLE"
+        if [ "$BUNDLE_HAD_PREV" -eq 1 ]; then
+            mv "$STAGE/bundle.prev" "$BUNDLE"
+        fi
+    fi
+    if [ "$AUTH_COMMITTED" -eq 1 ] && [ "$USER_CREATED" -eq 0 ]; then
+        if [ "$AUTH_HAD_PREV" -eq 1 ]; then
+            cp -a "$STAGE/auth.prev" "$AUTH_KEYS"
+        else
+            rm -f "$AUTH_KEYS"
+        fi
+    fi
+    if [ "$USER_CREATED" -eq 1 ]; then
+        userdel -r "$USER_NAME" >/dev/null 2>&1 || userdel "$USER_NAME" >/dev/null 2>&1 || true
+    elif [ "$USER_HAD_PREV" -eq 1 ] && [ -n "$PREV_SHELL" ]; then
+        usermod -s "$PREV_SHELL" "$USER_NAME" >/dev/null 2>&1 || true
+    fi
+    remove_stage
+    exit "$rc"
+}
 
-install -d -m 700 "$BUNDLE"
+trap remove_stage EXIT
+
+maybe_fail() {
+    if [ "${PHONETUNNEL_SETUP_FAIL_AFTER:-}" = "$1" ]; then
+        echo "phonetunnel setup forced failure after $1" >&2
+        exit 1
+    fi
+}
+
+install -d -m 700 "$STAGE_BUNDLE"
 # The phone client is Dropbear. It rejects OpenSSH private keys
 # ("String too long") because that format's cipher header is not what
 # dbclient's loader expects. dropbearkey writes a key dbclient can read.
@@ -220,43 +275,48 @@ if ! command -v dropbearkey >/dev/null 2>&1; then
     echo "The phone tunnel client cannot read an OpenSSH private key." >&2
     exit 1
 fi
-if [ ! -f "$BUNDLE/id_ed25519" ]; then
-    dropbearkey -t ed25519 -f "$BUNDLE/id_ed25519" > "$BUNDLE/id_ed25519.txt"
+if [ -f "$BUNDLE/id_ed25519" ]; then
+    cp -a "$BUNDLE/id_ed25519" "$STAGE_BUNDLE/id_ed25519"
 fi
-dropbearkey -y -f "$BUNDLE/id_ed25519" | awk '/^ssh-ed25519 / {print $1, $2; exit}' > "$BUNDLE/id_ed25519.pub"
-if [ ! -s "$BUNDLE/id_ed25519.pub" ]; then
+if [ -f "$BUNDLE/phone_shell_ed25519" ]; then
+    cp -a "$BUNDLE/phone_shell_ed25519" "$STAGE_BUNDLE/phone_shell_ed25519"
+fi
+if [ ! -f "$STAGE_BUNDLE/id_ed25519" ]; then
+    dropbearkey -t ed25519 -f "$STAGE_BUNDLE/id_ed25519" > "$STAGE_BUNDLE/id_ed25519.txt"
+fi
+dropbearkey -y -f "$STAGE_BUNDLE/id_ed25519" | awk '/^ssh-ed25519 / {print $1, $2; exit}' > "$STAGE_BUNDLE/id_ed25519.pub"
+if [ ! -s "$STAGE_BUNDLE/id_ed25519.pub" ]; then
     echo "dropbearkey -y did not print an ssh-ed25519 public key" >&2
     exit 1
 fi
-if [ ! -f "$BUNDLE/phone_shell_ed25519" ]; then
-    ssh-keygen -t ed25519 -f "$BUNDLE/phone_shell_ed25519" -N "" -C "phonetunnel-shell"
+if [ ! -f "$STAGE_BUNDLE/phone_shell_ed25519" ]; then
+    ssh-keygen -t ed25519 -f "$STAGE_BUNDLE/phone_shell_ed25519" -N "" -C "phonetunnel-shell"
 fi
-chmod 600 "$BUNDLE/id_ed25519" "$BUNDLE/phone_shell_ed25519"
-chmod 644 "$BUNDLE/id_ed25519.pub" "$BUNDLE/phone_shell_ed25519.pub"
+# A re-run copies the private key only. The public half is derived from it
+# so the staged directory is complete either way.
+ssh-keygen -y -f "$STAGE_BUNDLE/phone_shell_ed25519" > "$STAGE_BUNDLE/phone_shell_ed25519.pub"
+chmod 600 "$STAGE_BUNDLE/id_ed25519" "$STAGE_BUNDLE/phone_shell_ed25519"
+chmod 644 "$STAGE_BUNDLE/id_ed25519.pub" "$STAGE_BUNDLE/phone_shell_ed25519.pub"
 
-TUNNEL_PUB=$(awk '{print $1" "$2}' "$BUNDLE/id_ed25519.pub")
-TUNNEL_BLOB=$(awk '{print $2}' "$BUNDLE/id_ed25519.pub")
+TUNNEL_PUB=$(awk '{print $1" "$2}' "$STAGE_BUNDLE/id_ed25519.pub")
+TUNNEL_BLOB=$(awk '{print $2}' "$STAGE_BUNDLE/id_ed25519.pub")
 # permitopen is a single non-routable TEST-NET target so re-enabling
 # port-forwarding cannot open a local (-L) forward to a real host.
 # restrict does not disable unix-socket forwards; sshd_config does.
 AUTH_LINE="restrict,port-forwarding,permitlisten=\"127.0.0.1:${SSH_REMOTE_PORT}\",permitlisten=\"127.0.0.1:${ADB_REMOTE_PORT}\",permitopen=\"192.0.2.1:9\" ${TUNNEL_PUB} phonetunnel-phone"
 
-install -d -m 700 "${HOME_DIR}/.ssh"
+STAGE_AUTH="$STAGE/authorized_keys"
 if [ -f "$AUTH_KEYS" ]; then
-    grep -F -v "$TUNNEL_BLOB" "$AUTH_KEYS" > "${AUTH_KEYS}.tmp" || true
+    grep -F -v "$TUNNEL_BLOB" "$AUTH_KEYS" > "$STAGE_AUTH" || true
 else
-    : > "${AUTH_KEYS}.tmp"
+    : > "$STAGE_AUTH"
 fi
-printf '%s\n' "$AUTH_LINE" >> "${AUTH_KEYS}.tmp"
-mv "${AUTH_KEYS}.tmp" "$AUTH_KEYS"
-chmod 600 "$AUTH_KEYS"
-if [ "$(id -u)" -eq 0 ] && id "$USER_NAME" >/dev/null 2>&1; then
-    chown -R "${USER_NAME}:${USER_NAME}" "$HOME_DIR"
-fi
+printf '%s\n' "$AUTH_LINE" >> "$STAGE_AUTH"
+chmod 600 "$STAGE_AUTH"
 
 # Dropbear known_hosts is "hostname algo base64" with no bracketed port
 # and no hash. Pin every host key the stand-in or cup sshd offers.
-KNOWN="$BUNDLE/known_hosts"
+KNOWN="$STAGE_BUNDLE/known_hosts"
 : > "$KNOWN"
 found_hostkey=0
 for pub in "$HOST_PUB_DIR"/ssh_host_*_key.pub; do
@@ -272,16 +332,16 @@ if [ "$found_hostkey" -ne 1 ]; then
 fi
 chmod 644 "$KNOWN"
 
-SHELL_PUB=$(awk '{print $1" "$2}' "$BUNDLE/phone_shell_ed25519.pub")
+SHELL_PUB=$(awk '{print $1" "$2}' "$STAGE_BUNDLE/phone_shell_ed25519.pub")
 # Options dropbear 2025.89 actually parses. Do not add OpenSSH-only
 # words here; an unknown option makes dropbear ignore the whole key.
 # no-pty would block the rescue shell. Forwarding stays off.
 # A command without a TTY still works; ssh -t allocates a PTY.
 printf '%s\n' "no-port-forwarding,no-agent-forwarding,no-X11-forwarding ${SHELL_PUB} phonetunnel-shell" \
-    > "$BUNDLE/authorized_keys"
-chmod 600 "$BUNDLE/authorized_keys"
+    > "$STAGE_BUNDLE/authorized_keys"
+chmod 600 "$STAGE_BUNDLE/authorized_keys"
 
-cat > "$BUNDLE/config.env" << EOF
+cat > "$STAGE_BUNDLE/config.env" << EOF
 CUP_HOST=${CUP_HOST}
 CUP_PORT=${CUP_PORT}
 CUP_USER=${USER_NAME}
@@ -298,22 +358,20 @@ TS_CHECK_SEC=60
 TS_DOWN_STREAK=3
 TS_RESTART_MIN_SEC=900
 EOF
-chmod 600 "$BUNDLE/config.env"
+chmod 600 "$STAGE_BUNDLE/config.env"
 
-# First Match keyword wins. Appending this block loses to an earlier
-# Match User / Match all that already set AllowTcpForwarding or PermitOpen.
-# Insert before the first Match. A Match inside an Include that is
-# processed first still wins; sshd -T below refuses that and restores.
-BACKUP="${SSHD_CONFIG}.bak.phonetunnel"
-cp -a "$SSHD_CONFIG" "$BACKUP"
-BLOCK="${SSHD_CONFIG}.phonetunnel-block"
+# First Match keyword wins. Build the candidate in the stage directory
+# and accept it with sshd -T before replacing the live file. An Include
+# that already set AllowTcpForwarding still wins; that failure happens
+# before any account, hold script, or key is installed.
+BLOCK="$STAGE/match.block"
 match_block > "$BLOCK"
 awk '
     BEGIN {skip=0}
     $0=="# BEGIN gsm2computer-phonetunnel" {skip=1; next}
     $0=="# END gsm2computer-phonetunnel" {skip=0; next}
     skip==0 {print}
-' "$SSHD_CONFIG" > "${SSHD_CONFIG}.stripped"
+' "$SSHD_CONFIG" > "$STAGE/sshd.stripped"
 awk -v block="$BLOCK" '
     BEGIN {inserted=0}
     /^[[:space:]]*Match[[:space:]]/ && inserted==0 {
@@ -326,9 +384,7 @@ awk -v block="$BLOCK" '
             while ((getline line < block) > 0) print line
         }
     }
-' "${SSHD_CONFIG}.stripped" > "${SSHD_CONFIG}.new"
-mv "${SSHD_CONFIG}.new" "$SSHD_CONFIG"
-rm -f "$BLOCK" "${SSHD_CONFIG}.stripped"
+' "$STAGE/sshd.stripped" > "$STAGE_SSHD"
 
 if [ -x /usr/sbin/sshd ]; then
     SSHD_BIN=/usr/sbin/sshd
@@ -336,24 +392,16 @@ else
     SSHD_BIN=sshd
 fi
 
-restore_sshd() {
-    cp -a "$BACKUP" "$SSHD_CONFIG"
-    echo "restored $SSHD_CONFIG; sshd was not reloaded" >&2
-}
-
-if ! "$SSHD_BIN" -t -f "$SSHD_CONFIG"; then
-    restore_sshd
-    echo "sshd -t failed." >&2
+if ! "$SSHD_BIN" -t -f "$STAGE_SSHD"; then
+    echo "sshd -t failed. Live sshd config was not changed." >&2
     exit 1
 fi
 
-EFFECTIVE=$("$SSHD_BIN" -T -C "user=${USER_NAME},host=127.0.0.1,addr=127.0.0.1" -f "$SSHD_CONFIG" 2>"${SSHD_CONFIG}.T.err") || {
-    echo "sshd -T failed:" >&2
-    cat "${SSHD_CONFIG}.T.err" >&2
-    restore_sshd
+EFFECTIVE=$("$SSHD_BIN" -T -C "user=${USER_NAME},host=127.0.0.1,addr=127.0.0.1" -f "$STAGE_SSHD" 2>"$STAGE/sshd.T.err") || {
+    echo "sshd -T failed. Live sshd config was not changed." >&2
+    cat "$STAGE/sshd.T.err" >&2
     exit 1
 }
-rm -f "${SSHD_CONFIG}.T.err"
 
 setting() {
     printf '%s\n' "$EFFECTIVE" | awk -v k="$1" '$1==k { $1=""; sub(/^ /,""); print; exit }'
@@ -364,7 +412,7 @@ fail_effective() {
     echo "An earlier Match (often in sshd_config.d, included before this file) won." >&2
     echo "Fix that Match, then re-run. sshd was not reloaded." >&2
     printf '%s\n' "$EFFECTIVE" | awk '$1 ~ /^(allowtcpforwarding|allowstreamlocalforwarding|permitopen|permitlisten|permittty|x11forwarding|allowagentforwarding|gatewayports|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|forcecommand)$/ {print}' >&2
-    restore_sshd
+    echo "Live sshd config was not changed." >&2
     exit 1
 }
 
@@ -387,6 +435,63 @@ if [ "$got_listen" != "$want_listen" ]; then
     fail_effective
 fi
 
+# Commit. From here a failure undoes this run.
+trap rollback_commit EXIT
+
+if [ "$APPLY_SYSTEM" -eq 1 ]; then
+    if id "$USER_NAME" >/dev/null 2>&1; then
+        USER_HAD_PREV=1
+        PREV_SHELL=$(getent passwd "$USER_NAME" | awk -F: '{print $7}')
+    else
+        useradd --system --create-home --home-dir "/home/${USER_NAME}" --shell "$SHELL_BIN" "$USER_NAME"
+        USER_CREATED=1
+    fi
+    usermod -s "$SHELL_BIN" "$USER_NAME"
+    # shellcheck disable=SC2016
+    usermod -p '*' "$USER_NAME"
+    chmod 750 "/home/${USER_NAME}"
+    maybe_fail user
+fi
+
+if [ -f "$HOLD_DST" ]; then
+    cp -a "$HOLD_DST" "$STAGE/hold.prev"
+    HOLD_HAD_PREV=1
+fi
+HOLD_COMMITTED=1
+install -d -m 755 "$(dirname "$HOLD_DST")"
+install -m 755 "$HOLD_SRC" "$HOLD_DST"
+maybe_fail hold
+
+if [ -d "$BUNDLE" ]; then
+    cp -a "$BUNDLE" "$STAGE/bundle.prev"
+    BUNDLE_HAD_PREV=1
+fi
+BUNDLE_COMMITTED=1
+rm -rf "$BUNDLE"
+install -d -m 700 "$(dirname "$BUNDLE")"
+cp -a "$STAGE_BUNDLE" "$BUNDLE"
+maybe_fail keys
+
+if [ -f "$AUTH_KEYS" ]; then
+    cp -a "$AUTH_KEYS" "$STAGE/auth.prev"
+    AUTH_HAD_PREV=1
+fi
+install -d -m 700 "${HOME_DIR}/.ssh"
+install -m 600 "$STAGE_AUTH" "$AUTH_KEYS"
+if [ "$(id -u)" -eq 0 ] && id "$USER_NAME" >/dev/null 2>&1; then
+    chown -R "${USER_NAME}:${USER_NAME}" "$HOME_DIR"
+fi
+AUTH_COMMITTED=1
+
+cp -a "$SSHD_CONFIG" "$STAGE/sshd.prev"
+SSHD_COMMITTED=1
+cp "$STAGE_SSHD" "$SSHD_CONFIG"
+if ! "$SSHD_BIN" -t -f "$SSHD_CONFIG"; then
+    echo "sshd -t failed on the installed config." >&2
+    exit 1
+fi
+maybe_fail sshd
+
 if [ "$APPLY_SYSTEM" -eq 1 ]; then
     reloaded=0
     if command -v systemctl >/dev/null 2>&1; then
@@ -402,10 +507,12 @@ if [ "$APPLY_SYSTEM" -eq 1 ]; then
         fi
     fi
     if [ "$reloaded" -eq 0 ]; then
-        echo "sshd config is valid but it was not reloaded. Reload ssh yourself." >&2
+        echo "sshd reload failed. This run was rolled back." >&2
         exit 1
     fi
 fi
+
+trap remove_stage EXIT
 
 cat << EOF
 

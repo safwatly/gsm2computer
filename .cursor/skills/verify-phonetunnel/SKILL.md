@@ -56,6 +56,7 @@ One feature:
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-supervise
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-watchdog
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-policy
+.cursor/skills/verify-phonetunnel/scripts/harness.sh drive-account
 ```
 
 All of them, in that order:
@@ -82,6 +83,7 @@ Each drive writes a file under `/opt/cursor/artifacts/verify-phonetunnel/`
 | `supervise.txt` | dropbear restarts under the same tunnel pid; a dead dropbear makes `tunnel=down` while `tunnel_session=up` |
 | `watchdog.txt` | streak restart, rate limit, `mCallState=2`, empty dumpsys, dumpsys error, `mPreciseCallState=FG_ACTIVE`, `ip` error, missing dumpsys, and a bridge package name do not over-restart; an explicit idle plus a missing interface does |
 | `policy.txt` | zero timers are raised, an earlier Include Match is refused and the config restored, key and Match block the extra `-R`, `-L`, and unix-socket forward, and ForceCommand runs |
+| `account.txt` | real `useradd` in a private mount namespace: a loose Match writes nothing, a failure after the hold script rolls the new user back, a fresh account has shell `/bin/sh`, and a second run reuses the key. Host passwd is unchanged. Uninstall does not kill a reused pid |
 | `phonetunnel.log` | supervisor log copied at the end of `drive-all` |
 | `system-sshd.txt` | the system sshd config was not edited |
 | `drive-all.txt` | `drive-all ok` |
@@ -109,7 +111,7 @@ and does not edit `/etc/ssh/sshd_config`.
 
 ```sh
 .cursor/skills/verify-phonetunnel/scripts/harness.sh \
-  doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-supervise|drive-watchdog|drive-policy|drive-all|cleanup
+  doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-supervise|drive-watchdog|drive-policy|drive-account|drive-all|cleanup
 ```
 
 Cup account setup, used by `launch` with `--root` so it does not touch

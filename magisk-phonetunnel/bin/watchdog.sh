@@ -28,10 +28,12 @@ call_verified_idle() {
         log_msg "watchdog: dumpsys telephony.registry unusable; not restarting Tailscale"
         return 1
     fi
-    # Precise and legacy states both count. FG_ACTIVE can appear while
-    # mCallState is still 0; that is a live call.
-    if printf '%s\n' "$_dump" | grep -E -q \
-        'mPreciseCallState=(FG_ACTIVE|BG_ACTIVE|DIALING|ALERTING|INCOMING|WAITING|HOLDING|DISCONNECTING)|mCallState=[1-9]|mRingingCallState=[1-9]|mForegroundCallState=[1-9]|mBackgroundCallState=[1-9]'; then
+    # Any active, off-hook, or ringing value blocks a restart, even when
+    # another line says mCallState=0. Word boundaries keep mRingingCallState=0
+    # from matching RINGING. A contradictory dump is not idle.
+    if printf '%s\n' "$_dump" | grep -E -q -i \
+        '(^|[^A-Za-z0-9_])(OFFHOOK|RINGING|FG_ACTIVE|BG_ACTIVE|DIALING|ALERTING|INCOMING|WAITING|HOLDING|DISCONNECTING)([^A-Za-z0-9_]|$)|mCallState=[1-9]|mRingingCallState=[1-9]|mForegroundCallState=[1-9]|mBackgroundCallState=[1-9]|PreciseCallState=ACTIVE([^A-Za-z0-9_]|$)'; then
+        log_msg "watchdog: call active or contradictory; not restarting Tailscale"
         return 1
     fi
     if printf '%s\n' "$_dump" | grep -E -q 'mCallState=0'; then

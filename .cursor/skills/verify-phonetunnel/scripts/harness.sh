@@ -661,6 +661,10 @@ EOF
         inhibit "dumpsys error text"
         printf '%s\n' "mCallState=0" "mPreciseCallState=FG_ACTIVE" > "$wd/dumpsys.txt"
         inhibit "mPreciseCallState=FG_ACTIVE"
+        printf '%s\n' "mCallState=0" "state: OFFHOOK" > "$wd/dumpsys.txt"
+        inhibit "state OFFHOOK with mCallState=0"
+        printf '%s\n' "mCallState=0" "CallState: RINGING" > "$wd/dumpsys.txt"
+        inhibit "CallState RINGING with mCallState=0"
         printf 'mCallState=0\n' > "$wd/dumpsys.txt"
         printf 'error\n' > "$wd/ip.mode"
         inhibit "ip error"
@@ -670,6 +674,8 @@ EOF
         mv "$wd/bin/dumpsys.hide" "$wd/bin/dumpsys"
 
         # A real missing interface plus an explicit idle is still a restart.
+        # mRingingCallState=0 must not be read as RINGING.
+        printf '%s\n' "mCallState=0" "mRingingCallState=0" "mPreciseCallState=IDLE" > "$wd/dumpsys.txt"
         printf '0\n' > "$wd/state/watchdog.last"
         printf '1\n' > "$wd/state/watchdog.streak"
         "${env_prefix[@]}" sh "$MODULE/bin/watchdog.sh" once
@@ -1024,6 +1030,205 @@ PY
     sudo rm -f /tmp/pt-stream-sock
 }
 
+cmd_drive_account() {
+    local out="$EVIDENCE/account.txt"
+    local host_before hold_before
+    host_before=$(sudo sha256sum /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/ssh/sshd_config)
+    if [ -f /usr/local/sbin/phonetunnel-hold ]; then
+        hold_before=$(sha256sum /usr/local/sbin/phonetunnel-hold)
+    else
+        hold_before=absent
+    fi
+    {
+        echo "drive account $(date -Is)"
+        # Pid reuse: a pidfile whose cmdline is not this module is not killed.
+        local ustate unrelated owned
+        ustate=$(mktemp -d)
+        sleep 120 &
+        unrelated=$!
+        printf '%s\n' "$unrelated" > "$ustate/dropbear.pid"
+        PHONETUNNEL_STATE="$ustate" sh "$MODULE/uninstall.sh"
+        if ! kill -0 "$unrelated" 2>/dev/null; then
+            die "uninstall killed a pid whose cmdline is not dropbear"
+        fi
+        kill "$unrelated" 2>/dev/null || true
+        wait "$unrelated" 2>/dev/null || true
+        bash -c 'exec -a dropbear sleep 120' &
+        owned=$!
+        printf '%s\n' "$owned" > "$ustate/dropbear.pid"
+        PHONETUNNEL_STATE="$ustate" sh "$MODULE/uninstall.sh"
+        if kill -0 "$owned" 2>/dev/null; then
+            kill "$owned" 2>/dev/null || true
+            die "uninstall left a dropbear-named pid running"
+        fi
+        wait "$owned" 2>/dev/null || true
+        rm -rf "$ustate"
+        echo "uninstall skipped a reused pid and stopped a dropbear cmdline"
+
+        sudo unshare --mount --propagation private bash -s -- "$SETUP" << 'EOS'
+set -euo pipefail
+setup=$1
+root=$(mktemp -d /tmp/pt-account.XXXX)
+mkdir -p "$root"/{etc/ssh,etc/skel,etc/pam.d,home,root,tmp,proc,dev,bin,lib,usr/local/bin,usr/local/sbin,var,run/sshd}
+chmod 755 "$root/run/sshd"
+chmod 1777 "$root/tmp"
+cp -a /etc/passwd /etc/group /etc/shadow /etc/gshadow /etc/login.defs /etc/shells "$root/etc/"
+sed -i '/^phonetunnel:/d' "$root/etc/passwd" "$root/etc/shadow" "$root/etc/group" "$root/etc/gshadow" || true
+cat > "$root/etc/nsswitch.conf" << 'EOF'
+passwd: files
+group: files
+shadow: files
+EOF
+if [ -d /etc/skel ]; then cp -a /etc/skel/. "$root/etc/skel/" 2>/dev/null || true; fi
+ssh-keygen -t ed25519 -f "$root/etc/ssh/ssh_host_ed25519_key" -N "" -q
+cat > "$root/etc/ssh/sshd_config" << 'EOF'
+Port 22
+HostKey /etc/ssh/ssh_host_ed25519_key
+UsePAM no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+EOF
+cp -a "$root/etc/ssh/sshd_config" "$root/sshd.orig"
+cat > "$root/usr/local/bin/systemctl" << 'EOF'
+#!/bin/sh
+if [ "${1:-}" = reload ] && { [ "${2:-}" = ssh ] || [ "${2:-}" = sshd ]; }; then
+    exit 0
+fi
+exit 1
+EOF
+chmod 755 "$root/usr/local/bin/systemctl"
+mount --bind /bin "$root/bin"
+mount --bind /lib "$root/lib"
+if [ -d /lib64 ]; then mkdir -p "$root/lib64"; mount --bind /lib64 "$root/lib64"; fi
+mount --bind /usr "$root/usr"
+mount -t tmpfs tmpfs "$root/usr/local"
+mkdir -p "$root/usr/local/bin" "$root/usr/local/sbin"
+# tmpfs hid the copy made before the /usr bind. Write it on the private mount.
+cat > "$root/usr/local/bin/systemctl" << 'EOF'
+#!/bin/sh
+if [ "${1:-}" = reload ] && { [ "${2:-}" = ssh ] || [ "${2:-}" = sshd ]; }; then
+    exit 0
+fi
+exit 1
+EOF
+chmod 755 "$root/usr/local/bin/systemctl"
+mkdir -p "$root/agent/repos/gsm2computer"
+mount --bind /agent/repos/gsm2computer "$root/agent/repos/gsm2computer"
+mkdir -p "$root/etc/alternatives"
+mount --bind /etc/alternatives "$root/etc/alternatives"
+mount --bind /dev "$root/dev"
+mount -t proc proc "$root/proc"
+
+run_setup() {
+    chroot "$root" /usr/bin/env \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        PHONETUNNEL_SETUP_FAIL_AFTER="${1:-}" \
+        /bin/bash "$setup"
+}
+
+clean_tree() {
+    [ ! -e "$root/usr/local/sbin/phonetunnel-hold" ]
+    ! grep -q '^phonetunnel:' "$root/etc/passwd"
+    [ ! -d "$root/root/phonetunnel-install" ]
+    cmp -s "$root/sshd.orig" "$root/etc/ssh/sshd_config"
+}
+
+echo "---- conflict before any account ----"
+cat > "$root/etc/ssh/loose.conf" << 'EOF'
+Match User phonetunnel
+    AllowTcpForwarding yes
+    PermitOpen any
+    AllowStreamLocalForwarding yes
+EOF
+printf '\nInclude /etc/ssh/loose.conf\n' >> "$root/etc/ssh/sshd_config"
+cp -a "$root/etc/ssh/sshd_config" "$root/sshd.orig"
+set +e
+run_setup >"$root/conflict.out" 2>"$root/conflict.err"
+crc=$?
+set -e
+echo "conflict rc=$crc"
+cat "$root/conflict.err"
+[ "$crc" -ne 0 ]
+grep -q 'not the tunnel policy' "$root/conflict.err"
+clean_tree
+echo "conflict left no user, hold script, or sshd edit"
+
+echo "---- forced failure after hold ----"
+cp -a "$root/sshd.base" "$root/etc/ssh/sshd_config" 2>/dev/null || true
+# sshd.orig currently includes the loose Match. Restore the base.
+python3 - << PY
+from pathlib import Path
+p = Path("$root/etc/ssh/sshd_config")
+text = p.read_text()
+text = text.split("\nInclude /etc/ssh/loose.conf")[0]
+if not text.endswith("\n"):
+    text += "\n"
+p.write_text(text)
+PY
+cp -a "$root/etc/ssh/sshd_config" "$root/sshd.orig"
+set +e
+run_setup hold >"$root/fail.out" 2>"$root/fail.err"
+frc=$?
+set -e
+echo "fail-after-hold rc=$frc"
+cat "$root/fail.err"
+[ "$frc" -ne 0 ]
+grep -q 'forced failure after hold' "$root/fail.err"
+grep -q 'rolling back' "$root/fail.err"
+clean_tree
+echo "failed run rolled back the new user and the hold script"
+
+echo "---- fresh account ----"
+set +e
+run_setup >"$root/ok.out" 2>"$root/ok.err"
+ok=$?
+set -e
+echo "fresh rc=$ok"
+cat "$root/ok.err"
+[ "$ok" -eq 0 ]
+shell=$(awk -F: '$1=="phonetunnel" {print $7}' "$root/etc/passwd")
+shadow=$(awk -F: '$1=="phonetunnel" {print $2}' "$root/etc/shadow")
+echo "shell=$shell shadow=$shadow"
+[ "$shell" = /bin/sh ]
+[ "$shadow" = '*' ]
+[ -x "$root/usr/local/sbin/phonetunnel-hold" ]
+[ -s "$root/root/phonetunnel-install/id_ed25519" ]
+begins=$(grep -c 'BEGIN gsm2computer-phonetunnel' "$root/etc/ssh/sshd_config")
+[ "$begins" -eq 1 ]
+chroot "$root" /usr/sbin/sshd -T -C user=phonetunnel,host=127.0.0.1,addr=127.0.0.1 \
+    -f /etc/ssh/sshd_config | awk '$1=="allowtcpforwarding" || $1=="forcecommand"'
+pub1=$(awk '{print $2}' "$root/root/phonetunnel-install/id_ed25519.pub")
+
+echo "---- second run ----"
+set +e
+run_setup >"$root/again.out" 2>"$root/again.err"
+arc=$?
+set -e
+echo "second rc=$arc"
+cat "$root/again.err"
+[ "$arc" -eq 0 ]
+pub2=$(awk '{print $2}' "$root/root/phonetunnel-install/id_ed25519.pub")
+[ "$pub1" = "$pub2" ]
+begins=$(grep -c 'BEGIN gsm2computer-phonetunnel' "$root/etc/ssh/sshd_config")
+[ "$begins" -eq 1 ]
+echo "second run reused the key and did not stack Match blocks"
+echo "account ok"
+EOS
+        echo "host passwd and sshd were not the chroot"
+    } | tee "$out"
+    local host_after hold_after
+    host_after=$(sudo sha256sum /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/ssh/sshd_config)
+    if [ -f /usr/local/sbin/phonetunnel-hold ]; then
+        hold_after=$(sha256sum /usr/local/sbin/phonetunnel-hold)
+    else
+        hold_after=absent
+    fi
+    [ "$host_before" = "$host_after" ] || die "host passwd or sshd_config changed"
+    [ "$hold_before" = "$hold_after" ] || die "host hold script changed"
+    grep -q 'account ok' "$out"
+}
+
 assert_system_sshd_untouched() {
     local run now
     run=$(run_dir)
@@ -1039,6 +1244,7 @@ cmd_drive_all() {
     cmd_drive_supervise
     cmd_drive_watchdog
     cmd_drive_policy
+    cmd_drive_account
     assert_system_sshd_untouched
     local run
     run=$(run_dir)
@@ -1112,10 +1318,11 @@ case "${1:-}" in
     drive-watchdog) cmd_drive_watchdog ;;
     drive-supervise) cmd_drive_supervise ;;
     drive-policy) cmd_drive_policy ;;
+    drive-account) cmd_drive_account ;;
     drive-all) cmd_drive_all ;;
     cleanup) cmd_cleanup ;;
     *)
-        echo "usage: harness.sh doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-supervise|drive-watchdog|drive-policy|drive-all|cleanup" >&2
+        echo "usage: harness.sh doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-supervise|drive-watchdog|drive-policy|drive-account|drive-all|cleanup" >&2
         exit 2
         ;;
 esac

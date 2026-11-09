@@ -40,9 +40,11 @@ Dry-run writes nothing and does not reload sshd.
 
 The script:
 
-1. Creates unix user `phonetunnel` with shell `/usr/sbin/nologin` and a
-   shadow password of `*` (not `!`). A `!` lock makes OpenSSH refuse the
-   public key even when passwords are off.
+1. Creates unix user `phonetunnel` with shell `/bin/sh` and a shadow
+   password of `*` (not `!`). The shell has to be `/bin/sh` so OpenSSH
+   can run the hold script; `nologin` ignores `-c` and never runs it.
+   A `!` lock makes OpenSSH refuse the public key even when passwords
+   are off. A failed run deletes a user it just created.
 2. Generates two keys under `/root/phonetunnel-install/` (mode 700):
    - `id_ed25519` from `dropbearkey`. This is the phone's tunnel identity.
      The matching public line goes in `phonetunnel`'s `authorized_keys`
@@ -67,10 +69,13 @@ The script:
    `PermitOpen none`, `PermitTTY no`, and `PermitListen` for the two
    localhost ports. `restrict` does not turn off unix-socket forwards;
    `AllowStreamLocalForwarding no` does.
-6. Runs `sshd -t`, then `sshd -T -C user=phonetunnel,host=127.0.0.1,addr=127.0.0.1`.
-   If the effective settings are any looser (an earlier Match inside
-   `sshd_config.d` is the usual cause), the previous config is restored
-   and sshd is not reloaded. A clean result reloads ssh.
+6. Runs `sshd -t`, then `sshd -T -C user=phonetunnel,host=127.0.0.1,addr=127.0.0.1`
+   on a copy of the config. If the effective settings are any looser (an
+   earlier Match inside `sshd_config.d` is the usual cause), the live
+   file is left unchanged and sshd is not reloaded. Only a clean result
+   creates the account, installs the hold script and keys, writes the
+   Match, and reloads ssh. If one of those later steps fails, that run
+   is rolled back.
 
 `ssh -N` (what the phone uses) does not run ForceCommand. A client that
 asks for a command runs the hold script, which prints

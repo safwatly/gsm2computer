@@ -2,7 +2,7 @@
 
 ## Sub-features
 
-- Restart only when dumpsys explicitly shows `mCallState=0` and no active precise or legacy call state. Empty output, an error, `mPreciseCallState=FG_ACTIVE`, or a missing `dumpsys` does not restart.
+- Restart only when dumpsys explicitly shows `mCallState=0` and no active, off-hook, or ringing value in any known form. `state: OFFHOOK` or `CallState: RINGING` next to `mCallState=0` is a contradiction and does not restart. `mRingingCallState=0` is still idle. Empty output, an error, `mPreciseCallState=FG_ACTIVE`, or a missing `dumpsys` does not restart.
 - Restart only when `ip addr show tailscale0` succeeds, names the interface, and has no IPv4. An `ip` error is unknown, not down.
 - Count a down streak. Restart only at `TS_DOWN_STREAK` (3 in production, 2 in the drive).
 - Restart is `am force-stop com.tailscale.ipn` and then `am start` of `com.tailscale.ipn/.IPNActivity`. No other package. A config that names `com.gsm2computer.bridge` is invalid.
@@ -35,7 +35,7 @@ This does not use the live tunnel. It writes a private config and fake
 2. Interface down again. `am` log is `force-stop com.tailscale.ipn` and `start -n com.tailscale.ipn/com.tailscale.ipn.IPNActivity`.
 3. Interface still down, last restart is now. `am` is not called again.
 4. Streak is forced high, `mCallState=2`, last restart cleared. `am` is not called.
-5. The same high streak with empty dumpsys, a dumpsys error string, `mCallState=0` plus `mPreciseCallState=FG_ACTIVE`, an `ip` that exits 1 with `invalid argument`, and `dumpsys` removed from `PATH`. `am` is not called.
+5. The same high streak with empty dumpsys, a dumpsys error string, `mCallState=0` plus `mPreciseCallState=FG_ACTIVE`, `state: OFFHOOK`, or `CallState: RINGING`, an `ip` that exits 1 with `invalid argument`, and `dumpsys` removed from `PATH`. `am` is not called.
 6. Explicit `mCallState=0` and `ip` reporting that `tailscale0` does not exist. `am` is called.
 7. The same config with `TS_PACKAGE=com.gsm2computer.bridge`. `am` is not called, and the log says the package must be `com.tailscale.ipn`.
 
