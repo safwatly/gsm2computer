@@ -2,7 +2,7 @@
 
 ## Sub-features
 
-- Restart only when dumpsys explicitly shows `mCallState=0` and no active, off-hook, or ringing value in any known form. `state: OFFHOOK` or `CallState: RINGING` next to `mCallState=0` is a contradiction and does not restart. `mRingingCallState=0` is still idle. Empty output, an error, `mPreciseCallState=FG_ACTIVE`, or a missing `dumpsys` does not restart.
+- Restart only when every subscription's current `mCallState` is `0` and the current precise-call values are idle (`-1`, `0`, or disconnected `7`). Data-connection history and older `OFFHOOK`/`RINGING` log lines do not count. `mCallState=2`, a precise ringing value such as `5`, and `mPreciseCallState=FG_ACTIVE` do not restart. `mRingingCallState=0` is still idle. Empty output, an error, or a missing `dumpsys` does not restart.
 - Restart only when `ip addr show` succeeds and no `tunN` or `tailscaleN` interface has an address in `100.64.0.0/10`. A carrier `100.64` address on `rmnet` is not Tailscale. `TS_IFACE` names one interface, which is down when that device is missing or has no IPv4. An `ip` error is unknown, not down.
 - A dumpsys larger than one argument is still read. The output is written to a file. `mksh` would fail `printf` of that buffer with `Argument list too long`.
 - Count a down streak. Restart only at `TS_DOWN_STREAK` (3 in production, 2 in the drive).
@@ -36,10 +36,10 @@ This does not use the live tunnel. It writes a private config and fake
 2. Interface down again. `am` log is `force-stop com.tailscale.ipn` and `start -n com.tailscale.ipn/com.tailscale.ipn.IPNActivity`.
 3. Interface still down, last restart is now. `am` is not called again.
 4. Streak is forced high, `mCallState=2`, last restart cleared. `am` is not called.
-5. The same high streak with empty dumpsys, a dumpsys error string, `mCallState=0` plus `mPreciseCallState=FG_ACTIVE`, `state: OFFHOOK`, or `CallState: RINGING`, an `ip` that exits 1 with `invalid argument`, and `dumpsys` removed from `PATH`. `am` is not called.
+5. The same high streak with empty dumpsys, a dumpsys error string, `mCallState=0` plus `mPreciseCallState=FG_ACTIVE`, a precise `Ringing call state: 5`, a second subscription at `mCallState=2`, an `ip` that exits 1 with `invalid argument`, and `dumpsys` removed from `PATH`. `am` is not called.
 6. Explicit `mCallState=0` and `ip addr show` listing only `wlan0`. `am` is called.
 7. `tun1` holding `100.111.22.5/32` next to a carrier `100.80` address does not restart, and status prints `tailscale_iface=tun1`. Carrier CGNAT alone does restart. `TS_IFACE=tun1` does not. `TS_IFACE` pointing at a missing device does.
-8. A dumpsys bigger than 200KB that says `mCallState=0`, run under `mksh`, restarts. The same dump with `state: OFFHOOK` does not, and the log has no `Argument list too long`.
+8. A dumpsys bigger than 250KB in the real idle shape (two subscriptions, precise values `-1`, and historical `OFFHOOK`/`RINGING`/`DISCONNECTING` lines), run under `mksh`, restarts. Changing one current precise foreground value to `1` does not, and the log has no `Argument list too long`.
 9. The same config with `TS_PACKAGE=com.gsm2computer.bridge`. `am` is not called, and the log says the package must be `com.tailscale.ipn`.
 
 `drive-policy` also loads a config with `TS_CHECK_SEC=0` and `TS_RESTART_MIN_SEC=0` and requires those to be raised to 15 and 60.

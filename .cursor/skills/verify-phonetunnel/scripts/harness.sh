@@ -692,10 +692,13 @@ EOF
         inhibit "dumpsys error text"
         printf '%s\n' "mCallState=0" "mPreciseCallState=FG_ACTIVE" > "$wd/dumpsys.txt"
         inhibit "mPreciseCallState=FG_ACTIVE"
-        printf '%s\n' "mCallState=0" "state: OFFHOOK" > "$wd/dumpsys.txt"
-        inhibit "state OFFHOOK with mCallState=0"
-        printf '%s\n' "mCallState=0" "CallState: RINGING" > "$wd/dumpsys.txt"
-        inhibit "CallState RINGING with mCallState=0"
+        printf '%s\n' \
+            "mCallState=0" \
+            "  mPreciseCallState=Ringing call state: 5, Foreground call state: -1, Background call state: -1, Disconnect cause: -1, Precise disconnect cause: -1" \
+            > "$wd/dumpsys.txt"
+        inhibit "precise ringing value 5"
+        printf '%s\n' "Phone Id=0" "  mCallState=0" "Phone Id=1" "  mCallState=2" > "$wd/dumpsys.txt"
+        inhibit "second subscription mCallState=2"
         printf 'mCallState=0\n' > "$wd/dumpsys.txt"
         printf 'error\n' > "$wd/ip.mode"
         inhibit "ip error"
@@ -768,18 +771,48 @@ EOF
         python3 - << PY
 from pathlib import Path
 p = Path("$wd/dumpsys.txt")
-line = b"mCellIdentity=padding\\n"
-blob = line * ((256 * 1024) // len(line) + 1)
-p.write_bytes(blob + b"mCallState=0\\nmRingingCallState=0\\nmPreciseCallState=IDLE\\n")
+def phone(pid, call="0", ring="0", fg="0", bg="0", pr="-1", pf="-1", pb="-1"):
+    return (
+        "Phone Id=%s\n"
+        "  mCallState=%s\n"
+        "  mCallIncomingNumber=\n"
+        "  mRingingCallState=%s\n"
+        "  mForegroundCallState=%s\n"
+        "  mBackgroundCallState=%s\n"
+        "  mPreciseCallState=Ringing call state: %s, Foreground call state: %s, "
+        "Background call state: %s, Disconnect cause: -1, Precise disconnect cause: -1\n"
+        "  mDataConnectionState=0\n\n"
+    ) % (pid, call, ring, fg, bg, pr, pf, pb)
+hist = [
+    "11-09 01:00:00.100 notifyDataConnectionForSubscriber: phoneId=0 subId=1  state: CONNECTING, transport: WWAN, fail cause: NONE",
+    "11-09 01:00:01.100 notifyDataConnectionForSubscriber: phoneId=0 subId=1  state: CONNECTED, transport: WWAN, fail cause: NONE",
+    "11-09 01:00:02.100 notifyDataConnectionForSubscriber: phoneId=0 subId=1  state: DISCONNECTING, transport: WWAN, fail cause: LOST_CONNECTION",
+    "11-09 01:00:03.100 notifyDataConnectionForSubscriber: phoneId=0 subId=1  state: DISCONNECTED, transport: WWAN, fail cause: LOST_CONNECTION",
+    "11-09 01:02:00.000 notifyCallState: phoneId=0 subId=1 state=OFFHOOK incomingNumber=",
+    "11-09 01:02:10.000 notifyCallState: phoneId=0 subId=1 state=RINGING incomingNumber=",
+    "11-09 01:02:20.000 notifyCallState: phoneId=1 subId=2 CallState: RINGING",
+    "11-09 01:02:30.000 notifyCallState: phoneId=1 subId=2 state: OFFHOOK",
+    "11-09 01:03:00.000 notifyPreciseCallState: Ringing call state: 5, Foreground call state: 1, Background call state: -1, Disconnect cause: 16, Precise disconnect cause: 0",
+    "11-09 01:03:01.000 mCellInfo=[CellInfoLte:{mRegistered=YES mCi=12345}]",
+]
+body = ["TelephonyRegistry:", "last known state:", "mNumPhones=2", ""]
+body.append(phone(0))
+body.append(phone(1))
+body.append("local logs:")
+chunk = ("\n".join(hist) + "\n").encode()
+current = ("\n".join(body) + "\n").encode()
+reps = (250 * 1024) // len(chunk) + 1
+data = current + chunk * reps + current
+p.write_bytes(data)
 print(p.stat().st_size)
 PY
-        [ "$(wc -c < "$wd/dumpsys.txt" | tr -d ' ')" -gt 200000 ]
+        [ "$(wc -c < "$wd/dumpsys.txt" | tr -d ' ')" -gt 250000 ]
         printf 'missing\n' > "$wd/ip.mode"
         printf '0\n' > "$wd/state/watchdog.last"
         printf '1\n' > "$wd/state/watchdog.streak"
         "${env_prefix[@]}" mksh "$MODULE/bin/watchdog.sh" once
         lines=$(wc -l < "$wd/am.log" | tr -d ' ')
-        echo "large idle dumpsys, am lines: $lines"
+        echo "large idle dumpsys with call history, am lines: $lines"
         [ "$lines" -eq 10 ]
         if grep -q 'Argument list too long' "$wd/state/phonetunnel.log"; then
             echo "large dumpsys was passed as one argument" >&2
@@ -788,13 +821,18 @@ PY
         python3 - << PY
 from pathlib import Path
 p = Path("$wd/dumpsys.txt")
-p.write_bytes(p.read_bytes() + b"state: OFFHOOK\\n")
+text = p.read_text()
+old = "Foreground call state: -1"
+new = "Foreground call state: 1"
+if old not in text:
+    raise SystemExit("fixture has no current precise foreground field")
+p.write_text(text.replace(old, new, 1))
 PY
         printf '0\n' > "$wd/state/watchdog.last"
         printf '9\n' > "$wd/state/watchdog.streak"
         "${env_prefix[@]}" mksh "$MODULE/bin/watchdog.sh" once
         lines=$(wc -l < "$wd/am.log" | tr -d ' ')
-        echo "large dumpsys with OFFHOOK, am lines: $lines"
+        echo "large dump with current precise foreground 1, am lines: $lines"
         [ "$lines" -eq 10 ]
 
         # A config that names the bridge package must not call am.
