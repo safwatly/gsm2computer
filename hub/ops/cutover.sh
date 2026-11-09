@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Switch cup's hub code, or put the previous tree back.
-# Idle gate first: /health busy is false, and the phone's mCallState is 0
-# when GSM2COMPUTER_CALL_END_ADB is set on the call-end unit. A failed gate
-# exits 1 before any copy, rsync, stop, or restart.
+# Idle gate first: /health call.busy (else top-level busy) is exactly false,
+# and the phone's mCallState is 0 when GSM2COMPUTER_CALL_END_ADB is set.
+# A failed gate exits 1 before any copy, rsync, stop, or restart.
 set -euo pipefail
 
 LIVE=${GSM2COMPUTER_CUTOVER_LIVE:-$HOME/gsm2computer-hub}
@@ -111,10 +111,15 @@ try:
     body = json.load(sys.stdin)
 except json.JSONDecodeError:
     sys.exit(1)
-if body.get("busy") is not False:
+call = body.get("call")
+if isinstance(call, dict) and "busy" in call:
+    busy = call.get("busy")
+else:
+    busy = body.get("busy")
+if busy is not False:
     sys.exit(1)
 '; then
-    echo "cutover: hub at $url is not idle (busy must be false)" >&2
+    echo "cutover: hub at $url is not idle (call.busy, or top-level busy, must be false)" >&2
     exit 1
   fi
 
@@ -141,6 +146,43 @@ if body.get("busy") is not False:
   fi
 }
 
+# Paths on the live tree that rsync --delete must leave in place.
+# Recordings, the link-gap log, and the alert spool live outside this directory.
+RSYNC_PROTECT=(
+  --exclude '.git/'
+  --exclude '.cup-health*'
+  --exclude '.health-watch*'
+  --exclude 'node_modules/'
+  --exclude '.venv/'
+  --exclude 'device-tokens.json'
+  --exclude 'portal.sqlite*'
+  --exclude 'state/'
+  --exclude 'var/'
+  --exclude 'workspace/'
+  --exclude 'backups/'
+  --exclude '__pycache__/'
+  --exclude '*.bak'
+  --exclude '*.bak*'
+)
+
+print_delete_list() {
+  local list=$1 line any=0
+  rsync -a --delete --dry-run --itemize-changes \
+    "${RSYNC_PROTECT[@]}" "$REPO"/ "$LIVE"/ >"$list"
+  echo "cutover: --delete would remove:"
+  while IFS= read -r line; do
+    case "$line" in
+      *deleting\ *)
+        echo "  ${line#*deleting }"
+        any=1
+        ;;
+    esac
+  done <"$list"
+  if [[ "$any" -eq 0 ]]; then
+    echo "  (nothing)"
+  fi
+}
+
 apply_tree() {
   local stamp backup
   if [[ ! -d "$LIVE" ]]; then
@@ -155,13 +197,16 @@ apply_tree() {
   backup="${LIVE}.rollback-${stamp}"
   cp -a "$LIVE" "$backup"
   printf '%s\n' "$backup" >"${LIVE}.rollback-latest"
+  local delete_list
+  delete_list=$(mktemp)
+  print_delete_list "$delete_list"
+  rm -f "$delete_list"
   rsync -a --delete \
-    --exclude state/ --exclude var/ --exclude workspace/ --exclude backups/ \
-    --exclude '.venv/' --exclude 'portal.sqlite*' --exclude device-tokens.json \
-    --exclude __pycache__/ \
+    "${RSYNC_PROTECT[@]}" \
     "$REPO"/ "$LIVE"/
-  systemctl --user restart gsm2computer-hub.service
+  systemctl --user restart "$HUB_UNIT"
   systemctl --user restart "$CALL_WATCH_UNIT"
+  systemctl --user restart "$CALL_END_UNIT"
   echo "cutover: applied, rollback tree $backup"
 }
 
@@ -176,13 +221,15 @@ rollback_tree() {
     echo "cutover: rollback tree missing: $backup" >&2
     exit 1
   fi
-  systemctl --user stop gsm2computer-hub.service
+  systemctl --user stop "$CALL_END_UNIT"
   systemctl --user stop "$CALL_WATCH_UNIT"
+  systemctl --user stop "$HUB_UNIT"
   rm -rf "$LIVE"
   mv "$backup" "$LIVE"
   rm -f "${LIVE}.rollback-latest"
-  systemctl --user start gsm2computer-hub.service
+  systemctl --user start "$HUB_UNIT"
   systemctl --user start "$CALL_WATCH_UNIT"
+  systemctl --user start "$CALL_END_UNIT"
   echo "cutover: restored $LIVE"
 }
 

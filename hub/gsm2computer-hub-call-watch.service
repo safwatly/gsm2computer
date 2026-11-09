@@ -9,7 +9,8 @@ WorkingDirectory=%h/gsm2computer-hub
 Environment=PYTHONPATH=%h/gsm2computer-hub
 # Public Tailscale address of cup. The phone address is not in this file.
 Environment=GSM2COMPUTER_HUB_HTTP=http://100.113.222.47:8787
-# MOTO_TS_IP or GSM2COMPUTER_CALL_END_ADB (host:5555) comes from the cup drop-in.
+# Move MOTO_TS_IP and GSM2COMPUTER_CALL_END_ADB off the old installed unit
+# into gsm2computer-hub-call-watch.service.d/cup-private.conf. Do not put them here.
 Environment=GSM2COMPUTER_CALL_END_POLL_S=2.5
 Environment=GSM2COMPUTER_CALL_END_MIN_S=5
 ExecStart=%h/gsm2computer-hub/.venv/bin/python %h/gsm2computer-hub/hub_call_watch.py
