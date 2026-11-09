@@ -187,9 +187,7 @@ class CallOrchestrator(
         val endpoints = cfg.endpoints.ifEmpty {
             listOf(HubEndpoint(HubEndpoints.OPENAI_REALTIME_WS))
         }
-        if (cfg.endpoints.isNotEmpty() && cfg.endpoints.all { it.deviceToken.isBlank() }) {
-            Log.w(TAG, "device token unset; the public entrance will reject the call")
-        }
+        HubEndpoints.missingDeviceTokenWarning(cfg.endpoints)?.let { Log.w(TAG, it) }
         Log.i(
             TAG,
             "Opening hub stream (endpoints=${endpoints.joinToString { it.url }} " +
