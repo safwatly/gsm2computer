@@ -2,6 +2,7 @@ package com.gsm2computer.bridge
 
 import com.gsm2computer.bridge.realtime.HandshakeGate
 import com.gsm2computer.bridge.realtime.HubCallDialer
+import com.gsm2computer.bridge.realtime.timeoutDecision
 import okhttp3.OkHttpClient
 import okhttp3.Response
 import okhttp3.WebSocket
@@ -12,6 +13,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.IOException
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -106,6 +109,20 @@ class HubCallDialerTest {
     }
 
     @Test
+    fun timeoutCancelsOnlyWhenAbandonWins() {
+        val won = HandshakeGate()
+        assertTrue(won.onOpen())
+        var cancelled = false
+        assertEquals(DialStatus.OPENED, timeoutDecision(won) { cancelled = true })
+        assertFalse(cancelled)
+
+        val lost = HandshakeGate()
+        var cancels = 0
+        assertEquals(DialStatus.RETRYABLE, timeoutDecision(lost) { cancels += 1 })
+        assertEquals(1, cancels)
+    }
+
+    @Test
     fun abandonAfterOpenKeepsTheSocketAndALateOpenIsIgnored() {
         val gate = HandshakeGate()
         assertTrue(gate.onOpen())
@@ -130,10 +147,19 @@ class HubCallDialerTest {
                     .withWebSocketUpgrade(object : WebSocketListener() {}),
             )
             val installed = AtomicBoolean(false)
+            val callFailed = CountDownLatch(1)
             val dialer = HubCallDialer(
                 http = OkHttpClient.Builder()
                     .connectTimeout(2, TimeUnit.SECONDS)
                     .readTimeout(2, TimeUnit.SECONDS)
+                    .addInterceptor { chain ->
+                        try {
+                            chain.proceed(chain.request())
+                        } catch (e: IOException) {
+                            if (chain.call().isCanceled()) callFailed.countDown()
+                            throw e
+                        }
+                    }
                     .build(),
                 hubOwned = true,
                 openAiTokenUrl = "",
@@ -151,6 +177,7 @@ class HubCallDialerTest {
                 },
             )
             assertEquals(DialStatus.RETRYABLE, response.status)
+            assertTrue(callFailed.await(2, TimeUnit.SECONDS))
             Thread.sleep(2_500)
             assertFalse(installed.get())
             assertFalse(response.detail.contains(secret))

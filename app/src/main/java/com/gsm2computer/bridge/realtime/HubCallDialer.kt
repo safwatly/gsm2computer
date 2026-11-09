@@ -115,10 +115,8 @@ class HubCallDialer(
             }
         })
         if (!latch.await(handshakeTimeoutMs, TimeUnit.MILLISECONDS)) {
-            if (gate.opened()) return DialResponse(DialStatus.OPENED, 101, "")
-            val abandoned = gate.abandon()
-            socket.cancel()
-            if (!abandoned || gate.opened()) return DialResponse(DialStatus.OPENED, 101, "")
+            val status = timeoutDecision(gate) { socket.cancel() }
+            if (status == DialStatus.OPENED) return DialResponse(DialStatus.OPENED, 101, "")
             return failure.get() ?: DialResponse(DialStatus.RETRYABLE, 0, "handshake timeout")
         }
         if (gate.opened()) return DialResponse(DialStatus.OPENED, 101, "")
@@ -180,8 +178,8 @@ class HubCallDialer(
 /**
  * One handshake. [onOpen] and [abandon] cannot both win.
  * The loser of [onOpen] must not install the socket. The loser of [abandon]
- * means the socket is already open, so the dial returns [DialStatus.OPENED]
- * even if [okhttp3.WebSocket.cancel] already ran.
+ * means the socket is already open: [timeoutDecision] returns OPENED and
+ * does not cancel it.
  */
 internal class HandshakeGate {
     private val state = AtomicInteger(PENDING)
@@ -197,4 +195,12 @@ internal class HandshakeGate {
         const val OPENED = 1
         const val FAILED = 2
     }
+}
+
+/** Timeout outcome. [cancel] runs only when this attempt is the one that failed. */
+internal fun timeoutDecision(gate: HandshakeGate, cancel: () -> Unit): DialStatus {
+    if (gate.opened()) return DialStatus.OPENED
+    if (!gate.abandon()) return DialStatus.OPENED
+    cancel()
+    return DialStatus.RETRYABLE
 }
