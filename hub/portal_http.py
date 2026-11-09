@@ -191,7 +191,9 @@ class PortalApp:
             if not peer.strip():
                 writer.write(json_response(400, {"ok": False, "error": "peer required"}))
                 return "handled"
-            writer.write(json_response(200, self.store.list_messages(peer)))
+            messages = self.store.list_messages(peer)
+            self._publish_lease_timeouts()
+            writer.write(json_response(200, messages))
             return "handled"
 
         if method == "POST" and route == "/portal/api/messages/send":
@@ -208,7 +210,9 @@ class PortalApp:
             return "handled"
 
         if method == "GET" and route == "/sms/outbox":
-            writer.write(json_response(200, {"ok": True, "items": self.store.claim_outbox_for_send()}))
+            items = self.store.claim_outbox_for_send()
+            self._publish_lease_timeouts()
+            writer.write(json_response(200, {"ok": True, "items": items}))
             return "handled"
 
         ack = OUTBOX_ACK_RE.match(route)
@@ -275,7 +279,7 @@ class PortalApp:
             except json.JSONDecodeError:
                 payload = {}
             raw_status = str(payload.get("status") or "").strip().lower()
-            if raw_status in {"sent", "failed"}:
+            if raw_status in {"sent", "failed", "timeout"}:
                 status = raw_status
             elif payload.get("ok") is False:
                 status = "failed"
@@ -290,6 +294,10 @@ class PortalApp:
             self.events.publish("message", msg)
         self.events.publish("outbox", result)
         return json_response(200, {"ok": True, "item": result})
+
+    def _publish_lease_timeouts(self) -> None:
+        for msg in self.store.take_lease_timeouts():
+            self.events.publish("message", msg)
 
     def _add_call(self, body: bytes) -> bytes:
         try:

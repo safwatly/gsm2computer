@@ -72,6 +72,11 @@ def utc_now() -> str:
 # the actual gap will normally be at least this long.
 OUTBOUND_SMS_GAP_SECONDS = 6
 
+# Longer than the phone's 45s sent-intent wait. A dead process never acks.
+# Expiring the lease marks timeout. It does not put the row back in pending:
+# the radio may already have accepted the message.
+OUTBOX_SEND_LEASE_SECONDS = 90
+
 
 def _parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -104,7 +109,7 @@ def normalize_peer(raw: str) -> str:
 
 
 def _row_message(row: sqlite3.Row) -> dict[str, Any]:
-    return {
+    item = {
         "id": row["id"],
         "direction": row["direction"],
         "peer": row["peer"],
@@ -112,6 +117,10 @@ def _row_message(row: sqlite3.Row) -> dict[str, Any]:
         "ts": row["ts"],
         "status": row["status"],
     }
+    error = _optional_text(row, "error")
+    if error:
+        item["error"] = error
+    return item
 
 
 def _row_call(row: sqlite3.Row) -> dict[str, Any]:
@@ -230,8 +239,17 @@ def resolve_call_recording(call: dict[str, Any], record_dir: Path) -> Optional[P
     return None
 
 
+def _optional_text(row: sqlite3.Row, key: str) -> str:
+    try:
+        if key not in row.keys():
+            return ""
+        return str(row[key] or "")
+    except (IndexError, KeyError):
+        return ""
+
+
 def _row_outbox(row: sqlite3.Row) -> dict[str, Any]:
-    return {
+    item = {
         "id": row["id"],
         "to": row["to_number"],
         "body": row["body"],
@@ -239,6 +257,10 @@ def _row_outbox(row: sqlite3.Row) -> dict[str, Any]:
         "available_at": row["available_at"],
         "status": row["status"],
     }
+    error = _optional_text(row, "error")
+    if error:
+        item["error"] = error
+    return item
 
 
 class PortalStore:
@@ -246,6 +268,7 @@ class PortalStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._lease_timeouts: list[dict[str, Any]] = []
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -269,6 +292,16 @@ class PortalStore:
             message_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(messages)")}
             if "client_id" not in message_columns:
                 self._conn.execute("ALTER TABLE messages ADD COLUMN client_id TEXT")
+            if "error" not in message_columns:
+                self._conn.execute("ALTER TABLE messages ADD COLUMN error TEXT NOT NULL DEFAULT ''")
+            if "error" not in columns:
+                self._conn.execute("ALTER TABLE outbox ADD COLUMN error TEXT NOT NULL DEFAULT ''")
+            if "claimed_at" not in columns:
+                self._conn.execute("ALTER TABLE outbox ADD COLUMN claimed_at TEXT NOT NULL DEFAULT ''")
+                self._conn.execute(
+                    "UPDATE outbox SET claimed_at = ? WHERE status = 'sending' AND claimed_at = ''",
+                    (utc_now(),),
+                )
             self._conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS messages_client_id "
                 "ON messages (client_id) WHERE client_id IS NOT NULL AND client_id != ''"
@@ -407,10 +440,12 @@ class PortalStore:
     def list_messages(self, peer: str) -> list[dict[str, Any]]:
         peer_n = normalize_e164(peer) or peer.strip()
         with self._lock:
+            self._expire_stale_send_leases(utc_now())
             rows = self._conn.execute(
                 "SELECT * FROM messages WHERE peer = ? ORDER BY ts ASC, id ASC",
                 (peer_n,),
             ).fetchall()
+            self._conn.commit()
         return [_row_message(r) for r in rows]
 
     def enqueue_outbound(self, to_number: str, body: str) -> dict[str, Any]:
@@ -464,10 +499,11 @@ class PortalStore:
             ).fetchall()
         return [_row_outbox(r) for r in rows]
 
-    def claim_outbox_for_send(self, limit: int = 20) -> list[dict[str, Any]]:
+    def claim_outbox_for_send(self, limit: int = 20, now: Optional[str] = None) -> list[dict[str, Any]]:
         """Lease at most one due item per destination, in destination order."""
-        now = utc_now()
+        now = now or utc_now()
         with self._lock:
+            self._expire_stale_send_leases(now)
             rows = self._conn.execute(
                 """SELECT o.id FROM outbox AS o
                    WHERE o.status = 'pending' AND o.available_at <= ?
@@ -485,8 +521,8 @@ class PortalStore:
                 return []
             placeholders = ",".join("?" * len(ids))
             self._conn.execute(
-                f"UPDATE outbox SET status = 'sending' WHERE id IN ({placeholders})",
-                ids,
+                f"UPDATE outbox SET status = 'sending', claimed_at = ? WHERE id IN ({placeholders})",
+                (now, *ids),
             )
             self._conn.commit()
             claimed = self._conn.execute(
@@ -495,29 +531,69 @@ class PortalStore:
             ).fetchall()
         return [_row_outbox(r) for r in claimed]
 
+    def _expire_stale_send_leases(self, now: str) -> None:
+        """Caller holds [_lock]. Timeout only. Do not requeue.
+
+        Requeueing would send a second SMS when the process died after
+        SmsManager had already accepted the first one.
+        """
+        cutoff = (
+            _parse_utc(now) - timedelta(seconds=OUTBOX_SEND_LEASE_SECONDS)
+        ).isoformat().replace("+00:00", "Z")
+        stale = self._conn.execute(
+            """SELECT id FROM outbox
+               WHERE status = 'sending' AND claimed_at != '' AND claimed_at <= ?""",
+            (cutoff,),
+        ).fetchall()
+        if not stale:
+            return
+        ids = [row["id"] for row in stale]
+        placeholders = ",".join("?" * len(ids))
+        reason = "send lease expired"
+        self._conn.execute(
+            f"UPDATE outbox SET status = 'timeout', error = ? WHERE id IN ({placeholders})",
+            (reason, *ids),
+        )
+        self._conn.execute(
+            f"UPDATE messages SET status = 'timeout', error = ? WHERE id IN ({placeholders})",
+            (reason, *ids),
+        )
+        updated = self._conn.execute(
+            f"SELECT * FROM messages WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        self._lease_timeouts.extend(_row_message(row) for row in updated)
+
+    def take_lease_timeouts(self) -> list[dict[str, Any]]:
+        """Messages just moved from sending to timeout. One taker, for SSE."""
+        with self._lock:
+            items = self._lease_timeouts
+            self._lease_timeouts = []
+            return items
+
     def ack_outbox(self, item_id: str, status: str = "sent", error: Optional[str] = None) -> Optional[dict[str, Any]]:
         status_n = (status or "sent").strip().lower()
-        if status_n not in {"sent", "failed"}:
+        if status_n not in {"sent", "failed", "timeout"}:
             status_n = "sent"
-        msg_status = "sent" if status_n == "sent" else "failed"
+        error_n = (error or "").strip()[:240]
         with self._lock:
             row = self._conn.execute("SELECT * FROM outbox WHERE id = ?", (item_id,)).fetchone()
             if row is None:
                 return None
             current = row["status"]
-            if current in {"sent", "failed"}:
-                result = _row_outbox(row)
-                if error:
-                    result["error"] = error
-                return result
-            self._conn.execute("UPDATE outbox SET status = ? WHERE id = ?", (status_n, item_id))
-            self._conn.execute("UPDATE messages SET status = ? WHERE id = ?", (msg_status, item_id))
+            if current in {"sent", "failed", "timeout"}:
+                return _row_outbox(row)
+            self._conn.execute(
+                "UPDATE outbox SET status = ?, error = ? WHERE id = ?",
+                (status_n, error_n, item_id),
+            )
+            self._conn.execute(
+                "UPDATE messages SET status = ?, error = ? WHERE id = ?",
+                (status_n, error_n, item_id),
+            )
             self._conn.commit()
             updated = self._conn.execute("SELECT * FROM outbox WHERE id = ?", (item_id,)).fetchone()
-        result = _row_outbox(updated)
-        if error:
-            result["error"] = error
-        return result
+        return _row_outbox(updated)
 
     def add_call(
         self,

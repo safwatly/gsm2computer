@@ -144,6 +144,11 @@
             </intent-filter>
         </receiver>
 
+        <!-- SmsManager sent result. Explicit component, not exported. -->
+        <receiver
+            android:name=".sms.SmsSentReceiver"
+            android:exported="false" />
+
         <!-- SMS → hub control API. System-only sender via BROADCAST_SMS. -->
         <receiver
             android:name=".sms.SmsReceiver"

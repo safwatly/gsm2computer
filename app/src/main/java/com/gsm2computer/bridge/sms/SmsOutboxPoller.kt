@@ -1,7 +1,10 @@
 package com.gsm2computer.bridge.sms
 
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.telephony.SmsManager
 import android.util.Log
 import com.gsm2computer.bridge.BridgeConfig
@@ -25,6 +28,7 @@ import java.util.concurrent.TimeUnit
 object SmsOutboxPoller {
 
     private const val TAG = "SmsOutbox"
+    private const val SENT_TIMEOUT_MS = 45_000L
     private val JSON = "application/json; charset=utf-8".toMediaType()
     private val pollLock = Any()
 
@@ -78,26 +82,56 @@ object SmsOutboxPoller {
         to: String,
         body: String,
     ) {
-        try {
-            sendSms(to, body)
+        val outcome = try {
+            awaitRadioResult(context, id, to, body)
+        } catch (e: Exception) {
+            SmsSendOutcome.Ack("failed", "send threw ${e.javaClass.simpleName}")
+        }
+        if (outcome.status == "sent") {
             RedactingLogger.i(TAG, "SMS sent to $to")
             GatewayService.appendLog(context, "SMS sent to $to")
-            ack(endpoint, id, HubEndpoints.outboxAckJson("sent"))
-        } catch (e: Exception) {
-            val msg = "SMS send failed: ${e.message}"
-            Log.e(TAG, msg)
+        } else {
+            val msg = "SMS ${outcome.status} to $to: ${outcome.error}"
+            RedactingLogger.e(TAG, msg)
             GatewayService.appendLog(context, msg)
-            ack(endpoint, id, HubEndpoints.outboxAckJson("failed", e.message.orEmpty()))
         }
+        ack(endpoint, id, HubEndpoints.outboxAckJson(outcome.status, outcome.error))
     }
 
-    private fun sendSms(to: String, body: String) {
+    /**
+     * SmsManager returns before the carrier accepts the message. The sent
+     * PendingIntent is the result. Ack only after every part reports, or
+     * after [SENT_TIMEOUT_MS] with no callback.
+     */
+    private fun awaitRadioResult(context: Context, id: String, to: String, body: String): SmsSendOutcome.Ack {
         val sms = contextSmsManager()
         val parts = sms.divideMessage(body)
-        if (parts.size <= 1) {
-            sms.sendTextMessage(to, null, body, null, null)
-        } else {
-            sms.sendMultipartTextMessage(to, null, parts, null, null)
+        val count = if (parts.size <= 1) 1 else parts.size
+        val slot = SmsSentHub.register(id, count)
+        try {
+            val flags = PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_UPDATE_CURRENT or
+                if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
+            val intents = ArrayList<PendingIntent>(count)
+            for (index in 0 until count) {
+                val broadcast = Intent(context, SmsSentReceiver::class.java)
+                    .putExtra("id", id)
+                    .putExtra("part", index)
+                val request = (id.hashCode() xor index) and 0x7fffffff
+                intents += PendingIntent.getBroadcast(context, request, broadcast, flags)
+            }
+            if (count == 1) {
+                sms.sendTextMessage(to, null, body, intents[0], null)
+            } else {
+                sms.sendMultipartTextMessage(to, null, parts, intents, null)
+            }
+            val finished = slot.latch.await(SENT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            return SmsSendOutcome.decide(
+                slot.results.toList(),
+                timedOut = !finished,
+                rpErrors = slot.rpErrors.toList(),
+            )
+        } finally {
+            SmsSentHub.finish(id)
         }
     }
 

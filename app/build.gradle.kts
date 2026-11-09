@@ -38,9 +38,9 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        // versionCode 346 provisions the ordered entrances on a 344 prefs upgrade.
-        versionCode = 346
-        versionName = "0.2.7"
+        // versionCode 347 rebuilds a silent playback track and acks SMS from the sent intent.
+        versionCode = 347
+        versionName = "0.2.8"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

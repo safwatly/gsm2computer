@@ -47,6 +47,25 @@ test("queued outbound echo is not a desk alert", () => {
   );
 });
 
+test("a failed send is not announced as delivered", () => {
+  const copy = notificationCopy({
+    direction: "out",
+    peer: "+20100",
+    status: "failed",
+    error: "result=40 MODEM_ERR rp=38",
+    body: "hello",
+  });
+  assert.equal(copy.title, "SMS failed to +20100");
+  assert.equal(copy.body, "result=40 MODEM_ERR rp=38");
+  const timedOut = notificationCopy({
+    direction: "out",
+    peer: "+20100",
+    status: "timeout",
+    body: "hello",
+  });
+  assert.equal(timedOut.title, "SMS timed out to +20100");
+});
+
 test("inbound copy", () => {
   const copy = notificationCopy({ direction: "in", peer: "+1555", body: "hello" });
   assert.equal(copy.title, "SMS from +1555");

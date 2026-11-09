@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HUB_DIR = Path(__file__).resolve().parents[1]
@@ -100,6 +101,56 @@ class PortalStoreTests(unittest.TestCase):
         again = self.store.ack_outbox(queued["id"], status="sent")
         self.assertEqual(again["status"], "sent")
         self.assertEqual(self.store.get_message(queued["id"])["status"], "sent")
+
+    def test_failed_ack_keeps_the_carrier_error(self) -> None:
+        queued = self.store.enqueue_outbound("+201001234567", "hello")
+        self.store.claim_outbox_for_send()
+        reason = "result=40 MODEM_ERR rp=38"
+        acked = self.store.ack_outbox(queued["id"], status="failed", error=reason)
+        self.assertEqual(acked["status"], "failed")
+        self.assertEqual(acked["error"], reason)
+        message = self.store.get_message(queued["id"])
+        self.assertEqual(message["status"], "failed")
+        self.assertEqual(message["error"], reason)
+        self.assertEqual(self.store.list_outbox_pending(), [])
+        again = self.store.ack_outbox(queued["id"], status="sent")
+        self.assertEqual(again["status"], "failed")
+
+    def test_stale_sending_lease_times_out_and_is_not_resent(self) -> None:
+        queued = self.store.enqueue_outbound("+201001234567", "hello")
+        self.store.claim_outbox_for_send()
+        self.store._conn.execute(
+            "UPDATE outbox SET claimed_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:00Z", queued["id"]),
+        )
+        self.store._conn.commit()
+        message = self.store.get_message(queued["id"])
+        self.assertEqual(message["status"], "queued")
+        message = self.store.list_messages("+201001234567")[0]
+        self.assertEqual(message["status"], "timeout")
+        self.assertEqual(message["error"], "send lease expired")
+        self.assertEqual(self.store.claim_outbox_for_send(), [])
+        late = self.store.ack_outbox(queued["id"], status="sent")
+        self.assertEqual(late["status"], "timeout")
+
+    def test_fresh_send_lease_is_not_expired_early(self) -> None:
+        queued = self.store.enqueue_outbound("+201001234567", "hello")
+        self.store.claim_outbox_for_send()
+        recent = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat().replace("+00:00", "Z")
+        self.store._conn.execute(
+            "UPDATE outbox SET claimed_at = ? WHERE id = ?",
+            (recent, queued["id"]),
+        )
+        self.store._conn.commit()
+        self.assertEqual(self.store.list_messages("+201001234567")[0]["status"], "queued")
+
+    def test_timeout_ack_is_not_stored_as_sent(self) -> None:
+        queued = self.store.enqueue_outbound("+201001234567", "hello")
+        self.store.claim_outbox_for_send()
+        acked = self.store.ack_outbox(queued["id"], status="timeout", error="send result timeout")
+        self.assertEqual(acked["status"], "timeout")
+        self.assertEqual(acked["error"], "send result timeout")
+        self.assertEqual(self.store.get_message(queued["id"])["status"], "timeout")
 
     def test_short_message_is_unchanged(self) -> None:
         self.assertEqual(split_outbound_sms("on my way"), ["on my way"])
@@ -263,6 +314,38 @@ class PortalHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn("text/html", headers["content-type"])
         self.assertIn(b"portal", body)
+
+    async def test_http_failed_ack_persists_the_carrier_error(self) -> None:
+        writer = FakeWriter()
+        body = json.dumps({"to": "+201009998888", "body": "carrier"}).encode()
+        await self.app.dispatch("POST", "/portal/api/messages/send", {}, body, writer)
+        item_id = json.loads(_parse_http(bytes(writer.buf))[2])["id"]
+        writer = FakeWriter()
+        await self.app.dispatch("GET", "/sms/outbox", {}, b"", writer)
+        writer = FakeWriter()
+        ack = json.dumps({"status": "failed", "error": "result=40 MODEM_ERR rp=38"}).encode()
+        await self.app.dispatch("POST", f"/sms/outbox/{item_id}/ack", {}, ack, writer)
+        status, _, raw = _parse_http(bytes(writer.buf))
+        self.assertEqual(status, 200)
+        item = json.loads(raw)["item"]
+        self.assertEqual(item["status"], "failed")
+        self.assertEqual(item["error"], "result=40 MODEM_ERR rp=38")
+        message = self.store.get_message(item_id)
+        self.assertEqual(message["status"], "failed")
+        self.assertEqual(message["error"], "result=40 MODEM_ERR rp=38")
+
+        writer = FakeWriter()
+        timed = json.dumps({"to": "+201009998888", "body": "later"}).encode()
+        await self.app.dispatch("POST", "/portal/api/messages/send", {}, timed, writer)
+        timed_id = json.loads(_parse_http(bytes(writer.buf))[2])["id"]
+        writer = FakeWriter()
+        await self.app.dispatch("GET", "/sms/outbox", {}, b"", writer)
+        writer = FakeWriter()
+        timeout_ack = json.dumps({"status": "timeout", "error": "send result timeout"}).encode()
+        await self.app.dispatch("POST", f"/sms/outbox/{timed_id}/ack", {}, timeout_ack, writer)
+        item = json.loads(_parse_http(bytes(writer.buf))[2])["item"]
+        self.assertEqual(item["status"], "timeout")
+        self.assertEqual(self.store.get_message(timed_id)["status"], "timeout")
 
     async def test_messages_require_peer(self) -> None:
         writer = FakeWriter()
