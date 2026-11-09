@@ -12,13 +12,17 @@ package com.gsm2computer.bridge.rtp
  * are not eligible: their receive energy is not "playRMS should be loud."
  * One eligible sample is not enough. The first window of a call rebuilds
  * once near-zero output has covered [startupSilentMs] and at least
- * [startupElapsedMs] have passed, so the greeting is not lost for the whole
- * 3s window. Later windows still need half of [windowMs]. A stalled head
- * counts only while it stays still, and only against that longer bar: the
- * next advance clears the run, so a deep buffer that steps every few polls
- * does not rebuild. Closing a window, or leaving cooldown, starts the next
- * window on the following sample. [Decision.evaluated] is set only when a
- * window actually decides, so the call log can show holds as well as fires.
+ * [startupElapsedMs] have passed, so a stretch of real silence is not lost
+ * for the whole 3s window. A later eligible frame with play RMS above
+ * [silentRms] clears that run, the same way a head step clears a stall.
+ * Otherwise 600 ms of zeros followed by loud audio would still rebuild at
+ * 1 s and [RtpSession] would toggle incall_music. Later windows still need
+ * half of [windowMs]. A stalled head counts only while it stays still, and
+ * only against that longer bar. Closing a window, or leaving cooldown,
+ * starts the next window on the following sample. [Decision.evaluated] is
+ * set only when a window actually decides, so the call log can show holds
+ * as well as fires. The silence reason quotes the play RMS that accumulated
+ * the run, which stays at or under [silentRms], not the window's loudest frame.
  */
 class PlaybackSilenceWatch(
     private val speechRms: Int = 200,
@@ -37,6 +41,7 @@ class PlaybackSilenceWatch(
     private var stallMs = 0L
     private var maxInput = 0
     private var maxPlay = 0
+    private var silentPlay = 0
     private var cooldownUntil = 0L
 
     data class Decision(
@@ -67,12 +72,18 @@ class PlaybackSilenceWatch(
         if (eligible && inputRms >= speechRms) {
             maxInput = maxOf(maxInput, inputRms)
             maxPlay = maxOf(maxPlay, playRms)
-            if (playRms <= silentRms) silentMs += gap
+            if (playRms <= silentRms) {
+                silentMs += gap
+                silentPlay = maxOf(silentPlay, playRms)
+            } else {
+                silentMs = 0L
+                silentPlay = 0
+            }
             if (!headAdvanced) stallMs += gap
         }
         val elapsed = nowMs - windowStart
         if (opening && elapsed >= startupElapsedMs && silentMs >= startupSilentMs) {
-            val reason = "call-start rx speech rms=$maxInput but playRMS=$maxPlay"
+            val reason = "call-start rx speech rms=$maxInput but playRMS=$silentPlay"
             return finish(nowMs, snapshot(true, reason))
         }
         if (elapsed < windowMs) return Decision(false)
@@ -86,11 +97,12 @@ class PlaybackSilenceWatch(
         stallMs = 0L
         maxInput = 0
         maxPlay = 0
+        silentPlay = 0
     }
 
     private fun decide(): Decision {
         if (silentMs >= sustainedMs) {
-            return snapshot(true, "rx speech rms=$maxInput but playRMS=$maxPlay")
+            return snapshot(true, "rx speech rms=$maxInput but playRMS=$silentPlay")
         }
         if (stallMs >= sustainedMs) {
             return snapshot(true, "track head stalled while rx rms=$maxInput playRMS=$maxPlay")

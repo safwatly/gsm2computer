@@ -67,6 +67,11 @@ class PhasedInjector(
         }
     }
 
+    /**
+     * Replaces the start of the buffer AudioTrack.write will see. One beep is
+     * 0.5 s of tone and 0.25 s of zeros (0.75 s). [RtpSession] records
+     * playbackRms before this runs, and playback.wav after it.
+     */
     private fun applyMarker(pcm: ByteArray) {
         val nb = markerBeeps; if (nb <= 0) return
         val onS = srcRate / 2; val cycle = srcRate * 3 / 4

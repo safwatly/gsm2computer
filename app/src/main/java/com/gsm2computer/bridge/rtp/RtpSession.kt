@@ -1434,6 +1434,11 @@ class RtpSession(
                 }
 
                 playbackRms = if (playbackGain > 1) pcmRms(pcm) else rawRms
+                // PhasedInjector.write mutates this array: beeps(1) overwrites the
+                // first 0.75 s with a tone and then zeros. playback.wav is that
+                // post-marker buffer. playbackRms above, and seconds.jsonl
+                // play_rms (decayingPlaybackRms, latched only when rawRms clears
+                // the echo gate), are the pre-marker level.
                 out(pcm, pcm.size)
                 captureTap?.writePlay(pcm, pcm.size, liveTrack().sampleRate)
                 playbackFrames++

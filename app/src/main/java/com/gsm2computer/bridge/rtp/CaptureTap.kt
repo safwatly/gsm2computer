@@ -18,8 +18,13 @@ import java.util.TimeZone
  * Writes under Android/data/…/files/call-taps/<utc>/:
  *   pre-gate.wav   — raw AudioRecord, before noise/echo gate and gain
  *   post-gate.wav  — after noise/echo gate and gain (zeros = gated)
- *   playback.wav  — exactly what the app wrote into the call (hub -> caller)
- *   seconds.jsonl  — one JSON object per second of gate/RMS stats
+ *   playback.wav  — the buffer after PhasedInjector.applyMarker. On the Moto
+ *     that marker replaces the first 0.75 s (0.5 s tone, then 0.25 s of zeros)
+ *     before AudioTrack.write, so this file is not the pre-marker PCM.
+ *   seconds.jsonl  — one JSON object per second. play_rms is the mean of
+ *     decayingPlaybackRms sampled on the capture thread. That value is
+ *     latched from pre-marker playback RMS only while pre-gain RMS is above
+ *     the echo gate, then decays. A 0 does not mean playback.wav was silent.
  *   meta.json      — source, rate, gain, totals
  */
 class CaptureTap private constructor(

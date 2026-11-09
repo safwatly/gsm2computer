@@ -45,6 +45,34 @@ class PlaybackSilenceWatchTest {
     }
 
     @Test
+    fun callStartZerosThenLoudFramesDoNotRebuild() {
+        val watch = PlaybackSilenceWatch()
+        var decision = PlaybackSilenceWatch.Decision(false)
+        for (t in 0L..640L step 20L) {
+            decision = watch.observe(t, inputRms = 3_200, playRms = 0, headAdvanced = true, eligible = true)
+            assertFalse(decision.rebuild)
+        }
+        for (t in 660L..3_000L step 20L) {
+            decision = watch.observe(t, inputRms = 3_200, playRms = 4_000, headAdvanced = true, eligible = true)
+            assertFalse(decision.rebuild)
+        }
+    }
+
+    @Test
+    fun silenceReasonQuotesTheQuietRunNotTheLoudestFrame() {
+        val watch = PlaybackSilenceWatch()
+        watch.observe(0L, inputRms = 3_200, playRms = 4_000, headAdvanced = true, eligible = true)
+        watch.observe(20L, inputRms = 3_200, playRms = 4_000, headAdvanced = true, eligible = true)
+        var decision = PlaybackSilenceWatch.Decision(false)
+        for (t in 40L..1_000L step 20L) {
+            decision = watch.observe(t, inputRms = 3_200, playRms = 0, headAdvanced = true, eligible = true)
+        }
+        assertTrue(decision.rebuild)
+        assertTrue(decision.reason.contains("playRMS=0"))
+        assertFalse(decision.reason.contains("4000"))
+    }
+
+    @Test
     fun afterAHealthyWindowAShortSilenceDoesNotRebuild() {
         val watch = PlaybackSilenceWatch()
         var decision = PlaybackSilenceWatch.Decision(false)
