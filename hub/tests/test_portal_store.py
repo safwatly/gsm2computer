@@ -75,6 +75,9 @@ class PortalStoreTest(unittest.TestCase):
         message = self.store.list_messages("+201001234567")[0]
         self.assertEqual(message["status"], "timeout")
         self.assertEqual(message["error"], "send lease expired")
+        expired = self.store.take_lease_timeouts()
+        self.assertEqual(expired[0]["id"], queued["id"])
+        self.assertEqual(expired[0]["status"], "timeout")
         self.assertEqual(self.store.list_outbox_pending(), [])
         self.assertEqual(self.store.claim_outbox_for_send(), [])
         late = self.store.ack_outbox(queued["id"], status="sent")

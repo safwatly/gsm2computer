@@ -9,9 +9,11 @@ package com.gsm2computer.bridge.rtp
  * Only [eligible] samples count. Those are frames the playback loop dequeued
  * and wrote. Prebuffer silence and frames still sitting in the jitter buffer
  * are not eligible: their receive energy is not "playRMS should be loud."
- * One eligible sample is not enough. Near-zero output (or a stalled playback
- * head) has to cover most of the window. Closing a window, or leaving
- * cooldown, starts the next window on the following sample.
+ * One eligible sample is not enough. Near-zero output has to cover most of
+ * the window. A stalled head counts only while it stays still: the next
+ * advance clears that run, so a deep buffer that steps every few polls does
+ * not rebuild. Closing a window, or leaving cooldown, starts the next window
+ * on the following sample.
  */
 class PlaybackSilenceWatch(
     private val speechRms: Int = 200,
@@ -45,6 +47,7 @@ class PlaybackSilenceWatch(
         }
         val gap = (nowMs - lastAt).coerceIn(0L, sampleGapCapMs)
         lastAt = nowMs
+        if (headAdvanced) stallMs = 0L
         if (eligible && inputRms >= speechRms) {
             maxInput = maxOf(maxInput, inputRms)
             maxPlay = maxOf(maxPlay, playRms)

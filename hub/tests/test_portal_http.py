@@ -11,6 +11,7 @@ os.environ["GSM2COMPUTER_OPENCLAW_TALK"] = "off"
 HUB_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HUB_DIR))
 
+import hub as hub_mod  # noqa: E402
 from portal_store import reset_for_tests  # noqa: E402
 from hub import handle_client, split_request_target  # noqa: E402
 
@@ -130,6 +131,30 @@ class PortalHttpTest(unittest.IsolatedAsyncioTestCase):
         status, _, body = await self._exchange(_encode_request("POST", f"/sms/outbox/{timed_id}/ack", timeout_ack))
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["item"]["status"], "timeout")
+
+    async def test_expired_send_lease_publishes_timeout(self):
+        payload = json.dumps({"to": "+201001112233", "body": "lease"}).encode()
+        status, _, body = await self._exchange(_encode_request("POST", "/portal/api/messages/send", payload))
+        self.assertEqual(status, 201)
+        item_id = json.loads(body)["id"]
+        await self._exchange(_encode_request("GET", "/sms/outbox"))
+        hub_mod.portal_store._conn.execute(
+            "UPDATE outbox SET claimed_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:00Z", item_id),
+        )
+        hub_mod.portal_store._conn.commit()
+        q = hub_mod.portal_events.subscribe()
+        try:
+            status, _, body = await self._exchange(_encode_request("GET", "/sms/outbox"))
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["items"], [])
+            event_type, data = q.get_nowait()
+            self.assertEqual(event_type, "message")
+            self.assertEqual(data["id"], item_id)
+            self.assertEqual(data["status"], "timeout")
+            self.assertEqual(data["error"], "send lease expired")
+        finally:
+            hub_mod.portal_events.unsubscribe(q)
 
     async def test_sse_emits_inbound_message(self):
         reader, writer = await asyncio.open_connection("127.0.0.1", self.port)

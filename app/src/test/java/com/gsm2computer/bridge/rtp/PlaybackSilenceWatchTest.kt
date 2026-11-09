@@ -49,6 +49,22 @@ class PlaybackSilenceWatchTest {
     }
 
     @Test
+    fun slowHeadStepDuringSpeechDoesNotRebuild() {
+        val watch = PlaybackSilenceWatch()
+        var decision = PlaybackSilenceWatch.Decision(false)
+        for (t in 0L..6_000L step 20L) {
+            decision = watch.observe(
+                t,
+                inputRms = 2_000,
+                playRms = 2_000,
+                headAdvanced = t % 100L == 0L,
+                eligible = true,
+            )
+            assertFalse(decision.rebuild)
+        }
+    }
+
+    @Test
     fun quietCallDoesNotRebuild() {
         val watch = PlaybackSilenceWatch()
         var decision = PlaybackSilenceWatch.Decision(false)

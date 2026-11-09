@@ -268,6 +268,7 @@ class PortalStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._lease_timeouts: list[dict[str, Any]] = []
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -557,6 +558,18 @@ class PortalStore:
             f"UPDATE messages SET status = 'timeout', error = ? WHERE id IN ({placeholders})",
             (reason, *ids),
         )
+        updated = self._conn.execute(
+            f"SELECT * FROM messages WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        self._lease_timeouts.extend(_row_message(row) for row in updated)
+
+    def take_lease_timeouts(self) -> list[dict[str, Any]]:
+        """Messages just moved from sending to timeout. One taker, for SSE."""
+        with self._lock:
+            items = self._lease_timeouts
+            self._lease_timeouts = []
+            return items
 
     def ack_outbox(self, item_id: str, status: str = "sent", error: Optional[str] = None) -> Optional[dict[str, Any]]:
         status_n = (status or "sent").strip().lower()
