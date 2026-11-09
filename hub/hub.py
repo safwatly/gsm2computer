@@ -208,7 +208,16 @@ async def read_http_headers(reader: asyncio.StreamReader) -> Tuple[str, str, dic
         header_lines: list[bytes] = []
         seen = 0
         while True:
-            line = await reader.readline()
+            try:
+                line = await reader.readline()
+            except asyncio.LimitOverrunError as exc:
+                # StreamReader gives up at 64 KiB before this loop can count.
+                raise HttpRequestError(431, "headers too large") from exc
+            except ValueError as exc:
+                # readline() turns LimitOverrunError into ValueError and drops the line.
+                if "limit" in str(exc).lower():
+                    raise HttpRequestError(431, "headers too large") from exc
+                raise
             if not line:
                 raise ConnectionError("client closed")
             seen += len(line)
@@ -1446,12 +1455,16 @@ async def _park_relink_socket(
     session_id: str,
     key: str,
 ) -> bool:
-    """101 and hand the socket to the live call. True means this handler must return."""
-    if not relink_gate.matches(session_id):
+    """101 and hand the socket to the live call. True means this handler must return.
+
+    ``deliver`` reserves the single waiter with no await. Only that winner
+    stamps the live entrance. A second reconnect can pass ``matches`` and
+    then lose at ``deliver`` once ``drain`` yields; it must not leave its
+    own entrance on the slot, and it must not be told the upgrade succeeded.
+    """
+    release_fut = relink_gate.deliver(session_id, reader, writer)
+    if release_fut is None:
         return False
-    # Stamp the new socket's entrance before deliver(). The holder sends
-    # session.updated as soon as it wakes, and this function stays parked on
-    # release_fut until that call later ends.
     entrance = request_entrance()
     live_call.note_entrance(entrance.name, _current_device_id.get())
     LOG.info(
@@ -1471,12 +1484,10 @@ async def _park_relink_socket(
             "\r\n"
         ).encode("ascii")
     )
-    await writer.drain()
-    release_fut = relink_gate.deliver(session_id, reader, writer)
-    if release_fut is None:
-        LOG.warning("relink race lost session=%s utc=%s", session_id, _utc_now())
-        return True
-    LOG.info("relink socket parked session=%s utc=%s", session_id, _utc_now())
+    try:
+        await writer.drain()
+    except (ConnectionError, OSError):
+        LOG.warning("relink 101 drain failed session=%s", session_id, exc_info=True)
     await release_fut
     return True
 
@@ -2221,6 +2232,9 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 payload = {"raw": body.decode("utf-8", errors="replace")}
             log_entry, command = ingest_inbound_sms(portal_store, portal_events, payload)
             LOG.info("sms %s", json.dumps(log_entry, ensure_ascii=False))
+            # The webhook repeats the SMS text the phone reported. It does not
+            # parse MODE or STATUS and it does not change the switchboard.
+            # Those commands run only on the Tailscale entrance, below.
             try:
                 from portal_sms import should_wake_cup, format_ops_sms_alert
                 if should_wake_cup(

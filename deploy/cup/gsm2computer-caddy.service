@@ -5,6 +5,8 @@ Wants=network-online.target
 
 [Service]
 EnvironmentFile=-/etc/gsm2computer/public-entrance.env
+# Rejects an empty bind and 0.0.0.0/:: before Caddy can listen on the wrong address.
+ExecStartPre=/usr/local/sbin/gsm2computer-caddy-pre.sh
 ExecStart=/usr/bin/caddy run --config /etc/gsm2computer/Caddyfile --adapter caddyfile
 ExecReload=/usr/bin/caddy reload --config /etc/gsm2computer/Caddyfile --adapter caddyfile
 Restart=on-failure

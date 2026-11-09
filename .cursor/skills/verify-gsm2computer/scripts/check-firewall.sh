@@ -146,10 +146,33 @@ EOF
   grep -q 'nd-neighbor-advert' "$STATE/persist-ok.nft"
   sudo ip netns exec "$NS" nft list table inet gsm2computer | grep -q 'nd-neighbor-solicit'
   echo "confirm kept neighbor discovery and cancelled rollback only after persist"
+  : >"$STATE/systemctl.log"
   sudo ip netns exec "$NS" env \
     GSM2COMPUTER_NFT_STATE="$STATE" \
     GSM2COMPUTER_NFT_PERSIST="$STATE/persist-ok.nft" \
+    GSM2COMPUTER_NFT_ROLLBACK_MODE=sleep \
+    GSM2COMPUTER_NFT_UNIT_DEST="$STATE/gsm2computer-nft.service" \
+    GSM2COMPUTER_NFT_SYSTEMCTL="$STATE/systemctl" \
+    GSM2COMPUTER_NFT_SYSTEMCTL_LOG="$STATE/systemctl.log" \
     bash "$ROOT/deploy/cup/gsm2computer-nft.sh" revert >/dev/null
+  if sudo ip netns exec "$NS" nft list table inet gsm2computer >/dev/null 2>&1; then
+    echo "revert left the netns table loaded"
+    exit 1
+  fi
+  if [[ -f "$STATE/persist-ok.nft" ]]; then
+    echo "revert left the persisted rules in place"
+    exit 1
+  fi
+  grep -q 'disable --now gsm2computer-nft.service' "$STATE/systemctl.log"
+  if [[ -e /etc/systemd/system/gsm2computer-nft.service ]]; then
+    echo "host gained /etc/systemd/system/gsm2computer-nft.service"
+    exit 1
+  fi
+  if sudo nft list table inet gsm2computer >/dev/null 2>&1; then
+    echo "host namespace gained inet gsm2computer during revert"
+    exit 1
+  fi
+  echo "revert used the override systemctl and left the host firewall alone"
   sudo ip netns del "$NS"
   echo "firewall ok"
 } | tee "$OUT"

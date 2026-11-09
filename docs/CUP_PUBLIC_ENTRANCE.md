@@ -104,9 +104,10 @@ sudo cp deploy/cup/public-entrance.env.example /etc/gsm2computer/public-entrance
 sudoedit /etc/gsm2computer/public-entrance.env
 ```
 
-Set `GSM2COMPUTER_ACME_EMAIL` to a mailbox you read, and the hostname if you did not use `gsm.ta3leam.com`. Leave `GSM2COMPUTER_PUBLIC_BIND=62.83.35.197`.
+Set `GSM2COMPUTER_ACME_EMAIL` to a mailbox you read, and the hostname if you did not use `gsm.ta3leam.com`. Leave `GSM2COMPUTER_PUBLIC_BIND=62.83.35.197`. The Caddy unit runs `gsm2computer-caddy-pre.sh` first and will not start if that value is empty, `0.0.0.0`, or `::`.
 
 ```bash
+sudo install -m 0755 deploy/cup/gsm2computer-caddy-pre.sh /usr/local/sbin/gsm2computer-caddy-pre.sh
 sudo cp deploy/cup/gsm2computer-caddy.service /etc/systemd/system/gsm2computer-caddy.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now gsm2computer-caddy.service

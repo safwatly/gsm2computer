@@ -1,10 +1,12 @@
 """Device token, dual entrance, and call-path stamping."""
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -387,6 +389,11 @@ class EntranceHttpTests(unittest.IsolatedAsyncioTestCase):
         padded = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Pad: " + (b"a" * 20000) + b"\r\n\r\n"
         raw = await _raw(pub, padded)
         self.assertTrue(raw.startswith(b"HTTP/1.1 431"), raw[:80])
+        # One line past StreamReader's 64 KiB limit. readline() raises before
+        # the byte counter runs, and that must still be a 431, not a bare close.
+        huge_line = b"GET /health HTTP/1.1\r\nX-Pad: " + (b"b" * 70000) + b"\r\n\r\n"
+        raw = await _raw(pub, huge_line)
+        self.assertTrue(raw.startswith(b"HTTP/1.1 431"), raw[:120])
 
     async def test_call_report_records_observed_entrance(self) -> None:
         hub.remember_finished_call("hub-abc", "public")
@@ -473,6 +480,66 @@ class EnvEntranceTests(unittest.TestCase):
         os.environ["GSM2COMPUTER_TAILSCALE_TOKEN_REQUIRED"] = "0"
 
 
+class OverlappingRelinkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_loser_does_not_stamp_the_live_entrance(self) -> None:
+        hub.relink_gate.close()
+        if hub.live_call.busy:
+            hub.live_call.release()
+        hub.live_call.note_entrance("tailscale", "original")
+        waiter = hub.relink_gate.begin("hub-race")
+        writers: dict[str, bytearray] = {}
+
+        class YieldingWriter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.buf = bytearray()
+                writers[name] = self.buf
+
+            def write(self, data: bytes) -> None:
+                self.buf += data
+
+            async def drain(self) -> None:
+                # The overlap the race needs: both handlers are in flight.
+                await asyncio.sleep(0)
+
+        async def park(name: str) -> bool:
+            entrance = Entrance(name, "127.0.0.1", 9, name == "public")
+            entrance_token = hub._current_entrance.set(entrance)
+            device_token = hub._current_device_id.set(f"{name}-phone")
+            try:
+                return await hub._park_relink_socket(
+                    None,  # type: ignore[arg-type]
+                    YieldingWriter(name),  # type: ignore[arg-type]
+                    "hub-race",
+                    "dGhlIHNhbXBsZSBub25jZQ==",
+                )
+            finally:
+                hub._current_device_id.reset(device_token)
+                hub._current_entrance.reset(entrance_token)
+
+        public_task = asyncio.create_task(park("public"))
+        tail_task = asyncio.create_task(park("tailscale"))
+        for _ in range(20):
+            if waiter.done() and (public_task.done() or tail_task.done()):
+                break
+            await asyncio.sleep(0)
+        self.assertTrue(waiter.done())
+        _reader, delivered, _release = waiter.result()
+        hub.relink_gate.release_holder()
+        public_ok = await public_task
+        tail_ok = await tail_task
+        results = {"public": public_ok, "tailscale": tail_ok}
+        other = "tailscale" if delivered.name == "public" else "public"
+        self.assertTrue(results[delivered.name])
+        self.assertFalse(results[other])
+        self.assertEqual(hub.live_call.entrance, delivered.name)
+        self.assertEqual(hub.live_call.device_id, f"{delivered.name}-phone")
+        self.assertTrue(bytes(writers[delivered.name]).startswith(b"HTTP/1.1 101"))
+        self.assertEqual(bytes(writers[other]), b"")
+        hub.relink_gate.close()
+        hub.live_call.note_entrance("tailscale", "")
+
+
 class PublicBindTests(unittest.IsolatedAsyncioTestCase):
     async def test_public_bind_failure_keeps_tailscale(self) -> None:
         blocker = await __import__("asyncio").start_server(lambda r, w: None, "127.0.0.1", 0)
@@ -490,6 +557,62 @@ class PublicBindTests(unittest.IsolatedAsyncioTestCase):
                 await server.wait_closed()
             blocker.close()
             await blocker.wait_closed()
+
+
+class CaddyBindTests(unittest.TestCase):
+    def test_precheck_rejects_missing_and_wildcard_binds(self) -> None:
+        script = HUB_DIR.parent / "deploy" / "cup" / "gsm2computer-caddy-pre.sh"
+        caddyfile = HUB_DIR.parent / "deploy" / "cup" / "Caddyfile"
+
+        def run_pre(bind: str | None) -> subprocess.CompletedProcess[str]:
+            env = os.environ.copy()
+            env.pop("GSM2COMPUTER_PUBLIC_BIND", None)
+            if bind is not None:
+                env["GSM2COMPUTER_PUBLIC_BIND"] = bind
+            return subprocess.run(
+                ["bash", str(script)],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        good = run_pre("62.83.35.197")
+        self.assertEqual(good.returncode, 0, good.stderr)
+        self.assertIn("62.83.35.197", good.stdout)
+        for bad in (None, "", "0.0.0.0", "::", "*", "gsm.ta3leam.com", "62.83.35.197 127.0.0.1"):
+            refused = run_pre(bad)
+            self.assertNotEqual(refused.returncode, 0, bad)
+            self.assertIn("GSM2COMPUTER_PUBLIC_BIND", refused.stderr)
+
+        def adapt(bind: str) -> dict:
+            env = os.environ.copy()
+            env.update({
+                "GSM2COMPUTER_PUBLIC_HOSTNAME": "gsm.ta3leam.com",
+                "GSM2COMPUTER_PUBLIC_BIND": bind,
+                "GSM2COMPUTER_ACME_EMAIL": "ops@example.com",
+                "GSM2COMPUTER_PUBLIC_UPSTREAM": "127.0.0.1:8790",
+            })
+            proc = subprocess.run(
+                ["caddy", "adapt", "--config", str(caddyfile), "--adapter", "caddyfile"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return json.loads(proc.stdout)
+
+        def listens_of(cfg: dict) -> list[str]:
+            servers = (cfg.get("apps") or {}).get("http", {}).get("servers") or {}
+            return [
+                addr
+                for server in servers.values()
+                for addr in server.get("listen") or []
+            ]
+
+        self.assertEqual(listens_of(adapt("0.0.0.0")), ["0.0.0.0:443"])
+        self.assertEqual(listens_of(adapt("")), [])
 
 
 if __name__ == "__main__":

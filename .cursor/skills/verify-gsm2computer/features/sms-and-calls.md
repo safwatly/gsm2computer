@@ -6,6 +6,7 @@
 - `GET /sms/outbox` claims pending items. The public socket requires the device token. The Tailscale socket does not, while the transition flag is off.
 - `POST /sms/outbox/{id}/ack` on the public socket completes the item.
 - `POST /calls` stores `path` as `public` or `tailscale`. The hub stamps the entrance of the socket that carried the audio. A client-supplied path does not override that.
+- Public `POST /sms` stores the message the phone reported. `MODE` and `STATUS` in that body do not change the switchboard. The ops webhook, if set, repeats the message text for a person. It does not run a command. The device token is permission to report ingress, not permission to retarget the audio graph. Tailscale still runs `MODE` / `STATUS` from an SMS body.
 
 ## How to get to it (user POV)
 

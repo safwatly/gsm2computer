@@ -69,3 +69,5 @@ if ! grep -q 'data-entrance' "$ROOT"/hub/portal/dist/assets/*.js; then
   exit 1
 fi
 echo "portal dist has entrance chip"
+GSM2COMPUTER_PUBLIC_BIND=62.83.35.197 "$ROOT/deploy/cup/gsm2computer-caddy-pre.sh" >/dev/null
+echo "caddy pre-check accepted 62.83.35.197"

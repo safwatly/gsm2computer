@@ -117,11 +117,14 @@ stop_timer_process() {
     fi
     rm -f "$STATE_DIR/rollback.pid"
   fi
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl stop "$ROLLBACK_UNIT" >/dev/null 2>&1 || true
-    local timer=${ROLLBACK_UNIT%.service}.timer
-    systemctl stop "$timer" >/dev/null 2>&1 || true
+  # Sleep mode is the netns test. It has no systemd timer, so it must not
+  # call the host systemctl. Production uses the same systemctl_cmd as confirm.
+  if [[ "$ROLLBACK_MODE" == "sleep" ]]; then
+    return
   fi
+  systemctl_cmd stop "$ROLLBACK_UNIT" >/dev/null 2>&1 || true
+  local timer=${ROLLBACK_UNIT%.service}.timer
+  systemctl_cmd stop "$timer" >/dev/null 2>&1 || true
 }
 
 disarm_timer() {
@@ -243,8 +246,10 @@ case "$cmd" in
     need_nft
     disarm_timer
     restore_baseline
-    if [[ -f "/etc/systemd/system/$UNIT_NAME" ]]; then
-      systemctl disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+    # Same path confirm installed. A test override must not fall through to
+    # /etc/systemd/system or the host systemctl.
+    if [[ -f "$UNIT_DEST" ]]; then
+      systemctl_cmd disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
     fi
     rm -f "$PERSIST_PATH"
     echo "reverted. Boot unit disabled and $PERSIST_PATH removed."
