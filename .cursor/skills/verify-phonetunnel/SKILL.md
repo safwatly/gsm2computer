@@ -139,9 +139,14 @@ the line is idle, after the real cup setup in `docs/PHONETUNNEL.md`.
 - Cup is a private sshd on `127.0.0.1` at a high port, not
   `62.83.35.197:22`. `/etc/ssh/sshd_config` is not edited and the system
   ssh service is not reloaded.
-- A local user `phonetunnel` is created or adjusted (`nologin`, shadow
-  `*`) and `authorized_keys` is copied into `/home/phonetunnel` because
-  OpenSSH StrictModes rejects a key file under `/tmp`.
+- A local user `phonetunnel` is created or adjusted (shell `/bin/sh`,
+  shadow `*`) and `authorized_keys` is copied into `/home/phonetunnel`
+  because OpenSSH StrictModes rejects a key file under `/tmp`.
+  `drive-account` runs the real installer in a private mount namespace:
+  it refuses an existing password or non-tunnel account unless
+  `--adopt-existing` is passed, restores that account's shadow and home
+  mode when a later step fails, and keeps extra bundle files such as
+  `phone_known_hosts`.
 - The supervisor is started with `sh` by the harness, not by Magisk
   `service.sh` at boot. There is no module zip install and no `remove`
   file plus reboot.

@@ -1121,10 +1121,12 @@ mount --bind /dev "$root/dev"
 mount -t proc proc "$root/proc"
 
 run_setup() {
+    _fail="${1:-}"
+    shift || true
     chroot "$root" /usr/bin/env \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-        PHONETUNNEL_SETUP_FAIL_AFTER="${1:-}" \
-        /bin/bash "$setup"
+        PHONETUNNEL_SETUP_FAIL_AFTER="$_fail" \
+        /bin/bash "$setup" "$@"
 }
 
 clean_tree() {
@@ -1199,8 +1201,126 @@ begins=$(grep -c 'BEGIN gsm2computer-phonetunnel' "$root/etc/ssh/sshd_config")
 chroot "$root" /usr/sbin/sshd -T -C user=phonetunnel,host=127.0.0.1,addr=127.0.0.1 \
     -f /etc/ssh/sshd_config | awk '$1=="allowtcpforwarding" || $1=="forcecommand"'
 pub1=$(awk '{print $2}' "$root/root/phonetunnel-install/id_ed25519.pub")
+if compgen -G "$root/etc/ssh/sshd_config.tmp.*" >/dev/null; then
+    echo "sshd temp file left behind after a successful install" >&2
+    exit 1
+fi
+
+echo "---- refuse a password account ----"
+chroot "$root" useradd --create-home --shell /bin/bash --home-dir /home/nottunnel nottunnel
+hash='$6$testsalt$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+chroot "$root" usermod -p "$hash" nottunnel
+chmod 755 "$root/home/nottunnel"
+shadow_before=$(awk -F: '$1=="nottunnel" {print $2}' "$root/etc/shadow")
+[ "$shadow_before" = "$hash" ]
+sshd_before=$(sha256sum "$root/etc/ssh/sshd_config")
+set +e
+run_setup '' --user nottunnel >"$root/refuse.out" 2>"$root/refuse.err"
+rrc=$?
+set -e
+echo "refuse rc=$rrc"
+cat "$root/refuse.err"
+[ "$rrc" -ne 0 ]
+grep -q 'refusing to adopt' "$root/refuse.err"
+grep -q -- '--adopt-existing' "$root/refuse.err"
+if grep -q 'rolling back' "$root/refuse.err"; then
+    echo "refusal tried to roll the account back" >&2
+    exit 1
+fi
+[ "$(awk -F: '$1=="nottunnel" {print $2}' "$root/etc/shadow")" = "$hash" ]
+[ "$(awk -F: '$1=="nottunnel" {print $7}' "$root/etc/passwd")" = /bin/bash ]
+[ "$(stat -c %a "$root/home/nottunnel")" = 755 ]
+[ "$(sha256sum "$root/etc/ssh/sshd_config")" = "$sshd_before" ]
+echo "refused a password account without changing it"
+
+echo "---- refuse a locked account that is not this tunnel ----"
+chroot "$root" useradd --system --create-home --shell /usr/sbin/nologin --home-dir /home/spare spare
+spare_shadow=$(awk -F: '$1=="spare" {print $2}' "$root/etc/shadow")
+spare_shell=$(awk -F: '$1=="spare" {print $7}' "$root/etc/passwd")
+set +e
+run_setup '' --user spare >"$root/spare.out" 2>"$root/spare.err"
+src=$?
+set -e
+echo "spare rc=$src"
+cat "$root/spare.err"
+[ "$src" -ne 0 ]
+grep -q 'refusing to adopt' "$root/spare.err"
+[ "$(awk -F: '$1=="spare" {print $2}' "$root/etc/shadow")" = "$spare_shadow" ]
+[ "$(awk -F: '$1=="spare" {print $7}' "$root/etc/passwd")" = "$spare_shell" ]
+[ "$(sha256sum "$root/etc/ssh/sshd_config")" = "$sshd_before" ]
+echo "refused a locked nologin account"
+
+echo "---- refuse an empty password on a tunnel-shaped account ----"
+chroot "$root" useradd --system --create-home --shell /bin/sh --home-dir /home/empty empty
+python3 - << PY
+from pathlib import Path
+p = Path("$root/etc/shadow")
+lines = []
+for line in p.read_text().splitlines():
+    parts = line.split(":")
+    if parts and parts[0] == "empty":
+        parts[1] = ""
+    lines.append(":".join(parts))
+p.write_text("\n".join(lines) + "\n")
+PY
+mkdir -p "$root/home/empty/.ssh"
+printf '%s\n' 'ssh-ed25519 AAAA phonetunnel-phone' > "$root/home/empty/.ssh/authorized_keys"
+[ -z "$(awk -F: '$1=="empty" {print $2}' "$root/etc/shadow")" ]
+set +e
+run_setup '' --user empty >"$root/empty.out" 2>"$root/empty.err"
+erc=$?
+set -e
+echo "empty rc=$erc"
+cat "$root/empty.err"
+[ "$erc" -ne 0 ]
+grep -q 'refusing to adopt' "$root/empty.err"
+if grep -q 'rolling back' "$root/empty.err"; then
+    echo "empty-password refusal tried to roll the account back" >&2
+    exit 1
+fi
+[ -z "$(awk -F: '$1=="empty" {print $2}' "$root/etc/shadow")" ]
+[ "$(awk -F: '$1=="empty" {print $7}' "$root/etc/passwd")" = /bin/sh ]
+[ "$(sha256sum "$root/etc/ssh/sshd_config")" = "$sshd_before" ]
+echo "refused an empty password on a tunnel-shaped account"
+
+echo "---- failed re-run restores home mode ----"
+chmod 711 "$root/home/phonetunnel"
+set +e
+run_setup user >"$root/mode.out" 2>"$root/mode.err"
+mrc=$?
+set -e
+echo "mode-rollback rc=$mrc"
+cat "$root/mode.err"
+[ "$mrc" -ne 0 ]
+grep -q 'forced failure after user' "$root/mode.err"
+grep -q 'rolling back' "$root/mode.err"
+[ "$(stat -c %a "$root/home/phonetunnel")" = 711 ]
+[ "$(awk -F: '$1=="phonetunnel" {print $2}' "$root/etc/shadow")" = '*' ]
+[ "$(awk -F: '$1=="phonetunnel" {print $7}' "$root/etc/passwd")" = /bin/sh ]
+echo "failed re-run restored home mode, shadow, and shell"
+
+echo "---- adopt then roll back the password ----"
+set +e
+run_setup user --adopt-existing --user nottunnel >"$root/adopt.out" 2>"$root/adopt.err"
+adrc=$?
+set -e
+echo "adopt-rollback rc=$adrc"
+cat "$root/adopt.err"
+[ "$adrc" -ne 0 ]
+grep -q 'forced failure after user' "$root/adopt.err"
+grep -q 'rolling back' "$root/adopt.err"
+[ "$(awk -F: '$1=="nottunnel" {print $2}' "$root/etc/shadow")" = "$hash" ]
+[ "$(awk -F: '$1=="nottunnel" {print $7}' "$root/etc/passwd")" = /bin/bash ]
+[ "$(stat -c %a "$root/home/nottunnel")" = 755 ]
+[ "$(awk -F: '$1=="phonetunnel" {print $2}' "$root/etc/shadow")" = '*' ]
+[ "$(sha256sum "$root/etc/ssh/sshd_config")" = "$sshd_before" ]
+echo "adopt failure restored the password, shell, and home mode"
 
 echo "---- second run ----"
+printf 'kept-phone-hostkey\n' > "$root/root/phonetunnel-install/phone_known_hosts"
+printf 'operator-note\n' > "$root/root/phonetunnel-install/operator-note.txt"
+chmod 600 "$root/root/phonetunnel-install/phone_known_hosts" \
+    "$root/root/phonetunnel-install/operator-note.txt"
 set +e
 run_setup >"$root/again.out" 2>"$root/again.err"
 arc=$?
@@ -1212,7 +1332,14 @@ pub2=$(awk '{print $2}' "$root/root/phonetunnel-install/id_ed25519.pub")
 [ "$pub1" = "$pub2" ]
 begins=$(grep -c 'BEGIN gsm2computer-phonetunnel' "$root/etc/ssh/sshd_config")
 [ "$begins" -eq 1 ]
-echo "second run reused the key and did not stack Match blocks"
+[ "$(cat "$root/root/phonetunnel-install/phone_known_hosts")" = "kept-phone-hostkey" ]
+[ "$(cat "$root/root/phonetunnel-install/operator-note.txt")" = "operator-note" ]
+[ "$(stat -c %a "$root/home/phonetunnel")" = 750 ]
+if compgen -G "$root/etc/ssh/sshd_config.tmp.*" >/dev/null; then
+    echo "sshd temp file left behind after the second run" >&2
+    exit 1
+fi
+echo "second run reused the key, kept extra bundle files, and did not stack Match blocks"
 echo "account ok"
 EOS
         echo "host passwd and sshd were not the chroot"

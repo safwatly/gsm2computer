@@ -28,6 +28,7 @@ BACKOFF_INITIAL_SEC="2"
 BACKOFF_MAX_SEC="60"
 USER_NAME="phonetunnel"
 BUNDLE=""
+ADOPT=0
 
 usage() {
     cat << 'EOF'
@@ -47,6 +48,9 @@ usage: setup-phonetunnel-account.sh [options]
   --backoff-max SEC
   --user NAME               unix account (default phonetunnel)
   --bundle DIR              where keys and the phone bundle are written
+  --adopt-existing          take over an existing account that is not already
+                            this tunnel (has a usable password, or another shell).
+                            Without this flag that account is left unchanged.
 EOF
 }
 
@@ -65,6 +69,7 @@ while [ $# -gt 0 ]; do
         --backoff-max) BACKOFF_MAX_SEC=$2; shift 2 ;;
         --user) USER_NAME=$2; shift 2 ;;
         --bundle) BUNDLE=$2; shift 2 ;;
+        --adopt-existing) ADOPT=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -200,19 +205,26 @@ fi
 # Nothing under the live paths is written until sshd -T accepts a staged
 # config. A failure before that commit leaves the system untouched. A
 # failure after it rolls back the user, hold script, key bundle, and
-# sshd config this run changed, so a second run starts clean.
+# sshd config this run changed, so a second run starts clean. An
+# existing account also gets its shell, shadow field, and home mode back.
 STAGE=$(mktemp -d)
 STAGE_BUNDLE="$STAGE/bundle"
 STAGE_SSHD="$STAGE/sshd_config"
 USER_CREATED=0
 USER_HAD_PREV=0
 PREV_SHELL=""
+PREV_HOME=""
+PREV_MODE=""
+PREV_OWNER=""
+SSHD_TMP=""
 HOLD_COMMITTED=0
 HOLD_HAD_PREV=0
 BUNDLE_COMMITTED=0
 BUNDLE_HAD_PREV=0
 AUTH_COMMITTED=0
 AUTH_HAD_PREV=0
+AUTH_DOTSSH_MODE=""
+AUTH_DOTSSH_OWNER=""
 SSHD_COMMITTED=0
 
 remove_stage() {
@@ -223,6 +235,9 @@ rollback_commit() {
     local rc=$?
     trap - EXIT
     echo "phonetunnel setup failed; rolling back this run" >&2
+    if [ -n "$SSHD_TMP" ]; then
+        rm -f "$SSHD_TMP"
+    fi
     if [ "$SSHD_COMMITTED" -eq 1 ] && [ -f "$STAGE/sshd.prev" ]; then
         cp -a "$STAGE/sshd.prev" "$SSHD_CONFIG"
         echo "restored $SSHD_CONFIG; sshd was not reloaded" >&2
@@ -245,12 +260,34 @@ rollback_commit() {
             cp -a "$STAGE/auth.prev" "$AUTH_KEYS"
         else
             rm -f "$AUTH_KEYS"
+            if [ -z "$AUTH_DOTSSH_MODE" ]; then
+                rmdir "${HOME_DIR}/.ssh" >/dev/null 2>&1 || true
+            fi
+        fi
+        if [ -n "$AUTH_DOTSSH_MODE" ] && [ -d "${HOME_DIR}/.ssh" ]; then
+            chmod "$AUTH_DOTSSH_MODE" "${HOME_DIR}/.ssh" >/dev/null 2>&1 || true
+        fi
+        if [ -n "$AUTH_DOTSSH_OWNER" ] && [ -d "${HOME_DIR}/.ssh" ]; then
+            chown "$AUTH_DOTSSH_OWNER" "${HOME_DIR}/.ssh" >/dev/null 2>&1 || true
         fi
     fi
     if [ "$USER_CREATED" -eq 1 ]; then
         userdel -r "$USER_NAME" >/dev/null 2>&1 || userdel "$USER_NAME" >/dev/null 2>&1 || true
-    elif [ "$USER_HAD_PREV" -eq 1 ] && [ -n "$PREV_SHELL" ]; then
-        usermod -s "$PREV_SHELL" "$USER_NAME" >/dev/null 2>&1 || true
+    elif [ "$USER_HAD_PREV" -eq 1 ]; then
+        if [ -n "$PREV_SHELL" ]; then
+            usermod -s "$PREV_SHELL" "$USER_NAME" >/dev/null 2>&1 || true
+        fi
+        if [ -f "$STAGE/shadow.prev" ]; then
+            usermod -p "$(cat "$STAGE/shadow.prev")" "$USER_NAME" >/dev/null 2>&1 || true
+        fi
+        if [ -n "$PREV_HOME" ] && [ -d "$PREV_HOME" ]; then
+            if [ -n "$PREV_MODE" ]; then
+                chmod "$PREV_MODE" "$PREV_HOME" >/dev/null 2>&1 || true
+            fi
+            if [ -n "$PREV_OWNER" ]; then
+                chown "$PREV_OWNER" "$PREV_HOME" >/dev/null 2>&1 || true
+            fi
+        fi
     fi
     remove_stage
     exit "$rc"
@@ -275,11 +312,11 @@ if ! command -v dropbearkey >/dev/null 2>&1; then
     echo "The phone tunnel client cannot read an OpenSSH private key." >&2
     exit 1
 fi
-if [ -f "$BUNDLE/id_ed25519" ]; then
-    cp -a "$BUNDLE/id_ed25519" "$STAGE_BUNDLE/id_ed25519"
-fi
-if [ -f "$BUNDLE/phone_shell_ed25519" ]; then
-    cp -a "$BUNDLE/phone_shell_ed25519" "$STAGE_BUNDLE/phone_shell_ed25519"
+# Keep every file already in the bundle. A re-run used to copy only the
+# two private keys, which dropped phone_known_hosts and anything else
+# the operator had saved next to them.
+if [ -d "$BUNDLE" ]; then
+    cp -a "$BUNDLE/." "$STAGE_BUNDLE/"
 fi
 if [ ! -f "$STAGE_BUNDLE/id_ed25519" ]; then
     dropbearkey -t ed25519 -f "$STAGE_BUNDLE/id_ed25519" > "$STAGE_BUNDLE/id_ed25519.txt"
@@ -292,8 +329,8 @@ fi
 if [ ! -f "$STAGE_BUNDLE/phone_shell_ed25519" ]; then
     ssh-keygen -t ed25519 -f "$STAGE_BUNDLE/phone_shell_ed25519" -N "" -C "phonetunnel-shell"
 fi
-# A re-run copies the private key only. The public half is derived from it
-# so the staged directory is complete either way.
+# The public half is derived from the private key so a re-run does not
+# depend on the .pub file still being in the bundle.
 ssh-keygen -y -f "$STAGE_BUNDLE/phone_shell_ed25519" > "$STAGE_BUNDLE/phone_shell_ed25519.pub"
 chmod 600 "$STAGE_BUNDLE/id_ed25519" "$STAGE_BUNDLE/phone_shell_ed25519"
 chmod 644 "$STAGE_BUNDLE/id_ed25519.pub" "$STAGE_BUNDLE/phone_shell_ed25519.pub"
@@ -435,6 +472,50 @@ if [ "$got_listen" != "$want_listen" ]; then
     fail_effective
 fi
 
+# A shadow field can log in when it is not locked. '*' and '!' (and
+# '!!', '!*') are locks. An empty field is a usable empty password.
+# Anything else, including a crypt hash, is usable.
+shadow_unusable() {
+    case "$1" in
+        '*'|'!'|'!!') return 0 ;;
+        '!'*) return 0 ;;
+    esac
+    return 1
+}
+
+# Our own re-run: shell is /bin/sh, no usable password, and this user's
+# Match block or tunnel key is already installed.
+dedicated_tunnel_account() {
+    local _shell _shadow
+    _shell=$(getent passwd "$USER_NAME" | awk -F: '{print $7}')
+    _shadow=$(awk -F: -v u="$USER_NAME" '$1==u {print $2; exit}' /etc/shadow)
+    [ "$_shell" = "$SHELL_BIN" ] || return 1
+    shadow_unusable "$_shadow" || return 1
+    if awk -v u="$USER_NAME" '
+        $0=="# BEGIN gsm2computer-phonetunnel" {inside=1}
+        inside && $0==("Match User " u) {found=1}
+        $0=="# END gsm2computer-phonetunnel" {inside=0}
+        END {exit found ? 0 : 1}
+    ' "$SSHD_CONFIG"; then
+        return 0
+    fi
+    if [ -f "$AUTH_KEYS" ] && grep -q 'phonetunnel-phone' "$AUTH_KEYS"; then
+        return 0
+    fi
+    return 1
+}
+
+# Refuse before the commit trap. A refusal must not roll anything back
+# and must not mark the account as one this run changed.
+if [ "$APPLY_SYSTEM" -eq 1 ] && id "$USER_NAME" >/dev/null 2>&1; then
+    if [ "$ADOPT" -ne 1 ] && ! dedicated_tunnel_account; then
+        echo "refusing to adopt existing account ${USER_NAME}." >&2
+        echo "It has a usable password or is not already this tunnel account." >&2
+        echo "The account was not changed. Pass --adopt-existing to take it over." >&2
+        exit 1
+    fi
+fi
+
 # Commit. From here a failure undoes this run.
 trap rollback_commit EXIT
 
@@ -442,14 +523,23 @@ if [ "$APPLY_SYSTEM" -eq 1 ]; then
     if id "$USER_NAME" >/dev/null 2>&1; then
         USER_HAD_PREV=1
         PREV_SHELL=$(getent passwd "$USER_NAME" | awk -F: '{print $7}')
+        PREV_HOME=$(getent passwd "$USER_NAME" | awk -F: '{print $6}')
+        awk -F: -v u="$USER_NAME" '$1==u {print $2; exit}' /etc/shadow > "$STAGE/shadow.prev"
+        if [ -n "$PREV_HOME" ] && [ -d "$PREV_HOME" ]; then
+            PREV_MODE=$(stat -c %a "$PREV_HOME")
+            PREV_OWNER=$(stat -c %u:%g "$PREV_HOME")
+        fi
     else
         useradd --system --create-home --home-dir "/home/${USER_NAME}" --shell "$SHELL_BIN" "$USER_NAME"
         USER_CREATED=1
+        PREV_HOME="/home/${USER_NAME}"
     fi
     usermod -s "$SHELL_BIN" "$USER_NAME"
     # shellcheck disable=SC2016
     usermod -p '*' "$USER_NAME"
-    chmod 750 "/home/${USER_NAME}"
+    if [ -n "$PREV_HOME" ] && [ -d "$PREV_HOME" ]; then
+        chmod 750 "$PREV_HOME"
+    fi
     maybe_fail user
 fi
 
@@ -476,16 +566,32 @@ if [ -f "$AUTH_KEYS" ]; then
     cp -a "$AUTH_KEYS" "$STAGE/auth.prev"
     AUTH_HAD_PREV=1
 fi
+if [ -d "${HOME_DIR}/.ssh" ]; then
+    AUTH_DOTSSH_MODE=$(stat -c %a "${HOME_DIR}/.ssh")
+    AUTH_DOTSSH_OWNER=$(stat -c %u:%g "${HOME_DIR}/.ssh")
+fi
 install -d -m 700 "${HOME_DIR}/.ssh"
 install -m 600 "$STAGE_AUTH" "$AUTH_KEYS"
 if [ "$(id -u)" -eq 0 ] && id "$USER_NAME" >/dev/null 2>&1; then
-    chown -R "${USER_NAME}:${USER_NAME}" "$HOME_DIR"
+    if [ "$USER_CREATED" -eq 1 ]; then
+        chown -R "${USER_NAME}:${USER_NAME}" "$HOME_DIR"
+    else
+        # Do not chown the rest of an existing home. Only the key we wrote.
+        chown "${USER_NAME}:${USER_NAME}" "${HOME_DIR}/.ssh" "$AUTH_KEYS"
+    fi
 fi
 AUTH_COMMITTED=1
 
 cp -a "$SSHD_CONFIG" "$STAGE/sshd.prev"
 SSHD_COMMITTED=1
-cp "$STAGE_SSHD" "$SSHD_CONFIG"
+# Write the new config beside the live file and rename it into place.
+# A kill during the copy leaves the previous file intact.
+SSHD_TMP="${SSHD_CONFIG}.tmp.$$"
+cp "$STAGE_SSHD" "$SSHD_TMP"
+chmod --reference="$SSHD_CONFIG" "$SSHD_TMP"
+chown --reference="$SSHD_CONFIG" "$SSHD_TMP"
+mv -f "$SSHD_TMP" "$SSHD_CONFIG"
+SSHD_TMP=""
 if ! "$SSHD_BIN" -t -f "$SSHD_CONFIG"; then
     echo "sshd -t failed on the installed config." >&2
     exit 1

@@ -44,7 +44,13 @@ The script:
    password of `*` (not `!`). The shell has to be `/bin/sh` so OpenSSH
    can run the hold script; `nologin` ignores `-c` and never runs it.
    A `!` lock makes OpenSSH refuse the public key even when passwords
-   are off. A failed run deletes a user it just created.
+   are off. A failed run deletes a user it just created. If the name
+   already belongs to some other account (a usable password, or a shell
+   other than `/bin/sh` without this tunnel's Match block), the script
+   refuses and changes nothing unless you pass `--adopt-existing`.
+   A failed re-run of an account it did adopt puts back that account's
+   shell, shadow password, and home mode. Files already in the key
+   bundle, including `phone_known_hosts`, are kept.
 2. Generates two keys under `/root/phonetunnel-install/` (mode 700):
    - `id_ed25519` from `dropbearkey`. This is the phone's tunnel identity.
      The matching public line goes in `phonetunnel`'s `authorized_keys`
@@ -74,8 +80,10 @@ The script:
    earlier Match inside `sshd_config.d` is the usual cause), the live
    file is left unchanged and sshd is not reloaded. Only a clean result
    creates the account, installs the hold script and keys, writes the
-   Match, and reloads ssh. If one of those later steps fails, that run
-   is rolled back.
+   Match, and reloads ssh. The live file is replaced by renaming a
+   temporary file in the same directory, so a kill during the write
+   cannot leave a truncated config. If one of those later steps fails,
+   that run is rolled back.
 
 `ssh -N` (what the phone uses) does not run ForceCommand. A client that
 asks for a command runs the hold script, which prints
@@ -83,8 +91,9 @@ asks for a command runs the hold script, which prints
 not executed. Do not point the account shell at `nologin` or
 `/bin/false`; neither one runs the hold script.
 
-Re-running the script keeps existing key files and replaces only this
-account's authorized_keys line and the marked Match block.
+Re-running the script keeps existing key files and any other file
+already in the bundle, including `phone_known_hosts`. It replaces only
+this account's authorized_keys line and the marked Match block.
 
 Nothing secret is committed. After the phone has `id_ed25519` and
 `phonetunnel-status` shows `tunnel=up` for a while, delete the phone
