@@ -69,6 +69,13 @@ def _attach_assistant_silence(payload, tap):
         return
     if not isinstance(levels, dict):
         return
+    meta = levels.get("meta") if isinstance(levels.get("meta"), dict) else {}
+    if "max_outq" in meta:
+        try:
+            payload["max_outq"] = int(meta.get("max_outq") or 0)
+            payload["stall_count"] = int(meta.get("stall_count") or 0)
+        except (TypeError, ValueError):
+            pass
     try:
         from call_tap import assistant_silence_from_health
 

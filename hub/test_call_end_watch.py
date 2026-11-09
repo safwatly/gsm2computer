@@ -208,6 +208,39 @@ class ScenarioTests(unittest.TestCase):
             self.assertEqual(p["hub_during_call"]["hub_gap_max_s"], p["hub_gap_max_s"])
             self.assertLess(p["hub_end_lead_s"], cew.DROP_MARGIN_S)
 
+    def test_call_ended_includes_kernel_queue_for_this_call(self) -> None:
+        st = cew.WatchState(in_call=False, call_id="TC@1")
+        st.tap_id = "phone-1"
+        st.tap_dir = "/tmp/phone-1"
+        health = H(False, 1.0)
+        health["last_call_tap"] = {"id": "older", "meta": {"max_outq": 9, "stall_count": 9}}
+        health["open_call_tap"] = {
+            "id": "phone-1",
+            "dir": "/tmp/phone-1",
+            "meta": {"max_outq": 48000, "stall_count": 1},
+        }
+        with patch.object(cew, "journal_summary", return_value={}):
+            payload = cew.build_payload(st=st, duration_s=20.0, test=True, health=health, now_ts=10_000.0)
+        self.assertEqual(payload["max_outq"], 48000)
+        self.assertEqual(payload["stall_count"], 1)
+        self.assertIn("kernel_stalls=1 max_outq=48000", payload["text"])
+        quiet = H(False, 1.0)
+        quiet["open_call_tap"] = {
+            "id": "phone-1",
+            "dir": "/tmp/phone-1",
+            "meta": {"max_outq": 100, "stall_count": 0},
+        }
+        with patch.object(cew, "journal_summary", return_value={}):
+            quiet_payload = cew.build_payload(
+                st=st, duration_s=20.0, test=True, health=quiet, now_ts=10_000.0
+            )
+        self.assertEqual(quiet_payload["max_outq"], 100)
+        self.assertEqual(quiet_payload["stall_count"], 0)
+        self.assertNotIn("kernel_stalls", quiet_payload["text"])
+        with patch.object(cew, "journal_summary", return_value={}):
+            plain = cew.build_payload(st=st, duration_s=20.0, test=True, health=H(False, 1.0), now_ts=10_000.0)
+        self.assertNotIn("max_outq", plain)
+
     def test_dry_run_does_not_post_or_save_with_no_post(self) -> None:
         with patch.object(cew, "journal_summary", return_value={}), patch.object(
             cew, "post_alert_event"

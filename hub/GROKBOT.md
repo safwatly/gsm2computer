@@ -61,6 +61,14 @@ those rooms are mixed. Retention is still `GSM2COMPUTER_CALL_RECORD_KEEP`
 directories (default 20). The queue drops frames if it gets about two seconds
 behind.
 
+The downlink pump does not wait for the socket to drain. `admit()` only sees
+the asyncio write buffer, which can be empty while TCP still holds the frames.
+On Linux the pump reads `SIOCOUTQ` after each send. If that queue stays above
+about 500 ms of audio for at least 500 ms it logs
+`downlink kernel queue high outq=... ms_est=... entrance=...` once per episode.
+`max_outq` and `stall_count` land on the call meta and on `call_ended`. A
+failed read is ignored and does not change what gets sent.
+
 ```bash
 ffprobe ~/gsm2computer-calls/<call-id>/phone-downlink-8k-mono.wav
 ```

@@ -1,6 +1,7 @@
 """Phone address for the hub-side call watcher."""
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -60,6 +61,10 @@ class TranscriptFollowupTests(unittest.TestCase):
                 "ok",
                 [{"speaker": "caller", "text": "Hi", "timestamp": None}],
             )
+            (record / "levels.json").write_text(
+                json.dumps({"meta": {"max_outq": 48000, "stall_count": 1}}),
+                encoding="utf-8",
+            )
             with patch.object(hub_call_watch, "time") as clock, patch.object(
                 hub_call_watch, "adb_fired_since", return_value=False
             ), patch.object(hub_call_watch, "post_alert_event", side_effect=capture), patch(
@@ -73,6 +78,8 @@ class TranscriptFollowupTests(unittest.TestCase):
         self.assertEqual([item["event"] for item in posts], ["call_ended", "call_transcript"])
         self.assertEqual(posts[1]["transcript_status"], "ok")
         self.assertEqual(posts[0]["source"], "hub_call_watch")
+        self.assertEqual(posts[0]["max_outq"], 48000)
+        self.assertEqual(posts[0]["stall_count"], 1)
 
 
 if __name__ == "__main__":

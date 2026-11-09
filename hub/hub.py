@@ -34,6 +34,8 @@ from ws_backpressure import (
     UPLINK_QUEUE_FRAMES,
     UPLINK_WRITE_TIMEOUT_S,
     DownlinkSendGuard,
+    KernelQueueWatch,
+    kernel_send_queue,
     offer_nowait,
     reconnect_should_supersede,
     transport_buffered,
@@ -765,6 +767,8 @@ class PipewireBridge:
         self._in_src_rate = DEFAULT_CLIENT_RATE
         self._out_dst_rate = DEFAULT_CLIENT_RATE
         self.downlink_guard = DownlinkSendGuard()
+        self.kernel_queue = KernelQueueWatch()
+        self._dl_frame_bytes = 0
         self._dl_q = collections.deque()
         self.dl_seq = 0
         self.dl_sent = 0
@@ -962,7 +966,46 @@ class PipewireBridge:
         snap["dl_max_age_s"] = round(getattr(self, "dl_max_age_s", 0.0), 2)
         q = self._uplink_q
         snap["uplink_queued"] = q.qsize() if q is not None else 0
+        kq = self.kernel_queue.snapshot()
+        snap["max_outq"] = kq["max_outq"]
+        snap["stall_count"] = kq["stall_count"]
         return snap
+
+    def _publish_kernel_queue(self) -> None:
+        """Copy kernel-queue counters onto the call meta. Does not send."""
+        snap = self.kernel_queue.snapshot()
+        if snap["samples"] <= 0:
+            return
+        tap = self.tap
+        if tap is not None:
+            tap.meta["max_outq"] = snap["max_outq"]
+            tap.meta["stall_count"] = snap["stall_count"]
+        opened = open_call_tap
+        if (
+            tap is not None
+            and isinstance(opened, dict)
+            and opened.get("id") == tap.call_id
+            and isinstance(opened.get("meta"), dict)
+        ):
+            opened["meta"]["max_outq"] = snap["max_outq"]
+            opened["meta"]["stall_count"] = snap["stall_count"]
+
+    def _note_kernel_queue(self, writer: Any, frame_bytes: int) -> None:
+        if frame_bytes > 0:
+            self._dl_frame_bytes = frame_bytes
+        size = self._dl_frame_bytes
+        if size <= 0 or writer is None:
+            return
+        before = (self.kernel_queue.max_outq, self.kernel_queue.stall_count)
+        line = self.kernel_queue.note(
+            kernel_send_queue(writer),
+            size,
+            entrance=live_call.entrance or "",
+        )
+        if line:
+            LOG.warning("%s", line)
+        if (self.kernel_queue.max_outq, self.kernel_queue.stall_count) != before:
+            self._publish_kernel_queue()
 
     def current_downlink_writer(self) -> Optional[asyncio.StreamWriter]:
         writer = self._out_writer
@@ -1061,6 +1104,7 @@ class PipewireBridge:
                 if self.dl_dropped_oldest == 1 or self.dl_dropped_oldest % 250 == 0:
                     LOG.warning("downlink backlog: dropped oldest frames %s", self.downlink_snapshot())
             broken = False
+            sent_bytes = 0
             while q:
                 frame = q[0][1]
                 if not guard.admit(len(frame)):
@@ -1072,11 +1116,16 @@ class PipewireBridge:
                 try:
                     ws_writer.write(frame)
                     self.dl_sent += 1
+                    sent_bytes = len(frame)
                 except (ConnectionError, BrokenPipeError, RuntimeError):
                     if self._out_writer is ws_writer:
                         self._out_writer = None
                     broken = True
                     break
+            if not broken:
+                # TCP can hold frames after write() while the asyncio buffer is empty.
+                # Read-only. Do not drain.
+                self._note_kernel_queue(ws_writer, sent_bytes)
             if broken:
                 continue
             if guard.stall_started_at is None and guard.max_stall_s >= 1.0 and not self._stall_logged_recovery:
@@ -2607,6 +2656,8 @@ async def handle_websocket(
 
                 grok_voice.stop_later(after=grok_switch_task, on_stopped=on_transcript)
         finally:
+            if bridge is not None:
+                bridge._publish_kernel_queue()
             # A stuck downlink write must not keep the slot after the stop cap.
             live_call.release()
         if abort_reason:

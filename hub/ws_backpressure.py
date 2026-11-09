@@ -12,9 +12,14 @@ Policy here:
 - the socket is only "dead" when buffered bytes make no forward progress for
   ``dead_s`` (default 45 s). Inbound silence is handled by the CallSlot
   ws-idle watchdog (60 s), which pongs/uplink frames keep fresh.
+
+The asyncio buffer can be empty while TCP still holds the bytes (Call 1: a
+~5 s stall after ``write()``). ``KernelQueueWatch`` reads the kernel send
+queue with ``SIOCOUTQ`` and only records it. It does not drain or drop.
 """
 from __future__ import annotations
 
+import array
 import asyncio
 import os
 import time
@@ -32,6 +37,11 @@ def _env_float(name: str, default: float) -> float:
 DOWNLINK_BACKLOG_S = _env_float("GSM2COMPUTER_WS_DOWNLINK_BACKLOG_S", 0.3)
 DOWNLINK_DEAD_S = _env_float("GSM2COMPUTER_WS_DOWNLINK_DEAD_S", 45.0)
 FRAME_S = 0.02
+FRAME_MS = 20.0
+# Linux TIOCOUTQ / SIOCOUTQ. Best-effort; any failure leaves the queue unread.
+SIOCOUTQ = 0x5411
+KERNEL_QUEUE_HIGH_MS = _env_float("GSM2COMPUTER_KERNEL_QUEUE_HIGH_MS", 500.0)
+KERNEL_QUEUE_HOLD_S = _env_float("GSM2COMPUTER_KERNEL_QUEUE_HOLD_S", 0.5)
 MIN_BACKLOG_BYTES = 4096
 # Half a second of 20 ms frames. Older audio is dropped, not allowed to grow.
 UPLINK_QUEUE_FRAMES = 25
@@ -57,6 +67,99 @@ def offer_nowait(queue: asyncio.Queue, item: Any) -> int:
             except asyncio.QueueEmpty:
                 return dropped
             dropped += 1
+
+
+def kernel_send_queue(writer: Any) -> Optional[int]:
+    """Bytes sitting in the kernel TCP send queue. None when the read is unavailable.
+
+    Linux only. Does not send, drain, or change the socket.
+    """
+    sock = None
+    try:
+        sock = writer.get_extra_info("socket")
+    except Exception:
+        sock = None
+    if sock is None:
+        transport = getattr(writer, "transport", None)
+        if transport is not None:
+            try:
+                sock = transport.get_extra_info("socket")
+            except Exception:
+                sock = None
+    if sock is None:
+        return None
+    try:
+        import fcntl
+
+        fd = sock.fileno() if hasattr(sock, "fileno") else sock
+        buf = array.array("I", [0])
+        fcntl.ioctl(fd, SIOCOUTQ, buf, True)
+        return int(buf[0])
+    except Exception:
+        return None
+
+
+class KernelQueueWatch:
+    """Track a kernel send queue that stays above ~500 ms of audio for >= 500 ms."""
+
+    def __init__(
+        self,
+        *,
+        high_ms: float = KERNEL_QUEUE_HIGH_MS,
+        hold_s: float = KERNEL_QUEUE_HOLD_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.high_ms = high_ms
+        self.hold_s = hold_s
+        self._clock = clock
+        self.max_outq = 0
+        self.stall_count = 0
+        self.samples = 0
+        self._high_since: Optional[float] = None
+        self._open = False
+
+    def note(
+        self,
+        outq: Optional[int],
+        frame_bytes: int,
+        *,
+        entrance: str = "",
+        now: Optional[float] = None,
+    ) -> Optional[str]:
+        """Return the stall log line once an episode has lasted ``hold_s``.
+
+        ``frame_bytes`` is one 20 ms downlink frame, so the queue depth converts
+        to audio time. A failed ioctl (``outq is None``) is ignored.
+        """
+        if outq is None or frame_bytes <= 0:
+            return None
+        outq = max(0, int(outq))
+        now = self._clock() if now is None else now
+        self.samples += 1
+        self.max_outq = max(self.max_outq, outq)
+        ms_est = outq * FRAME_MS / float(frame_bytes)
+        if ms_est < self.high_ms:
+            self._high_since = None
+            self._open = False
+            return None
+        if self._high_since is None:
+            self._high_since = now
+            return None
+        if self._open or now - self._high_since < self.hold_s:
+            return None
+        self._open = True
+        self.stall_count += 1
+        return (
+            f"downlink kernel queue high outq={outq} ms_est={ms_est:.0f} "
+            f"entrance={entrance or '-'}"
+        )
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "max_outq": self.max_outq,
+            "stall_count": self.stall_count,
+            "samples": self.samples,
+        }
 
 
 def transport_buffered(writer: Any) -> int:
