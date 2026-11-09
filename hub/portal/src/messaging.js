@@ -161,7 +161,7 @@ function renderThreadInner() {
       const side = m.direction === "out" ? "out" : "in";
       const st =
         m.status && m.status !== "received" && m.status !== "sent"
-          ? `<span class="status-pill">${escapeHtml(m.status)}</span>`
+          ? `<span class="status-pill">${escapeHtml(m.status)}${m.error ? ` ${escapeHtml(m.error)}` : ""}</span>`
           : "";
       return `<div class="bubble ${side}"><span class="bubble-body">${escapeHtml(m.body || "")}</span>${st}<time>${escapeHtml(fmtTime(m.ts))}</time></div>`;
     })

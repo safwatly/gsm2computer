@@ -103,6 +103,34 @@ class PortalHttpTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["item"]["status"], "sent")
 
+    async def test_failed_and_timeout_acks_are_not_sent(self):
+        payload = json.dumps({"to": "+201009998888", "body": "carrier"}).encode()
+        status, _, body = await self._exchange(_encode_request("POST", "/portal/api/messages/send", payload))
+        self.assertEqual(status, 201)
+        item_id = json.loads(body)["id"]
+        await self._exchange(_encode_request("GET", "/sms/outbox"))
+        ack = json.dumps({"status": "failed", "error": "result=40 MODEM_ERR rp=38"}).encode()
+        status, _, body = await self._exchange(_encode_request("POST", f"/sms/outbox/{item_id}/ack", ack))
+        self.assertEqual(status, 200)
+        item = json.loads(body)["item"]
+        self.assertEqual(item["status"], "failed")
+        self.assertEqual(item["error"], "result=40 MODEM_ERR rp=38")
+        status, _, body = await self._exchange(
+            _encode_request("GET", "/portal/api/messages?peer=%2B201009998888")
+        )
+        message = json.loads(body)[0]
+        self.assertEqual(message["status"], "failed")
+        self.assertEqual(message["error"], "result=40 MODEM_ERR rp=38")
+
+        later = json.dumps({"to": "+201009998888", "body": "later"}).encode()
+        status, _, body = await self._exchange(_encode_request("POST", "/portal/api/messages/send", later))
+        timed_id = json.loads(body)["id"]
+        await self._exchange(_encode_request("GET", "/sms/outbox"))
+        timeout_ack = json.dumps({"status": "timeout", "error": "send result timeout"}).encode()
+        status, _, body = await self._exchange(_encode_request("POST", f"/sms/outbox/{timed_id}/ack", timeout_ack))
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["item"]["status"], "timeout")
+
     async def test_sse_emits_inbound_message(self):
         reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
         writer.write(_encode_request("GET", "/portal/api/events", extra_headers=["Accept: text/event-stream"]))

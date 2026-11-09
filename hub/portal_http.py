@@ -275,7 +275,7 @@ class PortalApp:
             except json.JSONDecodeError:
                 payload = {}
             raw_status = str(payload.get("status") or "").strip().lower()
-            if raw_status in {"sent", "failed"}:
+            if raw_status in {"sent", "failed", "timeout"}:
                 status = raw_status
             elif payload.get("ok") is False:
                 status = "failed"

@@ -30,6 +30,13 @@ export function previewBody(body, max = 140) {
 export function notificationCopy(event) {
   const peer = event.peer || "unknown";
   if (event.direction === "out") {
+    if (event.status === "failed" || event.status === "timeout") {
+      const title = event.status === "timeout" ? `SMS timed out to ${peer}` : `SMS failed to ${peer}`;
+      return {
+        title,
+        body: previewBody(event.error || event.body),
+      };
+    }
     return {
       title: `SMS sent to ${peer}`,
       body: previewBody(event.body),

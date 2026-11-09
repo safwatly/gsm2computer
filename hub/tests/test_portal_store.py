@@ -49,6 +49,27 @@ class PortalStoreTest(unittest.TestCase):
         self.assertEqual(self.store.list_outbox_pending(), [])
         self.assertEqual(self.store.list_messages("+15553333")[0]["status"], "sent")
 
+    def test_failed_ack_keeps_the_carrier_error(self):
+        queued = self.store.enqueue_outbound("+201001234567", "hello")
+        self.store.claim_outbox_for_send()
+        reason = "result=40 MODEM_ERR rp=38"
+        acked = self.store.ack_outbox(queued["id"], status="failed", error=reason)
+        self.assertEqual(acked["status"], "failed")
+        self.assertEqual(acked["error"], reason)
+        message = self.store.list_messages("+201001234567")[0]
+        self.assertEqual(message["status"], "failed")
+        self.assertEqual(message["error"], reason)
+        again = self.store.ack_outbox(queued["id"], status="sent")
+        self.assertEqual(again["status"], "failed")
+
+    def test_timeout_ack_is_not_stored_as_sent(self):
+        queued = self.store.enqueue_outbound("+201001234567", "hello")
+        self.store.claim_outbox_for_send()
+        acked = self.store.ack_outbox(queued["id"], status="timeout", error="send result timeout")
+        self.assertEqual(acked["status"], "timeout")
+        self.assertEqual(acked["error"], "send result timeout")
+        self.assertEqual(self.store.list_messages("+201001234567")[0]["status"], "timeout")
+
     def test_blank_peer_is_not_a_number(self):
         item = self.store.add_message("in", "  ", "hi")
         self.assertEqual(item["peer"], "")

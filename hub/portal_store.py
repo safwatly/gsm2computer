@@ -104,7 +104,7 @@ def normalize_peer(raw: str) -> str:
 
 
 def _row_message(row: sqlite3.Row) -> dict[str, Any]:
-    return {
+    item = {
         "id": row["id"],
         "direction": row["direction"],
         "peer": row["peer"],
@@ -112,6 +112,10 @@ def _row_message(row: sqlite3.Row) -> dict[str, Any]:
         "ts": row["ts"],
         "status": row["status"],
     }
+    error = _optional_text(row, "error")
+    if error:
+        item["error"] = error
+    return item
 
 
 def _row_call(row: sqlite3.Row) -> dict[str, Any]:
@@ -230,8 +234,17 @@ def resolve_call_recording(call: dict[str, Any], record_dir: Path) -> Optional[P
     return None
 
 
+def _optional_text(row: sqlite3.Row, key: str) -> str:
+    try:
+        if key not in row.keys():
+            return ""
+        return str(row[key] or "")
+    except (IndexError, KeyError):
+        return ""
+
+
 def _row_outbox(row: sqlite3.Row) -> dict[str, Any]:
-    return {
+    item = {
         "id": row["id"],
         "to": row["to_number"],
         "body": row["body"],
@@ -239,6 +252,10 @@ def _row_outbox(row: sqlite3.Row) -> dict[str, Any]:
         "available_at": row["available_at"],
         "status": row["status"],
     }
+    error = _optional_text(row, "error")
+    if error:
+        item["error"] = error
+    return item
 
 
 class PortalStore:
@@ -269,6 +286,10 @@ class PortalStore:
             message_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(messages)")}
             if "client_id" not in message_columns:
                 self._conn.execute("ALTER TABLE messages ADD COLUMN client_id TEXT")
+            if "error" not in message_columns:
+                self._conn.execute("ALTER TABLE messages ADD COLUMN error TEXT NOT NULL DEFAULT ''")
+            if "error" not in columns:
+                self._conn.execute("ALTER TABLE outbox ADD COLUMN error TEXT NOT NULL DEFAULT ''")
             self._conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS messages_client_id "
                 "ON messages (client_id) WHERE client_id IS NOT NULL AND client_id != ''"
@@ -497,27 +518,27 @@ class PortalStore:
 
     def ack_outbox(self, item_id: str, status: str = "sent", error: Optional[str] = None) -> Optional[dict[str, Any]]:
         status_n = (status or "sent").strip().lower()
-        if status_n not in {"sent", "failed"}:
+        if status_n not in {"sent", "failed", "timeout"}:
             status_n = "sent"
-        msg_status = "sent" if status_n == "sent" else "failed"
+        error_n = (error or "").strip()[:240]
         with self._lock:
             row = self._conn.execute("SELECT * FROM outbox WHERE id = ?", (item_id,)).fetchone()
             if row is None:
                 return None
             current = row["status"]
-            if current in {"sent", "failed"}:
-                result = _row_outbox(row)
-                if error:
-                    result["error"] = error
-                return result
-            self._conn.execute("UPDATE outbox SET status = ? WHERE id = ?", (status_n, item_id))
-            self._conn.execute("UPDATE messages SET status = ? WHERE id = ?", (msg_status, item_id))
+            if current in {"sent", "failed", "timeout"}:
+                return _row_outbox(row)
+            self._conn.execute(
+                "UPDATE outbox SET status = ?, error = ? WHERE id = ?",
+                (status_n, error_n, item_id),
+            )
+            self._conn.execute(
+                "UPDATE messages SET status = ?, error = ? WHERE id = ?",
+                (status_n, error_n, item_id),
+            )
             self._conn.commit()
             updated = self._conn.execute("SELECT * FROM outbox WHERE id = ?", (item_id,)).fetchone()
-        result = _row_outbox(updated)
-        if error:
-            result["error"] = error
-        return result
+        return _row_outbox(updated)
 
     def add_call(
         self,
