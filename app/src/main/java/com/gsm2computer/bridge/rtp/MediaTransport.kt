@@ -47,6 +47,15 @@ interface MediaTransport {
         /** Transport-level status line for the in-app log/stats viewer. */
         fun onStatus(msg: String)
 
+        /**
+         * Hub link dropped and the transport is retrying.
+         * The GSM call stays up; inbound audio simply stops until [holding] is false.
+         */
+        fun onLinkHold(holding: Boolean, detail: String) {}
+
+        /** 338: hub downlink sequence number of the next onAudio frame (-1 = none). */
+        fun onSeq(seq: Int) {}
+
         /** Fatal transport error — the session should tear the call down. */
         fun onError(msg: String)
     }

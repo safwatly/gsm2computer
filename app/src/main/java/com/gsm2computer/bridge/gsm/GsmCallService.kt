@@ -24,6 +24,12 @@ class GsmCallService : InCallService() {
         GsmCallManager.onCallAdded(call, this)
     }
 
+    @Deprecated("CallAudioState API")
+    override fun onCallAudioStateChanged(audioState: android.telecom.CallAudioState?) {
+        super.onCallAudioStateChanged(audioState)
+        GsmCallManager.noteAudioState(audioState)
+    }
+
     override fun onCallRemoved(call: Call) {
         super.onCallRemoved(call)
         Log.i(TAG, "Call removed")

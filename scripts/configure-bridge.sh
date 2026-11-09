@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Push hub-stream settings into the phone app's SharedPreferences.
+# To rotate only the tunnel URL on a running phone, use scripts/set-hub-url.sh
+# (drop file + broadcast). This script rewrites the prefs XML and needs a
+# process restart before the running bridge sees it.
 #
 # Usage:
 #   HUB_CONTROL_URL=http://hub.mining-ling.ts.net:8787 ./scripts/configure-bridge.sh --force -s <serial>
