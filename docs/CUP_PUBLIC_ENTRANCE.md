@@ -68,9 +68,12 @@ The command prints the secret once. Put it somewhere the step-3 bridge can read.
 
 ### 3. Hub listener
 
-Edit the user unit (the installed copy, usually `~/.config/systemd/user/gsm2computer-hub.service`) and set:
+Do not put these variables in `gsm2computer-hub.service`. Add them to the drop-in `~/.config/systemd/user/gsm2computer-hub.service.d/cup-private.conf`. Leave Talk and the audio buses on the unit.
 
-```
+```bash
+mkdir -p ~/.config/systemd/user/gsm2computer-hub.service.d
+cat > ~/.config/systemd/user/gsm2computer-hub.service.d/cup-private.conf <<'EOF'
+[Service]
 Environment=GSM2COMPUTER_HUB_HOST=100.113.222.47
 Environment=GSM2COMPUTER_HUB_PORT=8787
 Environment=GSM2COMPUTER_PUBLIC_ENABLE=1
@@ -79,11 +82,7 @@ Environment=GSM2COMPUTER_PUBLIC_PORT=8790
 Environment=GSM2COMPUTER_PUBLIC_HOSTNAME=gsm.ta3leam.com
 Environment=GSM2COMPUTER_DEVICE_TOKENS=%h/.config/gsm2computer/device-tokens.json
 Environment=GSM2COMPUTER_TAILSCALE_TOKEN_REQUIRED=0
-```
-
-Leave Talk and the audio buses as they are.
-
-```bash
+EOF
 systemctl --user daemon-reload
 systemctl --user restart gsm2computer-hub.service
 systemctl --user status gsm2computer-hub.service --no-pager
@@ -104,7 +103,35 @@ sudo cp deploy/cup/public-entrance.env.example /etc/gsm2computer/public-entrance
 sudoedit /etc/gsm2computer/public-entrance.env
 ```
 
-Set `GSM2COMPUTER_ACME_EMAIL` to a mailbox you read, and the hostname if you did not use `gsm.ta3leam.com`. Leave `GSM2COMPUTER_PUBLIC_BIND=62.83.35.197`. The Caddy unit runs `gsm2computer-caddy-pre.sh` first and will not start if that value is empty, `0.0.0.0`, or `::`.
+`GSM2COMPUTER_ACME_EMAIL` is required. It is the Let's Encrypt account contact, and it belongs in this env file. Caddy refuses to start when it is empty, because the Caddyfile's `email` line then has no argument. Set it to a mailbox you read. Set the hostname if you did not use `gsm.ta3leam.com`. Leave `GSM2COMPUTER_PUBLIC_BIND=62.83.35.197`. The Caddy unit runs `gsm2computer-caddy-pre.sh` first and will not start if that bind is empty, `0.0.0.0`, or `::`.
+
+The unit sets `StateDirectory=caddy`, `XDG_DATA_HOME=/var/lib/caddy`, and `XDG_CONFIG_HOME=/var/lib/caddy`. Caddy 2.6 appends `/caddy` to those variables, so the account and certificates live in `/var/lib/caddy/caddy`.
+
+#### One-time move off `/caddy`
+
+The entrance is already live. The previous unit set no `HOME` and no `XDG_*`, and a system unit's working directory is `/`, so Caddy stored the account and the certificate in `/caddy`. Starting the new unit before this move makes Caddy look in an empty `/var/lib/caddy/caddy` and ask Let's Encrypt for a new certificate.
+
+Record the fingerprint while the current process is still serving. Stop Caddy, move the directory, then install the unit and start it. `mv` keeps the owner, group, and mode of `/caddy` and of every file inside it. Do not copy the tree in a way that rewrites ownership.
+
+```bash
+echo | openssl s_client -connect 62.83.35.197:443 -servername gsm.ta3leam.com 2>/dev/null \
+  | openssl x509 -noout -fingerprint -sha256 | tee /tmp/gsm-cert.before
+sudo systemctl stop gsm2computer-caddy.service
+sudo install -d -m 0755 /var/lib/caddy
+sudo mv /caddy /var/lib/caddy/caddy
+sudo install -m 0755 deploy/cup/gsm2computer-caddy-pre.sh /usr/local/sbin/gsm2computer-caddy-pre.sh
+sudo cp deploy/cup/gsm2computer-caddy.service /etc/systemd/system/gsm2computer-caddy.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now gsm2computer-caddy.service
+echo | openssl s_client -connect 62.83.35.197:443 -servername gsm.ta3leam.com 2>/dev/null \
+  | openssl x509 -noout -fingerprint -sha256 | tee /tmp/gsm-cert.after
+cmp /tmp/gsm-cert.before /tmp/gsm-cert.after
+sudo journalctl -u gsm2computer-caddy.service -n 50 --no-pager
+```
+
+`cmp` exits 0 when the same certificate is still served. The journal after the start does not show a new issuance. `/caddy` is gone; the storage root is `/var/lib/caddy/caddy`.
+
+On a first install there is no `/caddy` directory. Install the unit and start it. The log shows a certificate obtained for the hostname.
 
 ```bash
 sudo install -m 0755 deploy/cup/gsm2computer-caddy-pre.sh /usr/local/sbin/gsm2computer-caddy-pre.sh
@@ -114,7 +141,9 @@ sudo systemctl enable --now gsm2computer-caddy.service
 sudo journalctl -u gsm2computer-caddy.service -n 50 --no-pager
 ```
 
-The log should show a certificate obtained for the hostname. `ss -ltnp 'sport = :443'` should show Caddy on `62.83.35.197:443` and Tailscale Serve still on the tailnet address. Then, from a machine that is **not** on Tailscale:
+`ss -ltnp 'sport = :443'` should show Caddy on `62.83.35.197:443` and Tailscale Serve still on the tailnet address.
+
+Then, from a machine that is **not** on Tailscale:
 
 ```bash
 curl -sS -o /dev/null -w '%{http_code}\n' https://gsm.ta3leam.com/health

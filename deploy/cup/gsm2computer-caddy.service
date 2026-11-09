@@ -5,6 +5,13 @@ Wants=network-online.target
 
 [Service]
 EnvironmentFile=-/etc/gsm2computer/public-entrance.env
+# Caddy 2.6 with neither HOME nor XDG_* uses ./caddy. A system unit's working
+# directory is /, so the account and certificates were stored in /caddy.
+# StateDirectory creates /var/lib/caddy. Caddy appends /caddy to these two
+# variables, so the storage root is /var/lib/caddy/caddy.
+StateDirectory=caddy
+Environment=XDG_DATA_HOME=/var/lib/caddy
+Environment=XDG_CONFIG_HOME=/var/lib/caddy
 # Rejects an empty bind and 0.0.0.0/:: before Caddy can listen on the wrong address.
 ExecStartPre=/usr/local/sbin/gsm2computer-caddy-pre.sh
 ExecStart=/usr/bin/caddy run --config /etc/gsm2computer/Caddyfile --adapter caddyfile
