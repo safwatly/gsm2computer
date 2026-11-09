@@ -8,7 +8,9 @@ DefaultDependencies=no
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/gsm2computer-nft.sh boot
-ExecStop=/usr/sbin/nft delete table inet gsm2computer
+# No ExecStop. Stopping or restarting this unit must not delete the table
+# while Caddy is still serving the public address. gsm2computer-nft.sh revert
+# is the only way to remove the table.
 
 [Install]
 WantedBy=multi-user.target

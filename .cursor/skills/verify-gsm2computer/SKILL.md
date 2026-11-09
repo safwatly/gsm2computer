@@ -29,7 +29,7 @@ Ready means `GET http://127.0.0.1:18787/health` returns 200. The public socket i
 .cursor/skills/verify-gsm2computer/scripts/doctor.sh
 ```
 
-Passes when the hub pid is alive, `/health` on the Tailscale socket lists entrances `public` and `tailscale`, and `/health` on the public socket with no token returns 401. It does not open a call.
+Passes when the hub pid is alive, `/health` on the Tailscale socket lists entrances `public` and `tailscale`, `/health` on the public socket with no token returns 401, and `caddy adapt` of `deploy/cup/Caddyfile` listens only on `62.83.35.197:443` with the ACME challenge bound to that address. It does not open a call.
 
 ## Drive
 

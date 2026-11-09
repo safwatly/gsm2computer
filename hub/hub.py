@@ -68,7 +68,7 @@ from pipewire_target import (
     wait_for_pipewire_link,
 )
 
-HOST = os.environ.get("GSM2COMPUTER_HUB_HOST", "100.101.181.110")
+HOST = os.environ.get("GSM2COMPUTER_HUB_HOST", "100.113.222.47")
 PORT = int(os.environ.get("GSM2COMPUTER_HUB_PORT", "8787"))
 HUB_DIR = Path(os.environ.get("GSM2COMPUTER_HUB_DIR", Path(__file__).resolve().parent))
 SWITCHBOARD = HUB_DIR / "switchboard.sh"
@@ -125,9 +125,6 @@ last_call_tap: Optional[dict[str, Any]] = None
 # session_id -> (entrance, monotonic time the socket finished)
 _finished_call_entrances: dict[str, tuple[str, float]] = {}
 _finished_call_order: list[str] = []
-# Anonymous POST /calls (today's bridge omits session_id) inherits the entrance
-# only when the upload follows hangup immediately.
-CALL_PATH_STAMP_WINDOW_S = float(os.environ.get("GSM2COMPUTER_CALL_PATH_STAMP_S", "60"))
 _active_entrances: list[Entrance] = []
 _current_entrance: contextvars.ContextVar[Optional[Entrance]] = contextvars.ContextVar(
     "gsm_entrance", default=None
@@ -157,7 +154,10 @@ def json_response(status: int, body: dict, extra_headers: Optional[dict] = None)
         400: "Bad Request",
         401: "Unauthorized",
         404: "Not Found",
+        408: "Request Timeout",
         409: "Conflict",
+        413: "Payload Too Large",
+        431: "Request Header Fields Too Large",
         500: "Internal Server Error",
         503: "Service Unavailable",
     }.get(status, "")
@@ -174,39 +174,87 @@ def json_response(status: int, body: dict, extra_headers: Optional[dict] = None)
     return "\r\n".join(lines).encode("ascii") + payload
 
 
-async def read_http_request(reader: asyncio.StreamReader) -> Tuple[str, str, dict, bytes]:
-    header_lines: list[bytes] = []
-    while True:
-        line = await reader.readline()
-        if not line:
-            raise ConnectionError("client closed")
-        if line in (b"\r\n", b"\n"):
-            break
-        header_lines.append(line.rstrip(b"\r\n"))
+class HttpRequestError(Exception):
+    """A request we can answer and then close. status is the HTTP code."""
 
-    if not header_lines:
-        raise ValueError("empty request")
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
 
-    request_line = header_lines[0].decode("iso-8859-1")
-    parts = request_line.split()
-    if len(parts) < 2:
-        raise ValueError(f"bad request line: {request_line!r}")
-    method, path = parts[0], parts[1]
 
-    headers: dict[str, str] = {}
-    for raw in header_lines[1:]:
-        if b":" not in raw:
-            continue
-        name, value = raw.split(b":", 1)
-        headers[name.decode("iso-8859-1").strip().lower()] = value.decode("iso-8859-1").strip()
+# Headers are read before auth, so the cap applies to every entrance.
+# Bodies are read only after auth. Public phone payloads (SMS, call reports)
+# are far below 64 KiB; the Tailscale cap still bounds the portal.
+MAX_HTTP_HEADER_BYTES = 16 * 1024
+MAX_HTTP_BODY_BYTES = 1024 * 1024
+MAX_PUBLIC_HTTP_BODY_BYTES = 64 * 1024
 
-    body = b""
-    if method in ("POST", "PUT", "PATCH"):
-        length = int(headers.get("content-length", "0") or "0")
-        if length:
-            body = await reader.readexactly(length)
 
-    return method.upper(), path, headers, body
+def _http_timeout(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+async def read_http_headers(reader: asyncio.StreamReader) -> Tuple[str, str, dict]:
+    """Read the request line and headers. Does not read a body."""
+    timeout = _http_timeout("GSM2COMPUTER_HTTP_HEADER_TIMEOUT_S", 8.0)
+
+    async def _read() -> Tuple[str, str, dict]:
+        header_lines: list[bytes] = []
+        seen = 0
+        while True:
+            line = await reader.readline()
+            if not line:
+                raise ConnectionError("client closed")
+            seen += len(line)
+            if seen > MAX_HTTP_HEADER_BYTES:
+                raise HttpRequestError(431, "headers too large")
+            if line in (b"\r\n", b"\n"):
+                break
+            header_lines.append(line.rstrip(b"\r\n"))
+        if not header_lines:
+            raise ValueError("empty request")
+        request_line = header_lines[0].decode("iso-8859-1")
+        parts = request_line.split()
+        if len(parts) < 2:
+            raise ValueError(f"bad request line: {request_line!r}")
+        method, path = parts[0], parts[1]
+        headers: dict[str, str] = {}
+        for raw in header_lines[1:]:
+            if b":" not in raw:
+                continue
+            name, value = raw.split(b":", 1)
+            headers[name.decode("iso-8859-1").strip().lower()] = value.decode("iso-8859-1").strip()
+        return method.upper(), path, headers
+
+    try:
+        return await asyncio.wait_for(_read(), timeout)
+    except asyncio.TimeoutError as exc:
+        raise HttpRequestError(408, "header timeout") from exc
+
+
+def content_length_header(headers: dict) -> int:
+    raw = headers.get("content-length")
+    if raw is None or raw == "":
+        return 0
+    if not str(raw).isdigit():
+        raise HttpRequestError(400, "bad content-length")
+    return int(raw)
+
+
+async def read_http_body(reader: asyncio.StreamReader, length: int) -> bytes:
+    if length <= 0:
+        return b""
+    timeout = _http_timeout("GSM2COMPUTER_HTTP_BODY_TIMEOUT_S", 15.0)
+    try:
+        return await asyncio.wait_for(reader.readexactly(length), timeout)
+    except asyncio.TimeoutError as exc:
+        raise HttpRequestError(408, "body timeout") from exc
 
 
 def ws_accept_key(sec_key: str) -> str:
@@ -538,32 +586,50 @@ def remember_finished_call(session_id: str, entrance: str) -> None:
 
 
 def resolve_call_path(session_id: Optional[str], requested: Optional[str]) -> Optional[str]:
-    """Entrance to store on a call report. The socket we saw beats the client's claim."""
-    now = time.monotonic()
-    observed: Optional[str] = None
-    if session_id:
-        hit = _finished_call_entrances.get(session_id)
-        if hit is not None:
-            observed = hit[0]
-    if observed is None and live_call.busy and live_call.entrance in ("public", "tailscale"):
-        if not session_id or session_id == live_call.session_id:
-            observed = live_call.entrance
-    if observed is None and not session_id and _finished_call_order:
-        last = _finished_call_entrances.get(_finished_call_order[-1])
-        if last is not None and now - last[1] <= CALL_PATH_STAMP_WINDOW_S:
-            observed = last[0]
-    if observed:
-        if requested and requested != observed:
-            LOG.info(
-                "call report path %s overridden by observed entrance %s session=%s",
-                requested,
-                observed,
-                session_id or "-",
-            )
-        return observed
-    if requested in ("public", "tailscale"):
-        return requested
+    """Entrance this process observed for session_id.
+
+    The client's path is never stored. A missing session id, or a session id
+    this process did not accept, is unknown (None) even when another call is
+    busy and even when the client claims public or tailscale.
+    """
+    if requested and requested not in (None, ""):
+        LOG.info(
+            "call report client path %s ignored session=%s",
+            requested,
+            session_id or "-",
+        )
+    if not session_id:
+        return None
+    hit = _finished_call_entrances.get(session_id)
+    if hit is not None:
+        return hit[0]
+    if (
+        live_call.busy
+        and live_call.session_id == session_id
+        and live_call.entrance in ("public", "tailscale")
+    ):
+        return live_call.entrance
     return None
+
+
+def session_description(session_id: str, *, loopback: bool, e2e: bool) -> dict[str, Any]:
+    """session.updated from the live slot. Built at send time so a relink onto
+    the other entrance is not stuck with the entrance of the first socket."""
+    return {
+        "type": "session.updated",
+        "session": {
+            "id": session_id,
+            "entrance": live_call.entrance or None,
+            "model": f"gsm2computer-hub-{OPENCLAW_TALK_MODE}" if not loopback else "gsm2computer-hub",
+            "audio": {
+                "format": DEFAULT_CLIENT_FORMAT,
+                "rate": DEFAULT_CLIENT_RATE,
+                "preferred": {"format": "audio/pcm", "rate": BUS_RATE, "encoding": "s16le"},
+            },
+            "talk": OPENCLAW_TALK_MODE if not loopback else "off",
+            "e2e": e2e,
+        },
+    }
 
 
 def _portal_mode() -> Optional[str]:
@@ -1383,6 +1449,18 @@ async def _park_relink_socket(
     """101 and hand the socket to the live call. True means this handler must return."""
     if not relink_gate.matches(session_id):
         return False
+    # Stamp the new socket's entrance before deliver(). The holder sends
+    # session.updated as soon as it wakes, and this function stays parked on
+    # release_fut until that call later ends.
+    entrance = request_entrance()
+    live_call.note_entrance(entrance.name, _current_device_id.get())
+    LOG.info(
+        "relink socket parked session=%s entrance=%s device=%s utc=%s",
+        session_id,
+        entrance.name,
+        _current_device_id.get() or "-",
+        _utc_now(),
+    )
     accept = ws_accept_key(key)
     writer.write(
         (
@@ -1527,27 +1605,18 @@ async def handle_websocket(
         writer.write(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
         await writer.drain()
         return
+    # Phone ingest on the public socket is the call route only. /loopback and
+    # /e2e-test change the switchboard; they stay on the Tailscale entrance.
+    if request_entrance().name == ENTRANCE_PUBLIC and not public_route_allowed(
+        "GET", path if path.startswith("/") else f"/{path}", {"upgrade": "websocket"}
+    ):
+        writer.write(json_response(404, {"ok": False, "error": "not found"}))
+        await writer.drain()
+        return
 
     resume_id = (headers.get("x-gsm-call-session") or "").strip()
     park_id = relink_gate.resume_session(resume_id)
     if park_id and await _park_relink_socket(reader, writer, park_id, key):
-        entrance = request_entrance()
-        live_call.note_entrance(entrance.name, _current_device_id.get())
-        if not resume_id:
-            LOG.info(
-                "header-less reconnect parked session=%s entrance=%s utc=%s",
-                park_id,
-                entrance.name,
-                _utc_now(),
-            )
-        else:
-            LOG.info(
-                "relink entrance=%s device=%s session=%s utc=%s",
-                entrance.name,
-                _current_device_id.get() or "-",
-                park_id,
-                _utc_now(),
-            )
         return
     # Reject only while a grace wait is still open and this socket could not
     # attach. After the waiter ends (expired/cancelled), fall through so the
@@ -1778,22 +1847,9 @@ async def handle_websocket(
                 await fail_call_handshake(writer, f"openclaw talk session failed: {exc}")
                 return
 
-        session_ack = {
-            "type": "session.updated",
-            "session": {
-                "id": session_id,
-                "entrance": live_call.entrance or None,
-                "model": f"gsm2computer-hub-{OPENCLAW_TALK_MODE}" if not loopback else "gsm2computer-hub",
-                "audio": {
-                    "format": DEFAULT_CLIENT_FORMAT,
-                    "rate": DEFAULT_CLIENT_RATE,
-                    "preferred": {"format": "audio/pcm", "rate": BUS_RATE, "encoding": "s16le"},
-                },
-                "talk": OPENCLAW_TALK_MODE if not loopback else "off",
-                "e2e": e2e,
-            },
-        }
-        await ws_send_text(writer, json.dumps(session_ack))
+        await ws_send_text(
+            writer, json.dumps(session_description(session_id, loopback=loopback, e2e=e2e))
+        )
         active_bridge = bridge
         live_call.mark_established()
 
@@ -1855,7 +1911,10 @@ async def handle_websocket(
                     break
                 reader, writer = held
                 try:
-                    await ws_send_text(writer, json.dumps(session_ack))
+                    await ws_send_text(
+                        writer,
+                        json.dumps(session_description(session_id, loopback=loopback, e2e=e2e)),
+                    )
                 except (ConnectionError, BrokenPipeError, OSError) as exc:
                     LOG.warning("relink session.updated failed: %s", exc)
                     held_again = await _hold_for_relink(
@@ -2022,7 +2081,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             LOG.debug("tcp keepalive not set: %s", exc)
     peer = writer.get_extra_info("peername")
     try:
-        method, path, headers, body = await read_http_request(reader)
+        method, path, headers = await read_http_headers(reader)
+    except HttpRequestError as exc:
+        writer.write(json_response(exc.status, {"ok": False, "error": str(exc)}))
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return
     except (ConnectionError, ValueError, asyncio.IncompleteReadError) as exc:
         LOG.debug("bad request from %s: %s", peer, exc)
         writer.close()
@@ -2034,8 +2099,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     path_only = split.path or "/"
     query = parse_qs(split.query)
 
-    # Same check on every listen socket. The entrance only changes whether a
-    # missing token is still allowed (Tailscale, during the bridge transition).
+    # Auth before any body read. A public client must not be able to make the
+    # process buffer an unbounded or slow body just by opening a socket.
     entrance = request_entrance()
     decision = authorize(headers, entrance, TOKENS)
     if not decision.ok:
@@ -2056,6 +2121,34 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     if entrance.name == ENTRANCE_PUBLIC and not public_route_allowed(method, path_only, headers):
         writer.write(json_response(404, {"ok": False, "error": "not found"}))
         await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return
+
+    try:
+        length = content_length_header(headers)
+    except HttpRequestError as exc:
+        writer.write(json_response(exc.status, {"ok": False, "error": str(exc)}))
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return
+    body_limit = MAX_PUBLIC_HTTP_BODY_BYTES if entrance.name == ENTRANCE_PUBLIC else MAX_HTTP_BODY_BYTES
+    if length > body_limit:
+        writer.write(json_response(413, {"ok": False, "error": "body too large"}))
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return
+    try:
+        body = await read_http_body(reader, length)
+    except HttpRequestError as exc:
+        writer.write(json_response(exc.status, {"ok": False, "error": str(exc)}))
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return
+    except (asyncio.IncompleteReadError, ConnectionError):
         writer.close()
         await writer.wait_closed()
         return
@@ -2143,9 +2236,17 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     )
             except Exception:
                 LOG.warning("ops SMS alert webhook failed", exc_info=True)
-            if command:
+            if command and entrance.name != ENTRANCE_PUBLIC:
                 result = await set_switchboard_mode(command)
                 writer.write(json_response(200, {"ok": True, "sms": log_entry, "routing": result}))
+            elif command:
+                LOG.info(
+                    "sms switchboard command ignored on public entrance: %s",
+                    command,
+                )
+                writer.write(
+                    json_response(200, {"ok": True, "sms": log_entry, "commandIgnored": True})
+                )
             else:
                 writer.write(json_response(200, {"ok": True, "sms": log_entry}))
         elif method == "POST" and path_only == "/admin/call/release":
@@ -2280,10 +2381,10 @@ async def main() -> None:
 
     TOKENS.reload_if_needed()
     entrances = entrances_from_env()
-    servers: list[asyncio.AbstractServer] = []
-    for entrance in entrances:
-        servers.append(await listen_entrance(entrance))
-        _active_entrances.append(entrance)
+    servers, bound = await start_entrances(entrances)
+    _active_entrances.extend(bound)
+    if not servers:
+        raise SystemExit("no listen socket could be bound")
     asyncio.create_task(_reap_stuck_call_slot())
     described = ", ".join(
         f"{item.name}={item.host}:{item.listen_port} token_required={item.token_required}"
@@ -2309,8 +2410,15 @@ async def main() -> None:
         await asyncio.gather(*(server.wait_closed() for server in servers))
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
 def entrances_from_env() -> list[Entrance]:
-    """Tailscale socket always. Public socket only when explicitly enabled."""
+    """Tailscale socket always. Public socket only when it fails closed.
+
+    A public socket without a required device token, or bound to something
+    other than loopback, is not opened. The Tailscale listener still starts.
+    """
     tailscale = Entrance(
         "tailscale",
         os.environ.get("GSM2COMPUTER_HUB_HOST", HOST),
@@ -2320,24 +2428,51 @@ def entrances_from_env() -> list[Entrance]:
     configured = [tailscale]
     if not _env_flag("GSM2COMPUTER_PUBLIC_ENABLE", False):
         return configured
+    public_host = os.environ.get("GSM2COMPUTER_PUBLIC_HOST", "127.0.0.1").strip()
     public = Entrance(
         ENTRANCE_PUBLIC,
-        os.environ.get("GSM2COMPUTER_PUBLIC_HOST", "127.0.0.1"),
+        public_host,
         int(os.environ.get("GSM2COMPUTER_PUBLIC_PORT", "8790")),
         _env_flag("GSM2COMPUTER_PUBLIC_TOKEN_REQUIRED", True),
     )
     if not public.token_required:
         LOG.error(
-            "public entrance has GSM2COMPUTER_PUBLIC_TOKEN_REQUIRED=0; "
-            "do not run that on cup"
+            "refusing public entrance: GSM2COMPUTER_PUBLIC_TOKEN_REQUIRED cannot be disabled"
         )
-    if public.host.strip() not in ("127.0.0.1", "::1", "localhost"):
-        LOG.warning(
-            "public entrance binds %s; cup should bind 127.0.0.1 and let Caddy own TLS",
-            public.host,
+        return configured
+    if public_host not in _LOOPBACK_HOSTS:
+        LOG.error(
+            "refusing public entrance: bind %s is not loopback; Caddy owns the public address",
+            public_host,
         )
+        return configured
     configured.append(public)
     return configured
+
+
+async def start_entrances(
+    entrances: list[Entrance],
+) -> tuple[list[asyncio.AbstractServer], list[Entrance]]:
+    """Bind each entrance. A public bind failure leaves the Tailscale socket up."""
+    servers: list[asyncio.AbstractServer] = []
+    bound: list[Entrance] = []
+    for entrance in entrances:
+        try:
+            servers.append(await listen_entrance(entrance))
+        except OSError as exc:
+            if entrance.name != ENTRANCE_PUBLIC:
+                for server in servers:
+                    server.close()
+                raise
+            LOG.error(
+                "public entrance bind failed %s:%s (%s); tailscale listener stays up",
+                entrance.host,
+                entrance.port,
+                exc,
+            )
+            continue
+        bound.append(entrance)
+    return servers, bound
 
 
 async def listen_entrance(entrance: Entrance) -> asyncio.AbstractServer:

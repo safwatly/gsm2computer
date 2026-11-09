@@ -40,7 +40,10 @@ DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 OUTBOX_ACK_RE = re.compile(r"^/sms/outbox/([^/]+)/ack$")
 
 # Phone-facing routes the public entrance may serve after the token check.
-# Portal, switchboard, and admin stay on the Tailscale entrance.
+# The call WebSocket is only `/`. /loopback and /e2e-test retarget the
+# switchboard and stay on the Tailscale entrance. Portal, switchboard, and
+# admin stay there too.
+_PUBLIC_WS_PATHS = frozenset({"/"} )
 _PUBLIC_HTTP = {
     ("GET", "/health"),
     ("POST", "/token"),
@@ -149,6 +152,7 @@ class DeviceTokenFile:
         self._path_override = path
         self._loaded_path: Optional[Path] = None
         self._mtime_ns: Optional[int] = None
+        self._mode: Optional[int] = None
         self._devices: tuple[DeviceToken, ...] = ()
 
     def path(self) -> Path:
@@ -163,15 +167,28 @@ class DeviceTokenFile:
                 LOG.info("no device token file at %s (public entrance fails closed)", path)
             self._devices = ()
             self._mtime_ns = None
+            self._mode = None
             self._loaded_path = path
             return
         except OSError as exc:
             LOG.error("device token file %s unreadable: %s", path, exc)
             self._devices = ()
             self._mtime_ns = None
+            self._mode = None
             self._loaded_path = path
             return
-        if self._loaded_path == path and self._mtime_ns == st.st_mtime_ns:
+        mode = stat.S_IMODE(st.st_mode)
+        if self._loaded_path == path and self._mtime_ns == st.st_mtime_ns and self._mode == mode:
+            return
+        if mode & 0o077:
+            LOG.error(
+                "device token file %s is readable by group or others; refusing to load",
+                path,
+            )
+            self._devices = ()
+            self._mtime_ns = st.st_mtime_ns
+            self._mode = mode
+            self._loaded_path = path
             return
         try:
             devices = load_device_tokens(path)
@@ -179,12 +196,12 @@ class DeviceTokenFile:
             LOG.error("device token file %s rejected: %s", path, exc)
             self._devices = ()
             self._mtime_ns = st.st_mtime_ns
+            self._mode = mode
             self._loaded_path = path
             return
-        if st.st_mode & (stat.S_IRGRP | stat.S_IWGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IWOTH | stat.S_IXOTH):
-            LOG.warning("device token file %s is readable by group or others; chmod 600", path)
         self._devices = tuple(devices)
         self._mtime_ns = st.st_mtime_ns
+        self._mode = mode
         self._loaded_path = path
         LOG.info(
             "loaded %d device token(s) from %s: %s",
@@ -242,10 +259,13 @@ def authorize(
     store = tokens if tokens is not None else TOKENS
     if DEVICE_TOKEN_HEADER in headers:
         presented = headers.get(DEVICE_TOKEN_HEADER, "").strip()
-        device_id = store.device_id_for(presented)
-        if not device_id:
-            return AuthDecision(ok=False, reason="rejected")
-        return AuthDecision(ok=True, device_id=device_id)
+        # An empty header is absent. A non-empty wrong token still rejects and
+        # does not fall through to a bearer that happens to be valid.
+        if presented:
+            device_id = store.device_id_for(presented)
+            if not device_id:
+                return AuthDecision(ok=False, reason="rejected")
+            return AuthDecision(ok=True, device_id=device_id)
 
     auth = headers.get("authorization", "").strip()
     if auth.lower().startswith("bearer "):
@@ -261,7 +281,7 @@ def authorize(
 def public_route_allowed(method: str, path_only: str, headers: Mapping[str, str]) -> bool:
     """Routes a device token may use on the public entrance."""
     if headers.get("upgrade", "").lower() == "websocket" or "sec-websocket-key" in headers:
-        return True
+        return path_only in _PUBLIC_WS_PATHS
     if (method, path_only) in _PUBLIC_HTTP:
         return True
     return method == "POST" and OUTBOX_ACK_RE.match(path_only) is not None

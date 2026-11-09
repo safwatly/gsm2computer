@@ -15,7 +15,7 @@ table inet gsm2computer {
 		tcp dport __TLS_PORT__ accept comment "public tls audio entrance"
 		udp dport __TS_PORT__ accept comment "tailscale wireguard"
 		ip protocol icmp icmp type { destination-unreachable, time-exceeded } accept comment "pmtu"
-		ip6 nexthdr ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept comment "pmtu6"
+		meta l4proto icmpv6 icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept comment "pmtu6-and-nd"
 		tcp dport { 21118, 21125-21129 } counter drop comment "rustdesk-not-public"
 		udp dport { 21118, 21125-21129 } counter drop comment "rustdesk-not-public"
 		counter drop comment "default deny on the public interface"

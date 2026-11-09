@@ -139,6 +139,17 @@ class Ws:
         except OSError:
             pass
 
+    def drop(self) -> None:
+        """TCP close without a 1000 frame, so the hub treats it as a link gap."""
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
 
 def wait_idle(base: str, timeout: float = 8.0) -> dict:
     deadline = time.monotonic() + timeout
@@ -153,9 +164,17 @@ def wait_idle(base: str, timeout: float = 8.0) -> dict:
     raise AssertionError(f"call slot stayed busy: {last}")
 
 
-def place_loopback(base_ws: tuple[str, int], health_url: str, headers: dict[str, str], ssl_ctx=None) -> dict:
+def place_loopback(
+    base_ws: tuple[str, int],
+    health_url: str,
+    headers: dict[str, str],
+    ssl_ctx=None,
+    path: str = "/loopback",
+    expect_echo: bool = True,
+    hangup: str = "clean",
+) -> dict:
     host, port = base_ws
-    ws = Ws(host, port, "/loopback", headers, ssl_ctx=ssl_ctx)
+    ws = Ws(host, port, path, headers, ssl_ctx=ssl_ctx)
     if ws.status != 101:
         ws.close()
         raise AssertionError(f"expected 101, got {ws.status}: {ws.head[:300]}")
@@ -176,14 +195,15 @@ def place_loopback(base_ws: tuple[str, int], health_url: str, headers: dict[str,
         raise AssertionError("no session.updated")
     deadline = time.monotonic() + 8
     tone = bytes([0x00, 0x7F, 0xFF, 0x80]) * 40
-    ws.send_text(json.dumps({
-        "type": "input_audio_buffer.append",
-        "audio": base64.b64encode(tone).decode("ascii"),
-        "format": "audio/pcmu",
-        "rate": 8000,
-    }))
     echo = None
-    while time.monotonic() < deadline:
+    if expect_echo:
+        ws.send_text(json.dumps({
+            "type": "input_audio_buffer.append",
+            "audio": base64.b64encode(tone).decode("ascii"),
+            "format": "audio/pcmu",
+            "rate": 8000,
+        }))
+    while expect_echo and time.monotonic() < deadline:
         text = ws.recv_text(12)
         if not text:
             break
@@ -196,11 +216,18 @@ def place_loopback(base_ws: tuple[str, int], health_url: str, headers: dict[str,
             raise AssertionError(f"audio error: {event}")
     status, _, body = http(health_url)
     health = json.loads(body) if status == 200 else {"http": status, "body": body.decode("utf-8", "replace")[:400]}
-    ws.close()
-    if echo is None:
+    if hangup == "drop":
+        ws.drop()
+    elif hangup == "stay":
+        pass
+    else:
+        ws.close()
+    echoed = b""
+    if echo is not None:
+        echoed = base64.b64decode(echo.get("delta") or "")
+    if expect_echo and echoed != tone:
         raise AssertionError(f"no audio echo; health={health}")
-    echoed = base64.b64decode(echo.get("delta") or "")
-    return {
+    result = {
         "session_entrance": (session.get("session") or {}).get("entrance"),
         "session_id": (session.get("session") or {}).get("id"),
         "echo_bytes": len(echoed),
@@ -208,6 +235,9 @@ def place_loopback(base_ws: tuple[str, int], health_url: str, headers: dict[str,
         "health_status": status,
         "health_call": health.get("call"),
     }
+    if hangup == "stay":
+        result["ws"] = ws
+    return result
 
 
 def main() -> int:
@@ -269,15 +299,55 @@ def main() -> int:
     status, _, _ = http(pub + f"/sms/outbox/{outbox_id}/ack", "POST", good, ack)
     check("public-outbox-ack", status == 200, {"status": status})
 
-    wait_idle(ts)
-    public_call = place_loopback(("127.0.0.1", int(env["PUBLIC_PORT"])), ts + "/health", good)
+    status, _, body = http(ts + "/switchboard/state")
+    mode_before = json.loads(body).get("mode") if status == 200 else None
+    ws_headers = {
+        **good,
+        "Upgrade": "websocket",
+        "Connection": "Upgrade",
+        "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+        "Sec-WebSocket-Version": "13",
+    }
+    status, _, _ = http(pub + "/loopback", headers=ws_headers)
+    check("public-loopback-forbidden", status == 404, {"status": status})
+    status, _, _ = http(pub + "/e2e-test", headers=ws_headers)
+    check("public-e2e-forbidden", status == 404, {"status": status})
+    status, _, _ = http(
+        pub + "/switchboard/mode",
+        "POST",
+        good,
+        json.dumps({"mode": "loopback"}).encode(),
+    )
+    check("public-switchboard-forbidden", status == 404, {"status": status})
+    status, _, body = http(
+        pub + "/sms",
+        "POST",
+        good,
+        json.dumps({"from": "+15551212", "body": "MODE loopback"}).encode(),
+    )
+    sms_body = json.loads(body)
+    status_mode, _, mode_body = http(ts + "/switchboard/state")
+    mode_after = json.loads(mode_body).get("mode") if status_mode == 200 else None
     check(
-        "public-loopback",
+        "public-sms-command-ignored",
+        status == 200 and sms_body.get("commandIgnored") is True and mode_after == mode_before,
+        {"status": status, "mode": mode_after},
+    )
+
+    wait_idle(ts)
+    public_call = place_loopback(
+        ("127.0.0.1", int(env["PUBLIC_PORT"])),
+        ts + "/health",
+        good,
+        path="/",
+        expect_echo=False,
+    )
+    check(
+        "public-call",
         public_call["session_entrance"] == "public"
-        and public_call["echo_matches"]
         and (public_call["health_call"] or {}).get("path") == "public"
         and (public_call["health_call"] or {}).get("entrance") == "public"
-        and (public_call["health_call"] or {}).get("route") == "/loopback"
+        and (public_call["health_call"] or {}).get("route") == "/"
         and (public_call["health_call"] or {}).get("device_id") == "moto-g84",
         public_call,
     )
@@ -292,15 +362,81 @@ def main() -> int:
     status, _, body = http(ts + "/calls", "POST", body=call_body)
     stored = json.loads(body)["call"]
     check("public-call-report", status == 201 and stored["path"] == "public", {"status": status, "path": stored.get("path")})
+    lied = json.dumps({
+        "direction": "in",
+        "number": "+15550005555",
+        "started_at": "2026-11-08T18:05:00Z",
+        "duration_sec": 1,
+        "session_id": "hub-not-ours",
+        "path": "public",
+    }).encode()
+    status, _, body = http(ts + "/calls", "POST", body=lied)
+    check(
+        "unknown-session-not-client-path",
+        status == 201 and json.loads(body)["call"]["path"] is None,
+        {"status": status, "path": json.loads(body)["call"].get("path")},
+    )
+    omitted = json.dumps({
+        "direction": "in",
+        "number": "+15550006666",
+        "started_at": "2026-11-08T18:06:00Z",
+        "duration_sec": 1,
+        "path": "tailscale",
+    }).encode()
+    status, _, body = http(ts + "/calls", "POST", body=omitted)
+    check(
+        "omitted-session-unknown",
+        status == 201 and json.loads(body)["call"]["path"] is None,
+        {"status": status, "path": json.loads(body)["call"].get("path")},
+    )
 
-    legacy_call = place_loopback(("127.0.0.1", int(env["TAILSCALE_PORT"])), ts + "/health", legacy)
+    legacy_call = place_loopback(
+        ("127.0.0.1", int(env["TAILSCALE_PORT"])),
+        ts + "/health",
+        legacy,
+        hangup="stay",
+    )
     check(
         "tailscale-legacy-loopback",
         legacy_call["session_entrance"] == "tailscale"
         and legacy_call["echo_matches"]
         and (legacy_call["health_call"] or {}).get("path") == "tailscale"
         and (legacy_call["health_call"] or {}).get("device_id") is None,
-        legacy_call,
+        {key: value for key, value in legacy_call.items() if key != "ws"},
+    )
+    legacy_call["ws"].drop()
+    relink_headers = {**good, "X-Gsm-Call-Session": legacy_call["session_id"]}
+    relinked = None
+    deadline = time.monotonic() + 3
+    last_error = "relink did not attach"
+    while time.monotonic() < deadline:
+        try:
+            candidate = place_loopback(
+                ("127.0.0.1", int(env["PUBLIC_PORT"])),
+                ts + "/health",
+                relink_headers,
+                path="/",
+                expect_echo=False,
+            )
+            if (
+                candidate["session_id"] == legacy_call["session_id"]
+                and candidate["session_entrance"] == "public"
+            ):
+                relinked = candidate
+                break
+            last_error = "relink opened a different session"
+        except AssertionError as exc:
+            last_error = str(exc)
+            time.sleep(0.1)
+    if relinked is None:
+        raise AssertionError(last_error)
+    check(
+        "cross-entrance-relink",
+        relinked["session_entrance"] == "public"
+        and relinked["session_id"] == legacy_call["session_id"]
+        and (relinked["health_call"] or {}).get("path") == "public"
+        and (relinked["health_call"] or {}).get("entrance") == "public",
+        {key: value for key, value in relinked.items() if key != "ws"},
     )
     wait_idle(ts)
     token_call = place_loopback(("127.0.0.1", int(env["TAILSCALE_PORT"])), ts + "/health", good)
@@ -382,11 +518,19 @@ def main() -> int:
         tls_health = json.loads(body)
         check("caddy-good-token", status == 200 and tls_health["ok"], {"status": status})
         wait_idle(ts)
-        tls_call = place_loopback(("127.0.0.1", caddy_note["port"]), ts + "/health", good, ssl_ctx=ctx)
+        tls_call = place_loopback(
+            ("127.0.0.1", caddy_note["port"]),
+            ts + "/health",
+            good,
+            ssl_ctx=ctx,
+            path="/",
+            expect_echo=False,
+        )
         check(
-            "caddy-loopback",
-            tls_call["session_entrance"] == "public" and tls_call["echo_matches"]
-            and (tls_call["health_call"] or {}).get("path") == "public",
+            "caddy-call",
+            tls_call["session_entrance"] == "public"
+            and (tls_call["health_call"] or {}).get("path") == "public"
+            and (tls_call["health_call"] or {}).get("route") == "/",
             tls_call,
         )
         wait_idle(ts)

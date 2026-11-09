@@ -8,7 +8,7 @@ Auth v1 is Tailscale mesh only ([ADR 0006](../adr/0006-portal-messaging.md)). Ma
 |---------|-----|----------------------|
 | OpenClaw Control UI / Talk | `https://hub.mining-ling.ts.net/chat/main` | Yes (Tailscale Serve + HTTPS Certificates in admin) |
 | gsm2computer portal (PWA) | `https://portal.mining-ling.ts.net/` (userspace sibling Serve) | Yes (Let’s Encrypt via Tailscale) |
-| Hub health / Pixel API | `http://hub.mining-ling.ts.net:8787` (hub binds `100.101.181.110:8787`) | No |
+| Hub health / Pixel API | `http://hub.mining-ling.ts.net:8787` (hub binds `100.113.222.47:8787`) | No |
 | NICE DCV | `https://…:8443` | No — DCV cert, unrelated to Tailscale |
 
 **Legacy hostname** (before rename): `ip-172-31-21-244.mining-ling.ts.net` → replace with `hub.mining-ling.ts.net` everywhere after `tailscale set --hostname=hub` (or admin rename).
@@ -65,7 +65,7 @@ tailscale status --json | jq -r '.Self.DNSName'   # expect hub.mining-ling.ts.ne
 
 Then update bookmarks and docs: `ip-172-31-21-244` → `hub`. Talk Chromium profile URL: `https://hub.mining-ling.ts.net/chat/main`.
 
-Pixel outbound SMS / call upload: default `http://hub.mining-ling.ts.net:8787` (hub binds `100.101.181.110:8787`).
+Pixel outbound SMS / call upload: default `http://hub.mining-ling.ts.net:8787` (hub binds `100.113.222.47:8787`).
 
 ## Portal HTTPS (future)
 

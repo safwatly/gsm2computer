@@ -95,7 +95,7 @@ The Tailscale `/health` is `200`. The loopback public `/health` without a token 
 
 ### 4. Caddy
 
-Confirm nothing else owns public port 443 (`ss -ltnp 'sport = :443'`). Tailscale Serve on the tailnet is a different interface and stays as it is.
+Tailscale Serve already listens on the tailnet address at `:443`. Caddy must bind only `62.83.35.197:443`, including the TLS-ALPN challenge. `GSM2COMPUTER_PUBLIC_BIND` in the env file is that address. An empty value or `0.0.0.0` is not a valid deploy.
 
 ```bash
 sudo install -d -m 755 /etc/gsm2computer
@@ -104,7 +104,7 @@ sudo cp deploy/cup/public-entrance.env.example /etc/gsm2computer/public-entrance
 sudoedit /etc/gsm2computer/public-entrance.env
 ```
 
-Set `GSM2COMPUTER_ACME_EMAIL` to a mailbox you read, and the hostname if you did not use `gsm.ta3leam.com`.
+Set `GSM2COMPUTER_ACME_EMAIL` to a mailbox you read, and the hostname if you did not use `gsm.ta3leam.com`. Leave `GSM2COMPUTER_PUBLIC_BIND=62.83.35.197`.
 
 ```bash
 sudo cp deploy/cup/gsm2computer-caddy.service /etc/systemd/system/gsm2computer-caddy.service
@@ -113,7 +113,7 @@ sudo systemctl enable --now gsm2computer-caddy.service
 sudo journalctl -u gsm2computer-caddy.service -n 50 --no-pager
 ```
 
-The log should show a certificate obtained for the hostname. Then, from a machine that is **not** on Tailscale:
+The log should show a certificate obtained for the hostname. `ss -ltnp 'sport = :443'` should show Caddy on `62.83.35.197:443` and Tailscale Serve still on the tailnet address. Then, from a machine that is **not** on Tailscale:
 
 ```bash
 curl -sS -o /dev/null -w '%{http_code}\n' https://gsm.ta3leam.com/health
@@ -159,7 +159,7 @@ sudo GSM2COMPUTER_PUBLIC_IF=<nic> GSM2COMPUTER_NFT_ROLLBACK_S=300 \
 3. From outside: RustDesk ports and `8790` and `8787` on the public IP do not accept. `tailscale0` still reaches the hub and RustDesk.
 4. `sudo deploy/cup/gsm2computer-nft.sh confirm`
 
-`confirm` cancels the timer, writes `/etc/nftables.d/gsm2computer.nft`, and enables `gsm2computer-nft.service` so the table loads on boot.
+`confirm` writes `/etc/nftables.d/gsm2computer.nft` and enables `gsm2computer-nft.service` before it cancels the rollback timer. The unit does not delete the table on stop. The public interface also allows IPv6 neighbor discovery, so the host's IPv6 neighbors survive cache expiry. `revert` is how the table comes off.
 
 ## Rollback
 

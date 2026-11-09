@@ -19,6 +19,8 @@ STATE_DIR=${GSM2COMPUTER_NFT_STATE:-/run/gsm2computer-nft}
 PERSIST_PATH=${GSM2COMPUTER_NFT_PERSIST:-/etc/nftables.d/gsm2computer.nft}
 UNIT_NAME=${GSM2COMPUTER_NFT_UNIT:-gsm2computer-nft.service}
 ROLLBACK_UNIT=${GSM2COMPUTER_NFT_ROLLBACK_UNIT:-gsm2computer-nft-rollback.service}
+SBIN_DIR=${GSM2COMPUTER_NFT_SBIN:-/usr/local/sbin}
+UNIT_DEST=${GSM2COMPUTER_NFT_UNIT_DEST:-/etc/systemd/system/$UNIT_NAME}
 ROLLBACK_S=${GSM2COMPUTER_NFT_ROLLBACK_S:-180}
 ROLLBACK_MODE=${GSM2COMPUTER_NFT_ROLLBACK_MODE:-systemd}
 PUBLIC_IP=${GSM2COMPUTER_PUBLIC_IP:-62.83.35.197}
@@ -127,6 +129,14 @@ disarm_timer() {
   rm -f "$STATE_DIR/rollback-armed"
 }
 
+systemctl_cmd() {
+  if [[ -n "${GSM2COMPUTER_NFT_SYSTEMCTL:-}" ]]; then
+    "$GSM2COMPUTER_NFT_SYSTEMCTL" "$@"
+  else
+    systemctl "$@"
+  fi
+}
+
 arm_timer() {
   mkdir -p "$STATE_DIR"
   # A second apply must not leave the previous timer armed. That timer still
@@ -211,15 +221,18 @@ case "$cmd" in
     ;;
   confirm)
     [[ -f "$STATE_DIR/pending.nft" ]] || die "nothing to confirm; run apply first"
-    disarm_timer
-    rm -f "$STATE_DIR/baseline.nft" "$STATE_DIR/baseline.mode"
+    # Persist and enable first. The rollback timer and the baseline stay until
+    # that succeeds, so a failed confirm can still revert.
     install -d -m 0755 "$(dirname "$PERSIST_PATH")"
     install -m 0644 "$STATE_DIR/pending.nft" "$PERSIST_PATH"
-    install -d -m 0755 /usr/local/sbin
-    install -m 0755 "$SCRIPT_PATH" /usr/local/sbin/gsm2computer-nft.sh
-    install -m 0644 "$SCRIPT_DIR/gsm2computer-nft.service" "/etc/systemd/system/$UNIT_NAME"
-    systemctl daemon-reload
-    systemctl enable "$UNIT_NAME"
+    install -d -m 0755 "$SBIN_DIR"
+    install -m 0755 "$SCRIPT_PATH" "$SBIN_DIR/gsm2computer-nft.sh"
+    install -d -m 0755 "$(dirname "$UNIT_DEST")"
+    install -m 0644 "$SCRIPT_DIR/gsm2computer-nft.service" "$UNIT_DEST"
+    systemctl_cmd daemon-reload
+    systemctl_cmd enable "$UNIT_NAME"
+    disarm_timer
+    rm -f "$STATE_DIR/baseline.nft" "$STATE_DIR/baseline.mode"
     echo "confirmed. $UNIT_NAME will load $PERSIST_PATH on boot. Rollback timer cancelled."
     ;;
   rollback-now)

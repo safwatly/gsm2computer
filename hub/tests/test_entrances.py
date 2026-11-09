@@ -50,6 +50,18 @@ def _write_tokens() -> None:
     hub.TOKENS.reload_if_needed()
 
 
+async def _raw(port: int, payload: bytes, read_timeout: float = 2.0) -> bytes:
+    asyncio = __import__("asyncio")
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(payload)
+    await writer.drain()
+    try:
+        return await asyncio.wait_for(reader.read(512), read_timeout)
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
 async def _http(
     port: int,
     method: str,
@@ -114,15 +126,60 @@ class TokenUnitTests(unittest.TestCase):
         self.assertIsNone(authorize(legacy, tailscale, tokens).device_id)
         self.assertFalse(authorize(legacy, public, tokens).ok)
         self.assertEqual(authorize({"authorization": f"Bearer {TOKEN}"}, public, tokens).device_id, DEVICE)
+        empty = {"x-gsm-device-token": "  ", "authorization": f"Bearer {TOKEN}"}
+        self.assertEqual(authorize(empty, public, tokens).device_id, DEVICE)
+        both = {"x-gsm-device-token": "x" * 40, "authorization": f"Bearer {TOKEN}"}
+        self.assertEqual(authorize(both, public, tokens).error, "device token rejected")
+
+    def test_world_readable_token_file_is_not_loaded(self) -> None:
+        path = _TMP / "open-tokens.json"
+        if path.exists():
+            path.unlink()
+        write_device_token(path, DEVICE, TOKEN)
+        os.chmod(path, 0o644)
+        tokens = DeviceTokenFile(path)
+        self.assertIsNone(tokens.device_id_for(TOKEN))
+        os.chmod(path, 0o600)
+        self.assertEqual(tokens.device_id_for(TOKEN), DEVICE)
 
     def test_public_allowlist_blocks_portal_and_admin(self) -> None:
+        ws = {"upgrade": "websocket", "sec-websocket-key": "x"}
         self.assertTrue(public_route_allowed("GET", "/health", {}))
         self.assertTrue(public_route_allowed("GET", "/sms/outbox", {}))
         self.assertTrue(public_route_allowed("POST", "/sms/outbox/abc/ack", {}))
-        self.assertTrue(public_route_allowed("GET", "/", {"upgrade": "websocket", "sec-websocket-key": "x"}))
+        self.assertTrue(public_route_allowed("GET", "/", ws))
+        self.assertFalse(public_route_allowed("GET", "/loopback", ws))
+        self.assertFalse(public_route_allowed("GET", "/e2e-test", ws))
+        self.assertFalse(public_route_allowed("GET", "/portal/", ws))
         self.assertFalse(public_route_allowed("GET", "/portal/", {}))
         self.assertFalse(public_route_allowed("POST", "/admin/call/release", {}))
         self.assertFalse(public_route_allowed("POST", "/switchboard/mode", {}))
+
+    def test_call_path_requires_an_observed_session(self) -> None:
+        hub._finished_call_entrances.clear()
+        hub._finished_call_order.clear()
+        if hub.live_call.busy:
+            hub.live_call.release()
+        hub.remember_finished_call("hub-real", "public")
+        self.assertEqual(hub.resolve_call_path("hub-real", "tailscale"), "public")
+        self.assertIsNone(hub.resolve_call_path("hub-other", "public"))
+        self.assertIsNone(hub.resolve_call_path(None, "public"))
+        self.assertIsNone(hub.resolve_call_path("", "tailscale"))
+        hub.live_call.claim("/", entrance="tailscale")
+        hub.live_call.session_id = "hub-live"
+        hub.live_call.note_entrance("tailscale", "")
+        try:
+            self.assertEqual(hub.resolve_call_path("hub-live", "public"), "tailscale")
+            self.assertIsNone(hub.resolve_call_path(None, "tailscale"))
+            self.assertIsNone(hub.resolve_call_path("hub-other", "public"))
+            hub.live_call.note_entrance("public", DEVICE)
+            first = hub.session_description("hub-live", loopback=False, e2e=False)
+            hub.live_call.note_entrance("tailscale", DEVICE)
+            second = hub.session_description("hub-live", loopback=False, e2e=False)
+            self.assertEqual(first["session"]["entrance"], "public")
+            self.assertEqual(second["session"]["entrance"], "tailscale")
+        finally:
+            hub.live_call.release()
 
     def test_snapshot_path_is_the_entrance(self) -> None:
         slot = CallSlot(CallWatchdogConfig(enabled=False))
@@ -263,17 +320,115 @@ class EntranceHttpTests(unittest.IsolatedAsyncioTestCase):
         await writer.wait_closed()
         self.assertTrue(raw.startswith(b"HTTP/1.1 401"))
 
+        status, _, body = await _http(
+            pub,
+            "GET",
+            "/loopback",
+            {**good, "Upgrade": "websocket", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ=="},
+        )
+        self.assertEqual(status, 404)
+        mode_sms = json.dumps({"from": "+15551212", "body": "MODE loopback"}).encode()
+        before = hub.current_mode
+        status, _, body = await _http(pub, "POST", "/sms", good, mode_sms)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["commandIgnored"])
+        self.assertEqual(hub.current_mode, before)
+        status, _, _ = await _http(
+            pub,
+            "POST",
+            "/switchboard/mode",
+            good,
+            json.dumps({"mode": "loopback"}).encode(),
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(hub.current_mode, before)
+
+    async def test_public_ingress_does_not_buffer_unbounded_bodies(self) -> None:
+        pub = self.public.listen_port
+        huge = (
+            "POST /sms HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Length: 8000000\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode()
+        raw = await _raw(pub, huge)
+        self.assertTrue(raw.startswith(b"HTTP/1.1 401"), raw[:80])
+        authed = (
+            "POST /sms HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"X-Gsm-Device-Token: {TOKEN}\r\n"
+            "Content-Length: 8000000\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode()
+        raw = await _raw(pub, authed)
+        self.assertTrue(raw.startswith(b"HTTP/1.1 413"), raw[:80])
+        os.environ["GSM2COMPUTER_HTTP_BODY_TIMEOUT_S"] = "0.3"
+        try:
+            stalled = (
+                "POST /sms HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                f"X-Gsm-Device-Token: {TOKEN}\r\n"
+                "Content-Length: 4\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode()
+            raw = await _raw(pub, stalled, read_timeout=2.0)
+            self.assertTrue(raw.startswith(b"HTTP/1.1 408"), raw[:80])
+        finally:
+            os.environ.pop("GSM2COMPUTER_HTTP_BODY_TIMEOUT_S", None)
+        os.environ["GSM2COMPUTER_HTTP_HEADER_TIMEOUT_S"] = "0.3"
+        try:
+            raw = await _raw(pub, b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n", read_timeout=2.0)
+            self.assertTrue(raw.startswith(b"HTTP/1.1 408"), raw[:80])
+        finally:
+            os.environ.pop("GSM2COMPUTER_HTTP_HEADER_TIMEOUT_S", None)
+        padded = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Pad: " + (b"a" * 20000) + b"\r\n\r\n"
+        raw = await _raw(pub, padded)
+        self.assertTrue(raw.startswith(b"HTTP/1.1 431"), raw[:80])
+
     async def test_call_report_records_observed_entrance(self) -> None:
         hub.remember_finished_call("hub-abc", "public")
         body = json.dumps(
-            {"direction": "in", "number": "+15550003333", "started_at": "2026-11-08T18:00:00Z", "duration_sec": 9}
+            {
+                "direction": "in",
+                "number": "+15550003333",
+                "started_at": "2026-11-08T18:00:00Z",
+                "duration_sec": 9,
+                "session_id": "hub-abc",
+                "path": "tailscale",
+            }
         ).encode()
         status, _, payload = await _http(self.tailscale.listen_port, "POST", "/calls", body=body)
         self.assertEqual(status, 201)
         call = json.loads(payload)["call"]
         self.assertEqual(call["path"], "public")
-        listed = hub.portal_store.list_calls()
-        self.assertEqual(listed[0]["path"], "public")
+        omitted = json.dumps(
+            {
+                "direction": "in",
+                "number": "+15550003334",
+                "started_at": "2026-11-08T18:01:00Z",
+                "duration_sec": 1,
+                "path": "public",
+            }
+        ).encode()
+        status, _, payload = await _http(self.tailscale.listen_port, "POST", "/calls", body=omitted)
+        self.assertEqual(status, 201)
+        self.assertIsNone(json.loads(payload)["call"]["path"])
+        unknown = json.dumps(
+            {
+                "direction": "in",
+                "number": "+15550003335",
+                "started_at": "2026-11-08T18:02:00Z",
+                "duration_sec": 1,
+                "session_id": "hub-not-ours",
+                "path": "public",
+            }
+        ).encode()
+        status, _, payload = await _http(self.tailscale.listen_port, "POST", "/calls", body=unknown)
+        self.assertEqual(status, 201)
+        self.assertIsNone(json.loads(payload)["call"]["path"])
 
     async def test_tailscale_required_flag_uses_the_same_check(self) -> None:
         locked = Entrance("tailscale", "127.0.0.1", 0, True)
@@ -307,8 +462,34 @@ class EnvEntranceTests(unittest.TestCase):
         os.environ["GSM2COMPUTER_TAILSCALE_TOKEN_REQUIRED"] = "1"
         described = {item.name: item.token_required for item in hub.entrances_from_env()}
         self.assertEqual(described, {"tailscale": True, "public": True})
+        os.environ["GSM2COMPUTER_PUBLIC_TOKEN_REQUIRED"] = "0"
+        self.assertEqual([item.name for item in hub.entrances_from_env()], ["tailscale"])
+        os.environ["GSM2COMPUTER_PUBLIC_TOKEN_REQUIRED"] = "1"
+        os.environ["GSM2COMPUTER_PUBLIC_HOST"] = "0.0.0.0"
+        self.assertEqual([item.name for item in hub.entrances_from_env()], ["tailscale"])
         os.environ["GSM2COMPUTER_PUBLIC_ENABLE"] = "0"
+        os.environ["GSM2COMPUTER_PUBLIC_HOST"] = "127.0.0.1"
+        os.environ.pop("GSM2COMPUTER_PUBLIC_TOKEN_REQUIRED", None)
         os.environ["GSM2COMPUTER_TAILSCALE_TOKEN_REQUIRED"] = "0"
+
+
+class PublicBindTests(unittest.IsolatedAsyncioTestCase):
+    async def test_public_bind_failure_keeps_tailscale(self) -> None:
+        blocker = await __import__("asyncio").start_server(lambda r, w: None, "127.0.0.1", 0)
+        port = blocker.sockets[0].getsockname()[1]
+        tail = Entrance("tailscale", "127.0.0.1", 0, False)
+        public = Entrance("public", "127.0.0.1", port, True)
+        servers, active = await hub.start_entrances([tail, public])
+        try:
+            self.assertEqual([item.name for item in active], ["tailscale"])
+            status, _, _ = await _http(tail.listen_port, "GET", "/health")
+            self.assertEqual(status, 200)
+        finally:
+            for server in servers:
+                server.close()
+                await server.wait_closed()
+            blocker.close()
+            await blocker.wait_closed()
 
 
 if __name__ == "__main__":

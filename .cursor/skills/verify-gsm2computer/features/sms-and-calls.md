@@ -23,5 +23,5 @@ python3 .cursor/skills/verify-gsm2computer/scripts/drive-entrances.py
 ## Gotchas
 
 - Claiming the outbox marks the row `sending`. A second poll returns nothing until something is queued again. Don't expect the item to still be pending after a successful public poll.
-- Today's phone posts `/calls` without `session_id` and without `path`. The hub remembers the last finished entrance for 60 seconds (`GSM2COMPUTER_CALL_PATH_STAMP_S`) and uses it when the body has no session id. The drive sends the session id so the stamp is exact.
+- A call report is labeled only when its `session_id` is a socket this process accepted. A missing session id, or a session id the hub does not know, is stored with `path` null. A client-supplied `path` is ignored. Today's bridge omits `session_id`, so those rows stay unknown until the bridge sends the id from `session.updated`.
 - `POST /calls` on the public socket also requires the device token. The drive posts it to the Tailscale socket, which is what today's uploader does.

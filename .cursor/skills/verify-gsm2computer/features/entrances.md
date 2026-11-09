@@ -9,7 +9,7 @@
 - A wrong device token is rejected on both.
 - `Authorization: Bearer hub-token` is the ephemeral mint from `POST /token`. It is not a device secret. It still works on Tailscale and does not open the public entrance.
 - `/health` `call.path` and `call.entrance` are `public` or `tailscale` while a call is up. `call.route` is the WebSocket route.
-- Portal and `/admin/call/release` are not reachable on the public socket, even with a valid device token.
+- Portal, `/admin/call/release`, `/switchboard`, `/loopback`, and `/e2e-test` are not reachable on the public socket, even with a valid device token. Public `POST /sms` with `MODE` stores the SMS and does not change the switchboard.
 - Caddy in front of the public socket. Production uses Let's Encrypt. This skill uses Caddy `tls internal`.
 
 ## How to get to it (user POV)
@@ -24,7 +24,7 @@ The bridge opens `wss://gsm.ta3leam.com/` (after deploy) or `ws://<tailscale-hos
 python3 .cursor/skills/verify-gsm2computer/scripts/drive-entrances.py
 ```
 
-`drive-entrances.py` is the journey: missing token, bad token, good token, legacy bearer, hidden portal, both loopback calls, `/health` during the call, the stored call `path`, and a second hub process with Tailscale token required. It then proxies the public socket through Caddy and repeats a health check and a loopback call over TLS.
+`drive-entrances.py` is the journey: missing token, bad token, good token, legacy bearer, hidden portal and switchboard, public `MODE` ignored, a public `/` call, Tailscale loopback echo, a cross-entrance relink, call reports that stay unknown without a matching session, and a second hub process with Tailscale token required. It then proxies the public socket through Caddy.
 
 ## Gotchas
 

@@ -13,14 +13,14 @@ A caller, or the simulator's loopback mode, connects to the hub WebSocket and sp
 
 ## Driving it with this skill
 
-The entrance drive places three `/loopback` calls: public with the device token, Tailscale with only `Authorization: Bearer hub-token`, and Tailscale with the device token. Each must echo the frame it was sent. A fourth call goes through Caddy's TLS listener and must report `call.path=public`.
+The entrance drive echoes on Tailscale `/loopback` (legacy bearer, then device token). The public socket must reject `/loopback` and `/e2e-test`. A public call on `/` reports `call.path=public` and does not echo. Caddy proxies that same `/` call. A dropped Tailscale `/loopback` relinks on the public `/` socket and `session.updated` then says `public`.
 
 ```bash
 .cursor/skills/verify-gsm2computer/scripts/launch-hub.sh
 python3 .cursor/skills/verify-gsm2computer/scripts/drive-entrances.py
 ```
 
-Evidence keys: `public-loopback`, `tailscale-legacy-loopback`, `tailscale-token-loopback`, `caddy-loopback` in `entrances.json`.
+Evidence keys: `public-loopback-forbidden`, `public-call`, `tailscale-legacy-loopback`, `cross-entrance-relink`, `tailscale-token-loopback`, `caddy-call` in `entrances.json`.
 
 ## Gotchas
 
