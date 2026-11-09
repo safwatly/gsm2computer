@@ -10,9 +10,10 @@ import java.io.OutputStream
 
 /**
  * Build 343 playback on the Moto g84: AudioTrack USAGE_MEDIA preferred onto
- * TYPE_TELEPHONY for the whole call (one beep at the start). Builds 342's
- * later phases (PCM 23 reorder, AFE-proxy, and the post-45s decide) were
- * never called from [start] and are not in this class.
+ * TYPE_TELEPHONY for the whole call. The start-of-call beep overwrote the
+ * first 0.75 s, so it stays off unless `persist.gsm2computer.inject_marker`
+ * is `1`. Builds 342's later phases (PCM 23 reorder, AFE-proxy, and the
+ * post-45s decide) were never called from [start] and are not in this class.
  * Mixers are reverted at stop / call end. Meta keys are inject_*.
  */
 class PhasedInjector(
@@ -67,6 +68,11 @@ class PhasedInjector(
         }
     }
 
+    /**
+     * Replaces the start of the buffer AudioTrack.write will see. One beep is
+     * 0.5 s of tone and 0.25 s of zeros (0.75 s). [RtpSession] records
+     * playbackRms before this runs, and playback.wav after it.
+     */
     private fun applyMarker(pcm: ByteArray) {
         val nb = markerBeeps; if (nb <= 0) return
         val onS = srcRate / 2; val cycle = srcRate * 3 / 4
@@ -122,8 +128,12 @@ class PhasedInjector(
         }
         enableIncallMusic()
         phase = if (again) 4 else 1
-        beeps(1)
-        phaseMark("P1${if (again) "b" else ""}_pixel_audiotrack telephony_found=${dev != null} id=${dev?.id} armed=${track.playState}")
+        val marker = markerBeepCount()
+        if (marker > 0) beeps(marker)
+        phaseMark(
+            "P1${if (again) "b" else ""}_pixel_audiotrack telephony_found=${dev != null} " +
+                "id=${dev?.id} armed=${track.playState} marker=$marker",
+        )
         Thread({
             try {
                 Thread.sleep(1500)
@@ -165,5 +175,16 @@ class PhasedInjector(
         const val DUMP = "/data/local/tmp/moto-calldump.sh"
         const val AFE = "/data/local/tmp/moto-afeproxy.sh"
         fun available(): Boolean = RootShell.execForOutput("ls $BIN $AFE 2>/dev/null", 2000).lines().count { it.isNotBlank() } == 2
+    }
+
+    private fun markerBeepCount(): Int {
+        val flag = try {
+            val cls = Class.forName("android.os.SystemProperties")
+            val get = cls.getMethod("get", String::class.java, String::class.java)
+            get.invoke(null, "persist.gsm2computer.inject_marker", "0") as? String
+        } catch (_: Throwable) {
+            null
+        }
+        return injectMarkerBeeps(flag)
     }
 }

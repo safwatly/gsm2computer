@@ -387,6 +387,12 @@ class HubStreamClient(
         }
     }
 
+    /**
+     * OkHttp calls this on its reader thread. It parses one JSON event and
+     * queues PCM. It does not take the playback lock, write the uplink, or
+     * wait on a socket. A block here would stop the reader, close the TCP
+     * window, and hold the hub's downlink in the kernel buffer.
+     */
     private fun handleEvent(text: String, sink: MediaTransport.Sink?) {
         if (sink == null) return
         val json = try {

@@ -1034,6 +1034,10 @@ class PipewireBridge:
             # outage and used to abort the call after 5 s). Queue while the
             # backlog is small, drop stale frames beyond it, and only give up
             # when queued bytes make no progress for DOWNLINK_DEAD_S.
+            # admit() watches the asyncio buffer only, not the kernel SO_SNDBUF.
+            # A multi-second pause on the public path can sit entirely in the
+            # kernel: every frame is still written, sequence numbers stay
+            # contiguous, and the phone sees one late burst.
             guard = self.downlink_guard
             ws_writer = self._out_writer
             if ws_writer is None or writer_closing(ws_writer):

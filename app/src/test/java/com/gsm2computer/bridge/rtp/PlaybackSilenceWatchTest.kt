@@ -7,9 +7,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * No handset and no GSM call. A rebuild is what build 347 logs as
- * `playback silence: rebuilding AudioTrack`. Prebuffer and a single sample
- * must not rebuild: that toggles incall_music on the Moto HAL.
+ * No handset and no GSM call. A rebuild is what the bridge logs as
+ * `playback silence: rebuilding AudioTrack`. The first window can rebuild
+ * call-start silence in about a second. Prebuffer, a single sample, and a
+ * head that keeps stepping must not rebuild: that toggles incall_music.
  */
 class PlaybackSilenceWatchTest {
 
@@ -21,20 +22,69 @@ class PlaybackSilenceWatchTest {
             decision = watch.observe(t, inputRms = 4_000, playRms = 4_000, headAdvanced = true, eligible = true)
         }
         assertFalse(decision.rebuild)
+        assertTrue(decision.evaluated)
+        assertEquals(0L, decision.silentMs)
     }
 
     @Test
-    fun playRmsStaysZeroWhileWrittenSpeechContinues() {
+    fun callStartPlayRmsZeroRebuildsWithinTwoSeconds() {
         val watch = PlaybackSilenceWatch()
         var decision = PlaybackSilenceWatch.Decision(false)
-        for (t in 0L..2_980L step 20L) {
+        for (t in 0L..980L step 20L) {
+            decision = watch.observe(t, inputRms = 3_200, playRms = 0, headAdvanced = true, eligible = true)
+            assertFalse(decision.rebuild)
+            assertFalse(decision.evaluated)
+        }
+        decision = watch.observe(1_000L, inputRms = 3_200, playRms = 0, headAdvanced = true, eligible = true)
+        assertTrue(decision.rebuild)
+        assertTrue(decision.evaluated)
+        assertTrue(decision.silentMs >= 600L)
+        assertTrue(decision.reason.contains("call-start"))
+        assertTrue(decision.reason.contains("playRMS=0"))
+        assertTrue(decision.reason.contains("rx speech"))
+    }
+
+    @Test
+    fun callStartZerosThenLoudFramesDoNotRebuild() {
+        val watch = PlaybackSilenceWatch()
+        var decision = PlaybackSilenceWatch.Decision(false)
+        for (t in 0L..640L step 20L) {
             decision = watch.observe(t, inputRms = 3_200, playRms = 0, headAdvanced = true, eligible = true)
             assertFalse(decision.rebuild)
         }
-        decision = watch.observe(3_000L, inputRms = 3_200, playRms = 0, headAdvanced = true, eligible = true)
+        for (t in 660L..3_000L step 20L) {
+            decision = watch.observe(t, inputRms = 3_200, playRms = 4_000, headAdvanced = true, eligible = true)
+            assertFalse(decision.rebuild)
+        }
+    }
+
+    @Test
+    fun silenceReasonQuotesTheQuietRunNotTheLoudestFrame() {
+        val watch = PlaybackSilenceWatch()
+        watch.observe(0L, inputRms = 3_200, playRms = 4_000, headAdvanced = true, eligible = true)
+        watch.observe(20L, inputRms = 3_200, playRms = 4_000, headAdvanced = true, eligible = true)
+        var decision = PlaybackSilenceWatch.Decision(false)
+        for (t in 40L..1_000L step 20L) {
+            decision = watch.observe(t, inputRms = 3_200, playRms = 0, headAdvanced = true, eligible = true)
+        }
         assertTrue(decision.rebuild)
         assertTrue(decision.reason.contains("playRMS=0"))
-        assertTrue(decision.reason.contains("rx speech"))
+        assertFalse(decision.reason.contains("4000"))
+    }
+
+    @Test
+    fun afterAHealthyWindowAShortSilenceDoesNotRebuild() {
+        val watch = PlaybackSilenceWatch()
+        var decision = PlaybackSilenceWatch.Decision(false)
+        for (t in 0L..3_000L step 20L) {
+            decision = watch.observe(t, inputRms = 4_000, playRms = 4_000, headAdvanced = true, eligible = true)
+        }
+        assertFalse(decision.rebuild)
+        assertTrue(decision.evaluated)
+        for (t in 3_020L..3_720L step 20L) {
+            decision = watch.observe(t, inputRms = 3_200, playRms = 0, headAdvanced = true, eligible = true)
+            assertFalse(decision.rebuild)
+        }
     }
 
     @Test
@@ -123,6 +173,13 @@ class PlaybackSilenceWatchTest {
         assertEquals(true, playbackRebuildOnRoute(routedType = 2, telephonyType = 18))
         assertEquals(false, playbackRebuildOnRoute(routedType = 18, telephonyType = 18))
         assertNull(playbackRebuildOnRoute(routedType = -1, telephonyType = 18))
+    }
+
+    @Test
+    fun retoggleOnlyWhenTheTrackIsNotOnTelephony() {
+        assertFalse(incallRetoggleNeeded(routedType = 18, telephonyType = 18))
+        assertTrue(incallRetoggleNeeded(routedType = 2, telephonyType = 18))
+        assertTrue(incallRetoggleNeeded(routedType = -1, telephonyType = 18))
     }
 
     @Test

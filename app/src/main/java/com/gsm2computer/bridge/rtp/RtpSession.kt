@@ -88,13 +88,22 @@ class RtpSession(
     // Previous capacity=3 was too aggressive: any slight jitter caused
     // packet drops and choppy audio.
     //
-    // WS transport mode uses a much larger buffer (≈10s): OpenAI streams a whole
-    // response faster than real time in a burst, and the playback loop paces it
-    // out at 20ms/frame. The drain-excess logic is disabled in WS mode so the
-    // burst isn't discarded (see playbackLoop).
-    private class QueuedDownlink(val bytes: ByteArray, val energy: Int)
+    // WS mode keeps up to 10 s so a fast hub burst is not dropped on arrival.
+    // A stall that then delivers that burst is trimmed by [trimDownlink]:
+    // silence first, then oldest speech past 2 s. UDP still drains above 100 ms.
+    private class QueuedDownlink(
+        val bytes: ByteArray,
+        val energy: Int,
+        var splice: Boolean = false,
+    )
 
     private val jitterBuffer = ArrayBlockingQueue<QueuedDownlink>(if (transport != null) 500 else 8)
+    private val downlinkLock = Any()
+    private val downlinkRx = DownlinkRxGaps()
+    private var armNextSplice = false
+    private var dlCatchupSilence = 0
+    private var dlCatchupSpeech = 0
+    private var dlCatchupSped = 0
 
     // RTP inactivity tracking
     @Volatile private var lastRtpReceivedTime = 0L
@@ -459,6 +468,23 @@ class RtpSession(
 
         try { transport?.stop() } catch (_: Exception) {}
 
+        val entrance = try {
+            transport?.currentLink()?.entrance?.ifBlank { "-" } ?: "-"
+        } catch (_: Exception) {
+            "-"
+        }
+        val rxLine = "downlink rx entrance=$entrance maxGapMs=${downlinkRx.maxGapMs} " +
+            "stalls=${downlinkRx.stalls} catchupSilence=$dlCatchupSilence " +
+            "catchupSpeech=$dlCatchupSpeech catchupSped=$dlCatchupSped seqGaps=$dlSeqGaps"
+        Log.i(TAG, rxLine)
+        BridgeLog.i(rxLine)
+        listener?.onRtpStats(rxLine)
+        captureTap?.putMeta("dl_max_rx_gap_ms", downlinkRx.maxGapMs)
+        captureTap?.putMeta("dl_rx_stalls", downlinkRx.stalls)
+        captureTap?.putMeta("dl_catchup_silence", dlCatchupSilence)
+        captureTap?.putMeta("dl_catchup_speech", dlCatchupSpeech)
+        captureTap?.putMeta("dl_catchup_sped", dlCatchupSped)
+
         captureTap?.close()
         captureTap = null
 
@@ -477,6 +503,19 @@ class RtpSession(
      */
     private val transportSink = object : MediaTransport.Sink {
         override fun onAudio(frame: ByteArray, format: String, rate: Int) {
+            val gapMs = downlinkRx.onFrame(System.currentTimeMillis())
+            if (gapMs >= 250L) {
+                val entrance = try {
+                    transport?.currentLink()?.entrance?.ifBlank { "-" } ?: "-"
+                } catch (_: Exception) {
+                    "-"
+                }
+                val line = "downlink rx stall gapMs=$gapMs stalls=${downlinkRx.stalls} " +
+                    "maxGapMs=${downlinkRx.maxGapMs} entrance=$entrance"
+                Log.w(TAG, line)
+                BridgeLog.w(line)
+                listener?.onRtpStats(line)
+            }
             val fmt = format.ifBlank { "audio/pcmu" }
             val hz = if (rate > 0) rate else 8000
             if (fmt != inboundFormat || hz != inboundRate) {
@@ -500,10 +539,7 @@ class RtpSession(
                 val energy = FrameEnergy.rms(slice, inboundFormat)
                 rxPacketCount++
                 val queued = QueuedDownlink(slice, energy)
-                if (!jitterBuffer.offer(queued)) {
-                    jitterBuffer.poll()
-                    jitterBuffer.offer(queued)
-                }
+                offerDownlink(queued)
             }
         }
 
@@ -517,7 +553,10 @@ class RtpSession(
 
         override fun onFlushPlayback() {
             // Caller barged in — discard queued agent audio so we stop talking.
-            jitterBuffer.clear()
+            synchronized(downlinkLock) {
+                jitterBuffer.clear()
+                armNextSplice = false
+            }
         }
 
         override fun onStatus(msg: String) {
@@ -941,8 +980,10 @@ class RtpSession(
 
     private fun timeoutLoop() {
         // Early re-assertion at 3s: combat Android re-revoking RECORD_AUDIO
-        // when screen is off, and re-toggle incall_music after speaker route
-        // is fully settled (~1.5s after configureAudioBridge).
+        // when the screen is off. incall_music is re-toggled only if the
+        // playback track is not already on TYPE_TELEPHONY. A second
+        // false→true on that route tears the usecase down and the greeting
+        // is gone until the HAL brings it back.
         try { Thread.sleep(3_000) } catch (_: InterruptedException) { return }
         if (running.get()) {
             reAssertAppOps()
@@ -1050,13 +1091,15 @@ class RtpSession(
     private var dlPrebufferWaits = 0L
     private val dlPerSec = org.json.JSONArray()
     private val jbTargetFrames = 15   // 300 ms prebuffer after silence
-    private val jbMaxFrames = 75      // >1.5 s behind -> drop oldest
-    private val jbCatchupFrames = 25  // catch up to 500 ms
 
     /**
-     * New track every call, and again when playback goes silent. Preferred
-     * device is set only while the track is stopped. setPreferredDevice on a
-     * playing track is what produces restoreTrack_l.
+     * New track every call, and again when playback goes silent. The public
+     * builder cannot pass a device into native_setup, so the first IAudioTrack
+     * is on the default output. setPreferredDevice while that track is stopped
+     * is what logs `restoreTrack_l ... from setOutputDevice()`: AudioFlinger
+     * replaces the native track so the replacement is created on the selected
+     * device. Volume is applied after that replacement. Doing the same call
+     * while the track is playing invalidates it instead.
      */
     private fun createPlaybackTrack(usage: Int, contentType: Int): AudioTrack? {
         val playRates = if (wsMode) listOf(48000, 16000, 8000) else listOf(playbackRate)
@@ -1109,25 +1152,49 @@ class RtpSession(
     }
 
     private fun armPlaybackTrack(track: AudioTrack) {
-        try {
-            track.setVolume(1f)
-        } catch (_: Exception) {
-        }
         val dev = telephonyOutput()
         if (dev != null && track.playState != AudioTrack.PLAYSTATE_PLAYING) {
             val ok = try {
                 track.setPreferredDevice(dev)
+                true
             } catch (e: Exception) {
                 Log.w(TAG, "setPreferredDevice failed: ${e.message}")
                 false
             }
-            Log.i(TAG, "AudioTrack armed on TYPE_TELEPHONY: $ok (id=${dev.id})")
+            Log.i(
+                TAG,
+                "setPreferredDevice TYPE_TELEPHONY id=${dev.id} while stopped " +
+                    "(AudioFlinger restoreTrack_l from setOutputDevice): $ok",
+            )
         } else if (profile.routing.playbackToTelephony && dev == null) {
             Log.w(TAG, "TYPE_TELEPHONY device not found — playback will use default device")
+        }
+        try {
+            track.setVolume(1f)
+        } catch (_: Exception) {
         }
         if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
             track.play()
         }
+        primePlayback(track)
+    }
+
+    /** One 20 ms silence write so incall_music sees an active STREAM_MUSIC output. */
+    private fun primePlayback(track: AudioTrack) {
+        val bytes = (playbackRate.coerceAtLeast(8_000) * 2 / 50).coerceAtMost(4_096)
+        val silence = ByteArray(bytes)
+        val wrote = try {
+            track.write(silence, 0, silence.size)
+        } catch (e: Exception) {
+            Log.w(TAG, "playback prime failed: ${e.message}")
+            -1
+        }
+        val routed = try {
+            track.routedDevice?.type ?: -1
+        } catch (_: Exception) {
+            -1
+        }
+        Log.i(TAG, "playback primed $wrote bytes before incall_music routed=$routed")
     }
 
     private fun applyPlaybackRoute(routedType: Int) {
@@ -1225,12 +1292,112 @@ class RtpSession(
             advanced,
             eligible,
         )
+        if (decision.evaluated) {
+            val routed = try {
+                track.routedDevice?.type ?: -1
+            } catch (_: Exception) {
+                -1
+            }
+            val verdict = if (decision.rebuild) "rebuild (${decision.reason})" else "hold"
+            val line = "playback silence: eval silentMs=${decision.silentMs} " +
+                "stallMs=${decision.stallMs} maxIn=${decision.maxInput} maxPlay=${decision.maxPlay} " +
+                "routed=$routed -> $verdict"
+            Log.i(TAG, line)
+            BridgeLog.i(line)
+            listener?.onRtpStats(line)
+        }
         val leftTelephony = playbackRebuild.getAndSet(false)
         if (!running.get()) return
         if (decision.rebuild) {
             rebuildPlaybackTrack(decision.reason)
         } else if (leftTelephony) {
             rebuildPlaybackTrack("left TYPE_TELEPHONY")
+        }
+    }
+
+    /**
+     * Silence first, then oldest speech past 2 s. Runs on the playback thread.
+     * [onAudio] takes [downlinkLock] too, so a burst cannot land in the middle
+     * of the rebuild and a barge-in flush cannot be undone by offering it back.
+     */
+    private fun trimDownlink() {
+        if (jitterBuffer.size <= DownlinkCatchup.TARGET_FRAMES) return
+        var silence = 0
+        var speech = 0
+        var gap = 0
+        var kept = 0
+        synchronized(downlinkLock) {
+            if (jitterBuffer.size <= DownlinkCatchup.TARGET_FRAMES) return
+            val held = ArrayList<QueuedDownlink>()
+            while (true) {
+                val item = jitterBuffer.poll() ?: break
+                held.add(item)
+            }
+            val plan = DownlinkCatchup.trim(IntArray(held.size) { held[it].energy })
+            silence = plan.silenceDropped
+            speech = plan.speechDropped
+            val keptFrames = ArrayList<QueuedDownlink>()
+            for (i in held.indices) {
+                if (!plan.keep[i]) continue
+                held[i].splice = held[i].splice || plan.splice[i]
+                keptFrames.add(held[i])
+            }
+            if (keptFrames.size > DownlinkCatchup.TARGET_FRAMES) {
+                val energies = IntArray(keptFrames.size) { keptFrames[it].energy }
+                val flags = BooleanArray(keptFrames.size) { keptFrames[it].splice }
+                val drained = DownlinkCatchup.dropLowest(energies, flags)
+                if (drained != null) {
+                    val droppedLast = drained.droppedIndex == keptFrames.lastIndex
+                    keptFrames.removeAt(drained.droppedIndex)
+                    for (i in keptFrames.indices) keptFrames[i].splice = drained.splice[i]
+                    if (droppedLast) armNextSplice = true
+                    gap = 1
+                }
+            }
+            for (frame in keptFrames) {
+                jitterBuffer.offer(frame)
+                kept++
+            }
+        }
+        dlCatchupSilence += silence
+        dlCatchupSpeech += speech
+        dlCatchupSped += gap
+        dlCatchupDropped += silence + speech + gap
+        if (silence + speech == 0) return
+        val entrance = try {
+            transport?.currentLink()?.entrance?.ifBlank { "-" } ?: "-"
+        } catch (_: Exception) {
+            "-"
+        }
+        val line = "downlink catch-up silence=$silence speech=$speech kept=$kept " +
+            "maxGapMs=${downlinkRx.maxGapMs} stalls=${downlinkRx.stalls} entrance=$entrance"
+        Log.w(TAG, line)
+        BridgeLog.w(line)
+        listener?.onRtpStats(line)
+    }
+
+    /** Full jitter buffer: drop the oldest silence frame, else the oldest frame. */
+    private fun offerDownlink(queued: QueuedDownlink) {
+        synchronized(downlinkLock) {
+            if (armNextSplice) {
+                queued.splice = true
+                armNextSplice = false
+            }
+            if (jitterBuffer.offer(queued)) return
+            val held = ArrayList<QueuedDownlink>()
+            while (true) {
+                val item = jitterBuffer.poll() ?: break
+                held.add(item)
+            }
+            if (held.isNotEmpty()) {
+                val idx = DownlinkCatchup.capDropIndex(IntArray(held.size) { held[it].energy })
+                val droppedLast = idx == held.lastIndex
+                held.removeAt(idx)
+                if (idx < held.size) held[idx].splice = true
+                if (droppedLast) queued.splice = true
+            }
+            held.add(queued)
+            for (frame in held) jitterBuffer.offer(frame)
         }
     }
 
@@ -1281,6 +1448,7 @@ class RtpSession(
         // gets over-amplified causing distortion at the start of each phrase.
         // A short fade-in smooths the transition.
         var wasPlayingSilence = true
+        var pendingTail: ByteArray? = null
 
         while (running.get()) {
             try {
@@ -1312,14 +1480,17 @@ class RtpSession(
                         captureTap?.putMeta("dl_last_seq", dlLastSeq)
                         captureTap?.putMeta("dl_underruns", dlUnderruns)
                         captureTap?.putMeta("dl_catchup_dropped", dlCatchupDropped)
+                        captureTap?.putMeta("dl_catchup_silence", dlCatchupSilence)
+                        captureTap?.putMeta("dl_catchup_speech", dlCatchupSpeech)
+                        captureTap?.putMeta("dl_catchup_sped", dlCatchupSped)
+                        captureTap?.putMeta("dl_max_rx_gap_ms", downlinkRx.maxGapMs)
+                        captureTap?.putMeta("dl_rx_stalls", downlinkRx.stalls)
                         captureTap?.putMeta("dl_prebuffer_waits", dlPrebufferWaits)
                         captureTap?.putMeta("dl_wire", "$inboundFormat/$inboundRate")
                     } catch (_: Exception) {}
                     dlSecStart = nowMs; dlSecPlayed = 0; dlSecUnder = 0; dlSecGaps = 0; dlSecBytes = 0; dlSecMsgs0 = dlRxMsgs
                 }
-                if (wsMode && jitterBuffer.size > jbMaxFrames) {
-                    while (jitterBuffer.size > jbCatchupFrames) { jitterBuffer.poll(); dlCatchupDropped++ }
-                }
+                if (wsMode) trimDownlink()
                 // Prebuffer ~300 ms after silence so a laggy link doesn't chop speech.
                 val prebuffer = wsMode && wasPlayingSilence && jitterBuffer.size in 1 until jbTargetFrames &&
                     nowMs - dlFirstQueuedAt < 300
@@ -1335,6 +1506,12 @@ class RtpSession(
                     // Write silence to keep AudioTrack fed and prevent underruns.
                     // Prebuffer and an empty jitter buffer are not eligible:
                     // speech may be queued and not written yet.
+                    pendingTail?.let { tail ->
+                        val faded = PcmSplice.fadeOut(tail)
+                        out(faded, faded.size)
+                        captureTap?.writePlay(faded, faded.size, liveTrack().sampleRate)
+                    }
+                    pendingTail = null
                     out(silenceFrame, silenceFrame.size)
                     captureTap?.writePlay(silenceFrame, silenceFrame.size, liveTrack().sampleRate)
                     playbackRms = 0
@@ -1362,11 +1539,12 @@ class RtpSession(
 
                 // Fade-in after silence: prevents modem DSP AGC spike that
                 // causes distorted/harsh beginning of each agent phrase.
-                // 5ms ramp (40 samples @ 8kHz) is enough to smooth the onset.
-                if (wasPlayingSilence) {
+                // A splice still holding the previous tail crossfades instead.
+                val splice = queued.splice && pendingTail != null
+                if (wasPlayingSilence && !splice) {
                     applyFadeIn(pcm)
-                    wasPlayingSilence = false
                 }
+                wasPlayingSilence = false
 
                 // Measure RMS BEFORE gain for the echo gate.  The echo gate
                 // threshold was calibrated to raw codec output levels.  If
@@ -1390,8 +1568,10 @@ class RtpSession(
                 }
 
                 playbackRms = if (playbackGain > 1) pcmRms(pcm) else rawRms
-                out(pcm, pcm.size)
-                captureTap?.writePlay(pcm, pcm.size, liveTrack().sampleRate)
+                // PhasedInjector.write mutates this array when the marker is on.
+                // playback.wav is that post-marker buffer. playbackRms above, and
+                // seconds.jsonl play_rms, are the pre-marker level.
+                pendingTail = emitPlayback(pcm, pendingTail, splice) { buf, n -> out(buf, n) }
                 playbackFrames++
                 dlSecPlayed++
                 val inputRms = if (queued.energy > 0) queued.energy else rawRms
@@ -1402,7 +1582,43 @@ class RtpSession(
                 if (running.get()) Log.e(TAG, "Playback error: ${e.message}")
             }
         }
+        pendingTail?.let { tail ->
+            out(tail, tail.size)
+            captureTap?.writePlay(tail, tail.size, liveTrack().sampleRate)
+        }
         phased?.stop()
+    }
+
+    /**
+     * Writes [pcm] except its last fade window, which is returned for the next
+     * join. A splice crossfades that held tail with the head of [pcm].
+     */
+    private fun emitPlayback(
+        pcm: ByteArray,
+        pendingTail: ByteArray?,
+        splice: Boolean,
+        out: (ByteArray, Int) -> Unit,
+    ): ByteArray {
+        val fade = PcmSplice.fadeSamples(playbackRate)
+        val samples = pcm.size / 2
+        val tailN = fade.coerceAtMost(samples)
+        val tail = pendingTail
+        if (tail != null && splice) {
+            val joined = PcmSplice.join(tail, pcm, tailN)
+            out(joined, joined.size)
+            captureTap?.writePlay(joined, joined.size, playbackRate)
+            return PcmSplice.takeTail(pcm, tailN)
+        }
+        if (tail != null) {
+            out(tail, tail.size)
+            captureTap?.writePlay(tail, tail.size, playbackRate)
+        }
+        val bodyBytes = (samples - tailN).coerceAtLeast(0) * 2
+        if (bodyBytes > 0) {
+            out(pcm, bodyBytes)
+            captureTap?.writePlay(pcm, bodyBytes, playbackRate)
+        }
+        return PcmSplice.takeTail(pcm, tailN)
     }
 
     /**
@@ -1762,17 +1978,29 @@ class RtpSession(
     private fun reToggleIncallMusic() {
         val param = profile.routing.incallMusicParam
         if (param.isEmpty()) return
+        val routed = try {
+            audioTrack?.routedDevice?.type ?: -1
+        } catch (_: Exception) {
+            -1
+        }
+        if (!incallRetoggleNeeded(routed, AudioDeviceInfo.TYPE_TELEPHONY)) {
+            val line = "$param re-toggle skipped; track already on TYPE_TELEPHONY"
+            Log.i(TAG, line)
+            listener?.onRtpStats(line)
+            return
+        }
         try {
             val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
             am?.let {
+                Log.i(TAG, "$param re-toggle: routed=$routed (not telephony yet)")
                 it.setParameters("${param}=false")
                 Thread.sleep(50)
                 it.setParameters("${param}=true")
                 GsmCallManager.enforceVolumes(it)
-                Log.i(TAG, "${param} re-toggled (3s safety), mode=${it.mode}")
+                Log.i(TAG, "$param re-toggled (3s safety), mode=${it.mode}")
             }
         } catch (e: Exception) {
-            Log.w(TAG, "${param} re-toggle failed: ${e.message}")
+            Log.w(TAG, "$param re-toggle failed: ${e.message}")
         }
     }
 

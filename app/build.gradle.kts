@@ -38,9 +38,11 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        // versionCode 347 rebuilds a silent playback track and acks SMS from the sent intent.
-        versionCode = 347
-        versionName = "0.2.8"
+        // versionCode 348: a loud frame clears the call-start silence watch. A stalled
+        // downlink keeps the newest 2s of speech, drops the quietest gap next, and
+        // crossfades every join. The inject marker stays off unless the property is set.
+        versionCode = 348
+        versionName = "0.2.9"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
