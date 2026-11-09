@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HUB_DIR = Path(__file__).resolve().parents[1]
@@ -61,6 +62,35 @@ class PortalStoreTest(unittest.TestCase):
         self.assertEqual(message["error"], reason)
         again = self.store.ack_outbox(queued["id"], status="sent")
         self.assertEqual(again["status"], "failed")
+
+    def test_stale_sending_lease_times_out_and_is_not_resent(self):
+        queued = self.store.enqueue_outbound("+201001234567", "hello")
+        claimed = self.store.claim_outbox_for_send()
+        self.assertEqual(claimed[0]["status"], "sending")
+        self.store._conn.execute(
+            "UPDATE outbox SET claimed_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:00Z", queued["id"]),
+        )
+        self.store._conn.commit()
+        message = self.store.list_messages("+201001234567")[0]
+        self.assertEqual(message["status"], "timeout")
+        self.assertEqual(message["error"], "send lease expired")
+        self.assertEqual(self.store.list_outbox_pending(), [])
+        self.assertEqual(self.store.claim_outbox_for_send(), [])
+        late = self.store.ack_outbox(queued["id"], status="sent")
+        self.assertEqual(late["status"], "timeout")
+
+    def test_fresh_send_lease_stays_queued(self):
+        queued = self.store.enqueue_outbound("+201001234567", "hello")
+        self.store.claim_outbox_for_send()
+        recent = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat().replace("+00:00", "Z")
+        self.store._conn.execute(
+            "UPDATE outbox SET claimed_at = ? WHERE id = ?",
+            (recent, queued["id"]),
+        )
+        self.store._conn.commit()
+        self.assertEqual(self.store.list_messages("+201001234567")[0]["status"], "queued")
+        self.assertEqual(self.store.claim_outbox_for_send(), [])
 
     def test_timeout_ack_is_not_stored_as_sent(self):
         queued = self.store.enqueue_outbound("+201001234567", "hello")

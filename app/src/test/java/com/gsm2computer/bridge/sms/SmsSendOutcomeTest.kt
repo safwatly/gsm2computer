@@ -3,7 +3,9 @@ package com.gsm2computer.bridge.sms
 import com.gsm2computer.bridge.HubEndpoints
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 
 /**
  * No radio and no handset. The poller acks only with this decision, after
@@ -52,6 +54,32 @@ class SmsSendOutcomeTest {
     fun partialCallbackWithNoFailureIsStillTimeout() {
         val ack = SmsSendOutcome.decide(listOf(SmsSendOutcome.OK, null), timedOut = true)
         assertEquals("timeout", ack.status)
+    }
+
+    @Test
+    fun sentReceiverIsExplicitAndNotExported() {
+        val manifest = listOf(File("src/main/AndroidManifest.xml"), File("app/src/main/AndroidManifest.xml"))
+            .firstOrNull { it.isFile }
+            ?.readText()
+            ?: error("AndroidManifest.xml not found from ${File(".").absolutePath}")
+        val receiver = Regex(
+            """<receiver\b[^>]*android:name="\.sms\.SmsSentReceiver"[^>]*>""",
+            setOf(RegexOption.DOT_MATCHES_ALL),
+        ).find(manifest) ?: error("SmsSentReceiver is missing from the manifest")
+        assertTrue(receiver.value.contains("""android:exported="false""""))
+        assertFalse(receiver.value.contains("intent-filter"))
+    }
+
+    @Test
+    fun sentHubRecordsTheResultCodeForTheMatchingPart() {
+        val slot = SmsSentHub.register("bf07cf40", 2)
+        SmsSentHub.record("bf07cf40", part = 1, resultCode = 40, rp = 38)
+        assertEquals(40, slot.results[1])
+        assertEquals(38, slot.rpErrors[1])
+        assertEquals(1, slot.latch.count)
+        SmsSentHub.record("someone-else", part = 0, resultCode = 1, rp = null)
+        assertEquals(1, slot.latch.count)
+        SmsSentHub.finish("bf07cf40")
     }
 
     @Test

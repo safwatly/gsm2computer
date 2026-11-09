@@ -1,10 +1,8 @@
 package com.gsm2computer.bridge.sms
 
 import android.app.PendingIntent
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.telephony.SmsManager
@@ -21,7 +19,6 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
@@ -31,7 +28,6 @@ import java.util.concurrent.TimeUnit
 object SmsOutboxPoller {
 
     private const val TAG = "SmsOutbox"
-    private const val ACTION_SMS_SENT = "com.gsm2computer.bridge.SMS_SENT"
     private const val SENT_TIMEOUT_MS = 45_000L
     private val JSON = "application/json; charset=utf-8".toMediaType()
     private val pollLock = Any()
@@ -111,35 +107,13 @@ object SmsOutboxPoller {
         val sms = contextSmsManager()
         val parts = sms.divideMessage(body)
         val count = if (parts.size <= 1) 1 else parts.size
-        val results = arrayOfNulls<Int>(count)
-        val rpErrors = arrayOfNulls<Int>(count)
-        val latch = CountDownLatch(count)
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(ctx: Context, intent: Intent) {
-                if (intent.getStringExtra("id") != id) return
-                val index = intent.getIntExtra("part", 0)
-                if (index !in results.indices || results[index] != null) return
-                results[index] = resultCode
-                if (intent.hasExtra("errorCode")) {
-                    rpErrors[index] = intent.getIntExtra("errorCode", 0)
-                }
-                latch.countDown()
-            }
-        }
-        val filter = IntentFilter(ACTION_SMS_SENT)
-        if (Build.VERSION.SDK_INT >= 33) {
-            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            context.registerReceiver(receiver, filter)
-        }
+        val slot = SmsSentHub.register(id, count)
         try {
             val flags = PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_UPDATE_CURRENT or
                 if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
             val intents = ArrayList<PendingIntent>(count)
             for (index in 0 until count) {
-                val broadcast = Intent(ACTION_SMS_SENT)
-                    .setPackage(context.packageName)
+                val broadcast = Intent(context, SmsSentReceiver::class.java)
                     .putExtra("id", id)
                     .putExtra("part", index)
                 val request = (id.hashCode() xor index) and 0x7fffffff
@@ -150,13 +124,14 @@ object SmsOutboxPoller {
             } else {
                 sms.sendMultipartTextMessage(to, null, parts, intents, null)
             }
-            val finished = latch.await(SENT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            return SmsSendOutcome.decide(results.toList(), timedOut = !finished, rpErrors = rpErrors.toList())
+            val finished = slot.latch.await(SENT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            return SmsSendOutcome.decide(
+                slot.results.toList(),
+                timedOut = !finished,
+                rpErrors = slot.rpErrors.toList(),
+            )
         } finally {
-            try {
-                context.unregisterReceiver(receiver)
-            } catch (_: Exception) {
-            }
+            SmsSentHub.finish(id)
         }
     }
 

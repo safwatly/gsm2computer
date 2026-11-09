@@ -1,66 +1,96 @@
 package com.gsm2computer.bridge.rtp
 
 /**
- * Notices when hub audio is arriving and the call playback path is not
+ * Notices when hub audio was written to the call track and the track is not
  * delivering it. A fresh [android.media.AudioTrack] is created per call;
  * [android.media.AudioTrack.setPreferredDevice] on an already-playing track
- * makes AudioFlinger log `dead IAudioTrack, creating a new one from
- * setOutputDevice` and the replacement track can lose in-call-music routing.
- * This watch tells the playback thread to release that track and arm a new one.
+ * makes AudioFlinger replace the native track and drop in-call-music routing.
  *
- * [rxRms] is the energy of frames as they arrived. [playRms] is the energy
- * of what the playback loop actually wrote. [headAdvanced] is whether
- * `AudioTrack.playbackHeadPosition` moved. Mutual silence does not rebuild.
+ * Only [eligible] samples count. Those are frames the playback loop dequeued
+ * and wrote. Prebuffer silence and frames still sitting in the jitter buffer
+ * are not eligible: their receive energy is not "playRMS should be loud."
+ * One eligible sample is not enough. Near-zero output (or a stalled playback
+ * head) has to cover most of the window. Closing a window, or leaving
+ * cooldown, starts the next window on the following sample.
  */
 class PlaybackSilenceWatch(
     private val speechRms: Int = 200,
     private val silentRms: Int = 8,
     private val windowMs: Long = 3_000,
     private val cooldownMs: Long = 8_000,
+    private val sampleGapCapMs: Long = 40,
 ) {
+    private val sustainedMs = windowMs / 2
     private var windowStart = -1L
-    private var maxRx = 0
+    private var lastAt = -1L
+    private var silentMs = 0L
+    private var stallMs = 0L
+    private var maxInput = 0
     private var maxPlay = 0
-    private var headMoved = false
-    private var samples = 0
     private var cooldownUntil = 0L
 
     data class Decision(val rebuild: Boolean, val reason: String = "")
 
-    fun observe(nowMs: Long, rxRms: Int, playRms: Int, headAdvanced: Boolean): Decision {
+    fun observe(
+        nowMs: Long,
+        inputRms: Int,
+        playRms: Int,
+        headAdvanced: Boolean,
+        eligible: Boolean,
+    ): Decision {
         if (nowMs < cooldownUntil) return Decision(false)
-        if (windowStart < 0L) windowStart = nowMs
-        maxRx = maxOf(maxRx, rxRms)
-        maxPlay = maxOf(maxPlay, playRms)
-        if (headAdvanced) headMoved = true
-        samples++
+        if (windowStart < 0L) {
+            openWindow(nowMs)
+            return Decision(false)
+        }
+        val gap = (nowMs - lastAt).coerceIn(0L, sampleGapCapMs)
+        lastAt = nowMs
+        if (eligible && inputRms >= speechRms) {
+            maxInput = maxOf(maxInput, inputRms)
+            maxPlay = maxOf(maxPlay, playRms)
+            if (playRms <= silentRms) silentMs += gap
+            if (!headAdvanced) stallMs += gap
+        }
         if (nowMs - windowStart < windowMs) return Decision(false)
         val decision = decide()
-        resetWindow(nowMs)
+        windowStart = -1L
+        lastAt = -1L
+        silentMs = 0L
+        stallMs = 0L
+        maxInput = 0
+        maxPlay = 0
         if (decision.rebuild) cooldownUntil = nowMs + cooldownMs
         return decision
     }
 
+    private fun openWindow(nowMs: Long) {
+        windowStart = nowMs
+        lastAt = nowMs
+        silentMs = 0L
+        stallMs = 0L
+        maxInput = 0
+        maxPlay = 0
+    }
+
     private fun decide(): Decision {
-        if (samples == 0) return Decision(false)
-        val rxSpeech = maxRx >= speechRms
-        if (!rxSpeech) return Decision(false)
-        if (maxPlay <= silentRms) {
-            return Decision(true, "rx speech rms=$maxRx but playRMS=$maxPlay")
+        if (silentMs >= sustainedMs) {
+            return Decision(true, "rx speech rms=$maxInput but playRMS=$maxPlay")
         }
-        if (!headMoved) {
-            return Decision(true, "track head stalled while rx rms=$maxRx playRMS=$maxPlay")
+        if (stallMs >= sustainedMs) {
+            return Decision(true, "track head stalled while rx rms=$maxInput playRMS=$maxPlay")
         }
         return Decision(false)
     }
+}
 
-    private fun resetWindow(nowMs: Long) {
-        windowStart = nowMs
-        maxRx = 0
-        maxPlay = 0
-        headMoved = false
-        samples = 0
-    }
+/**
+ * `true` when the track left the telephony output and should be rebuilt.
+ * `false` when it is back on telephony, which clears a pending rebuild.
+ * `null` when the route is not known yet.
+ */
+internal fun playbackRebuildOnRoute(routedType: Int, telephonyType: Int): Boolean? {
+    if (routedType < 0) return null
+    return routedType != telephonyType
 }
 
 /** Energy of one hub downlink frame, before the playback loop rewrites it. */

@@ -8,6 +8,7 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioDeviceInfo
+import android.media.AudioRouting
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.util.Log
@@ -24,7 +25,6 @@ import java.net.SocketTimeoutException
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * RTP session: handles bidirectional audio between speaker/mic and remote RTP endpoint.
@@ -63,8 +63,8 @@ class RtpSession(
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
     private val playbackSilence = PlaybackSilenceWatch()
-    private val rxPeak = AtomicInteger(0)
     private val playbackRebuild = AtomicBoolean(false)
+    private var playbackRouteListener: AudioRouting.OnRoutingChangedListener? = null
     private var lastPlayHead = -1
     private var captureTap: CaptureTap? = null
 
@@ -92,7 +92,9 @@ class RtpSession(
     // response faster than real time in a burst, and the playback loop paces it
     // out at 20ms/frame. The drain-excess logic is disabled in WS mode so the
     // burst isn't discarded (see playbackLoop).
-    private val jitterBuffer = ArrayBlockingQueue<ByteArray>(if (transport != null) 500 else 8)
+    private class QueuedDownlink(val bytes: ByteArray, val energy: Int)
+
+    private val jitterBuffer = ArrayBlockingQueue<QueuedDownlink>(if (transport != null) 500 else 8)
 
     // RTP inactivity tracking
     @Volatile private var lastRtpReceivedTime = 0L
@@ -447,7 +449,9 @@ class RtpSession(
         }
         audioRecord = null
 
-        audioTrack?.let {
+        val played = audioTrack
+        clearPlaybackRouteListener(played)
+        played?.let {
             try { it.stop() } catch (_: Exception) {}
             it.release()
         }
@@ -494,11 +498,11 @@ class RtpSession(
                 val slice = frame.copyOfRange(off, end)
                 off = end
                 val energy = FrameEnergy.rms(slice, inboundFormat)
-                rxPeak.updateAndGet { cur -> maxOf(cur, energy) }
                 rxPacketCount++
-                if (!jitterBuffer.offer(slice)) {
+                val queued = QueuedDownlink(slice, energy)
+                if (!jitterBuffer.offer(queued)) {
                     jitterBuffer.poll()
-                    jitterBuffer.offer(slice)
+                    jitterBuffer.offer(queued)
                 }
             }
         }
@@ -652,19 +656,9 @@ class RtpSession(
                     val cur = t.routedDevice?.type ?: -1
                     captureTap?.putMeta("play_routed_at_start", cur)
                     Log.i(TAG, "AudioTrack route at call start: type=$cur")
-                    if (cur != -1 && cur != AudioDeviceInfo.TYPE_TELEPHONY) {
-                        playbackRebuild.set(true)
-                    }
+                    applyPlaybackRoute(cur)
                 }
-                t?.addOnRoutingChangedListener({ r ->
-                    val ty = (r as? AudioTrack)?.routedDevice?.type ?: -1
-                    Log.i(TAG, "AudioTrack routing changed -> type=$ty")
-                    captureTap?.putMeta("play_routed_last", ty)
-                    if (ty != -1 && ty != AudioDeviceInfo.TYPE_TELEPHONY && dev != null && running.get()) {
-                        Log.w(TAG, "AudioTrack left TYPE_TELEPHONY; will rebuild")
-                        playbackRebuild.set(true)
-                    }
-                }, null)
+                if (t != null) watchPlaybackRoute(t)
             } catch (e: Exception) {
                 Log.w(TAG, "re-route to TYPE_TELEPHONY failed: ${e.message}")
             }
@@ -929,9 +923,10 @@ class RtpSession(
                     Log.i(TAG, "First RX: $firstRxInfo")
                 }
                 if (rtp.payloadType == payloadType || rtp.payloadType == RtpPacket.PT_PCMA || rtp.payloadType == RtpPacket.PT_G722) {
-                    if (!jitterBuffer.offer(rtp.payload)) {
+                    val queued = QueuedDownlink(rtp.payload, 0)
+                    if (!jitterBuffer.offer(queued)) {
                         jitterBuffer.poll() // drop oldest
-                        jitterBuffer.offer(rtp.payload)
+                        jitterBuffer.offer(queued)
                     }
                 }
             } catch (_: SocketTimeoutException) {
@@ -1135,12 +1130,48 @@ class RtpSession(
         }
     }
 
+    private fun applyPlaybackRoute(routedType: Int) {
+        when (playbackRebuildOnRoute(routedType, AudioDeviceInfo.TYPE_TELEPHONY)) {
+            true -> {
+                Log.w(TAG, "AudioTrack left TYPE_TELEPHONY; will rebuild")
+                playbackRebuild.set(true)
+            }
+            false -> playbackRebuild.set(false)
+            null -> Unit
+        }
+    }
+
+    private fun watchPlaybackRoute(track: AudioTrack) {
+        if (!profile.routing.playbackToTelephony) return
+        clearPlaybackRouteListener(audioTrack)
+        val routeListener = AudioRouting.OnRoutingChangedListener { routed ->
+            val ty = (routed as? AudioTrack)?.routedDevice?.type ?: -1
+            Log.i(TAG, "AudioTrack routing changed -> type=$ty")
+            captureTap?.putMeta("play_routed_last", ty)
+            if (running.get()) applyPlaybackRoute(ty)
+        }
+        playbackRouteListener = routeListener
+        track.addOnRoutingChangedListener(routeListener, null)
+    }
+
+    private fun clearPlaybackRouteListener(track: AudioTrack?) {
+        val routeListener = playbackRouteListener ?: return
+        if (track != null) {
+            try {
+                track.removeOnRoutingChangedListener(routeListener)
+            } catch (_: Exception) {
+            }
+        }
+        playbackRouteListener = null
+    }
+
     private fun rebuildPlaybackTrack(reason: String) {
         val line = "playback silence: rebuilding AudioTrack ($reason)"
         Log.w(TAG, line)
         BridgeLog.w(line)
         listener?.onRtpStats(line)
         val old = audioTrack
+        clearPlaybackRouteListener(old)
         try {
             old?.pause()
         } catch (_: Exception) {
@@ -1173,11 +1204,12 @@ class RtpSession(
         audioTrack = fresh
         lastPlayHead = -1
         armPlaybackTrack(fresh)
+        watchPlaybackRoute(fresh)
         enableIncallMusic()
         enableIncallMusicViaMixer()
     }
 
-    private fun notePlaybackHealth() {
+    private fun notePlaybackHealth(eligible: Boolean, inputRms: Int) {
         val track = audioTrack ?: return
         val head = try {
             track.playbackHeadPosition
@@ -1186,12 +1218,12 @@ class RtpSession(
         }
         val advanced = lastPlayHead >= 0 && head >= 0 && head != lastPlayHead
         if (head >= 0) lastPlayHead = head
-        val rx = rxPeak.getAndSet(0)
         val decision = playbackSilence.observe(
             System.currentTimeMillis(),
-            rx,
+            inputRms,
             playbackRms,
             advanced,
+            eligible,
         )
         val leftTelephony = playbackRebuild.getAndSet(false)
         if (!running.get()) return
@@ -1292,18 +1324,26 @@ class RtpSession(
                 val prebuffer = wsMode && wasPlayingSilence && jitterBuffer.size in 1 until jbTargetFrames &&
                     nowMs - dlFirstQueuedAt < 300
                 if (prebuffer) dlPrebufferWaits++
-                val encoded = if (prebuffer) { Thread.sleep(18); null } else jitterBuffer.poll(18, TimeUnit.MILLISECONDS)
-                if (encoded == null) {
+                val queued = if (prebuffer) {
+                    Thread.sleep(18)
+                    null
+                } else {
+                    jitterBuffer.poll(18, TimeUnit.MILLISECONDS)
+                }
+                if (queued == null) {
                     if (wsMode && !wasPlayingSilence) { dlUnderruns++; dlSecUnder++ }
                     // Write silence to keep AudioTrack fed and prevent underruns.
+                    // Prebuffer and an empty jitter buffer are not eligible:
+                    // speech may be queued and not written yet.
                     out(silenceFrame, silenceFrame.size)
                     captureTap?.writePlay(silenceFrame, silenceFrame.size, liveTrack().sampleRate)
                     playbackRms = 0
                     currentPlaybackActive = false
                     wasPlayingSilence = true
-                    notePlaybackHealth()
+                    notePlaybackHealth(eligible = false, inputRms = 0)
                     continue
                 }
+                val encoded = queued.bytes
 
                 val pcm = if (wsMode) {
                     decodeHubFrame(encoded)
@@ -1354,7 +1394,8 @@ class RtpSession(
                 captureTap?.writePlay(pcm, pcm.size, liveTrack().sampleRate)
                 playbackFrames++
                 dlSecPlayed++
-                notePlaybackHealth()
+                val inputRms = if (queued.energy > 0) queued.energy else rawRms
+                notePlaybackHealth(eligible = true, inputRms = inputRms)
             } catch (e: InterruptedException) {
                 break
             } catch (e: Exception) {
