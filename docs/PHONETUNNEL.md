@@ -11,7 +11,9 @@ localhost ports on that session:
 | `127.0.0.1:2222` | Dropbear sshd on `127.0.0.1:2222` |
 | `127.0.0.1:5556` | adbd on `127.0.0.1:5555` |
 
-The phone sshd is key-only and cannot forward. The cup account
+The phone sshd is key-only and cannot forward. Android has no
+`/etc/passwd`, so this Dropbear treats the name `root` as uid 0 when
+`getpwnam` fails. Any other name is still rejected. The cup account
 `phonetunnel` can open only those two reverse forwards. It has no shell,
 no TTY, no agent, and no other forwards.
 
@@ -223,11 +225,22 @@ of the config is next to it as `sshd_config.bak.phonetunnel`.
 - The watchdog only force-stops `com.tailscale.ipn`. Any other
   `TS_PACKAGE` is rejected, so a bad config cannot aim it at
   `com.gsm2computer.bridge`. It restarts only when `dumpsys
-  telephony.registry` contains `mCallState=0` and no active precise or
-  legacy call state (`mPreciseCallState=FG_ACTIVE` counts as a call).
-  Empty output, a dumpsys error, or an unrecognized dump is not idle.
-  `ip addr show tailscale0` must succeed and show the interface with no
-  IPv4 before a miss counts. An `ip` error is not a down interface.
+  telephony.registry` shows every subscription's current `mCallState`
+  as `0` and the current precise-call fields as idle. History lines
+  (`state: OFFHOOK`, `CallState: RINGING`, `state: DISCONNECTING` on a
+  data connection) and the label `Ringing call state: -1` are not a
+  live call. `mCallState=2`, `mForegroundCallState=1`, a precise value
+  other than `-1`, `0`, or disconnected `7`, and
+  `mPreciseCallState=FG_ACTIVE` are a live call. Empty output, a
+  dumpsys error, or a dump with no `mCallState` is not idle.
+  The dump is written to a file and grepped there, so a large
+  `telephony.registry` does not die with `Argument list too long`.
+  Tailscale is up when `ip addr show` lists a `tunN` or `tailscaleN`
+  interface with an address in `100.64.0.0/10`. This phone's interface
+  is `tun1`, not `tailscale0`. A `100.64` address on `rmnet` is the
+  carrier, not Tailscale. Set `TS_IFACE` to force one name; that
+  interface is up when it has any IPv4 address. An `ip` error is not
+  a down interface.
   `TS_CHECK_SEC` below 15 is raised to 15. `TS_RESTART_MIN_SEC` below
   60 is raised to 60. The loop never sleeps 0.
 - Phone sshd key directory: Dropbear rejects `authorized_keys` if any

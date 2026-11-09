@@ -38,6 +38,9 @@ GCC="$CACHE/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc"
 rm -rf "$CACHE/dropbear-${VER}"
 tar -xjf "dropbear-${VER}.tar.bz2" -C "$CACHE"
 cd "$CACHE/dropbear-${VER}"
+# Android has no /etc/passwd. The patch synthesizes uid 0 for "root"
+# only, and only when getpwnam fails. localoptions.h turns it on.
+patch -p1 < "$ROOT/patches/android-root-login.patch"
 cp "$ROOT/localoptions.h" ./localoptions.h
 
 export PATH="$CACHE/aarch64-linux-musl-cross/bin:${PATH}"
@@ -81,13 +84,14 @@ own OpenSSH server.
 | Upstream | Dropbear ${VER} |
 | Source | ${TARBALL_URL} |
 | Source SHA-256 | \`${TARBALL_SHA256}\` |
-| Local options | \`magisk-phonetunnel/localoptions.h\` (password auth compiled out, no motd) |
+| Local options | \`magisk-phonetunnel/localoptions.h\` (password auth compiled out, no motd, Android root account) |
+| Android login | \`magisk-phonetunnel/patches/android-root-login.patch\` synthesizes \`root\` (uid 0, gid 0, shell \`/system/bin/sh\`) when \`getpwnam\` fails. Other names stay nonexistent. |
 | Programs | \`dropbear\`, \`dbclient\`, \`dropbearkey\` (multi-call) |
 | Cross compiler | ${TOOLCHAIN_URL} |
 | Toolchain tarball SHA-256 | \`${TOOLCHAIN_SHA256}\` |
 | Compiler | ${GCC_VER} |
 | Configure | \`--host=aarch64-linux-musl --enable-static --disable-zlib --disable-syslog --disable-lastlog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx --disable-pututline --disable-pam\` |
-| Link | static musl (\`-static\`). Does not use Android bionic. |
+| Link | static-pie musl (\`-static\`). \`file\` reports \`static-pie linked\`: no dynamic linker, not Android bionic. |
 | Binary SHA-256 | \`${BIN_SHA256}\` |
 | \`file\` | ${BIN_FILE} |
 
@@ -105,6 +109,29 @@ the phone sshd, the tunnel client, and host-key generation.
 Syslog is compiled out because Android has no syslog daemon. The
 supervisor appends the process's stderr to
 \`/data/adb/phonetunnel/phonetunnel.log\`.
+
+## Key format
+
+\`dbclient\` in this build cannot load an OpenSSH private key
+(\`-----BEGIN OPENSSH PRIVATE KEY-----\`). The loader treats the cipher
+name at the start of the openssh-key-v1 blob as a length and exits
+with \`String too long\`. The cup setup script therefore generates the
+phone identity with \`dropbearkey\` (Debian/Ubuntu package \`dropbear-bin\`).
+The cup-to-phone shell key stays an OpenSSH key, because cup's OpenSSH
+client reads it and the phone only stores the public line.
+
+Do not replace \`/data/adb/phonetunnel/id_ed25519\` with a key from
+\`ssh-keygen\`. The supervisor refuses that file and logs the reason.
+
+## Android account
+
+The phone has no \`/etc/passwd\`. Unpatched Dropbear rejects every login
+with \`Login attempt for nonexistent user\`. This build, when
+\`getpwnam("root")\` fails, uses uid 0, gid 0, shell \`/system/bin/sh\`
+(or \`/bin/sh\` when that is the one that exists), and home
+\`/data/adb/phonetunnel/home\` if that directory exists, otherwise \`/\`.
+A name other than \`root\` is still rejected. Password authentication
+stays compiled out.
 EOF
 
 echo "built $ROOT/bin/dropbearmulti"

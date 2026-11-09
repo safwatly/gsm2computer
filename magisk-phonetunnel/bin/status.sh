@@ -55,12 +55,14 @@ if [ -s "$STATE_DIR/dropbear_ed25519_host_key" ]; then
     fi
 fi
 
-_ts=$(tailscale_state)
-_ts_addr=none
-if [ "$_ts" = up ]; then
-    _ts_addr=$(${IP_BIN:-ip} addr show tailscale0 2>/dev/null | awk '/inet / {print $2; exit}' || true)
-    [ -n "$_ts_addr" ] || _ts_addr=none
-fi
+_ts_line=$(tailscale_state)
+_ts=${_ts_line%% *}
+_ts_rest=${_ts_line#* }
+_ts_iface=${_ts_rest%% *}
+_ts_addr=${_ts_rest#* }
+[ -n "$_ts" ] || _ts=unknown
+[ -n "$_ts_iface" ] || _ts_iface=none
+[ -n "$_ts_addr" ] || _ts_addr=none
 _clamped=no
 if [ "${PHONETUNNEL_TIMERS_CLAMPED:-0}" = 1 ]; then
     _clamped=yes
@@ -94,6 +96,7 @@ printf '%s\n' "cup_ssh_forward=127.0.0.1:$SSH_REMOTE_PORT"
 printf '%s\n' "cup_adb_forward=127.0.0.1:$ADB_REMOTE_PORT"
 printf '%s\n' "keepalive_sec=$KEEPALIVE_SEC"
 printf '%s\n' "tailscale=$_ts"
+printf '%s\n' "tailscale_iface=$_ts_iface"
 printf '%s\n' "tailscale_addr=$_ts_addr"
 printf '%s\n' "watchdog_last_restart=$_wd"
 if [ -f "$LOG_FILE" ]; then

@@ -1,0 +1,110 @@
+--- a/src/auth.h	2026-11-09 03:32:39.533660290 +0000
++++ b/src/auth.h	2026-11-09 03:32:39.533660290 +0000
+@@ -134,6 +134,9 @@
+ 	char *pw_shell;
+ 	char *pw_name;
+ 	char *pw_passwd;
++	/* Server only. Set when Android had no passwd entry and root was
++	 * synthesized. Other usernames are never synthesized. */
++	unsigned int pw_synthetic;
+ #if DROPBEAR_SVR_PUBKEY_OPTIONS_BUILT
+ 	struct PubKeyOptions* pubkey_options;
+ 	char *pubkey_info;
+--- a/src/common-session.c	2026-11-09 03:32:39.533660290 +0000
++++ b/src/common-session.c	2026-11-09 03:32:39.533660290 +0000
+@@ -657,6 +657,33 @@
+ 
+ 	pw = getpwnam(username);
+ 	if (!pw) {
++#ifdef DROPBEAR_ANDROID_ROOT
++		/* Android has no /etc/passwd, so getpwnam("root") fails and
++		 * Dropbear logs "Login attempt for nonexistent user" before
++		 * it ever checks the key. Synthesize only root. Any other
++		 * name stays nonexistent. */
++		if (strcmp(username, "root") == 0) {
++			const char *shell = "/system/bin/sh";
++			const char *home = "/data/adb/phonetunnel/home";
++			struct stat st;
++			if (access("/system/bin/sh", X_OK) != 0
++					&& access("/bin/sh", X_OK) == 0) {
++				shell = "/bin/sh";
++			}
++			if (stat(home, &st) != 0 || !S_ISDIR(st.st_mode)) {
++				home = "/";
++			}
++			ses.authstate.pw_uid = 0;
++			ses.authstate.pw_gid = 0;
++			ses.authstate.pw_name = m_strdup("root");
++			ses.authstate.pw_dir = m_strdup(home);
++			ses.authstate.pw_shell = m_strdup(shell);
++			/* Password auth is compiled out. A locked field keeps a
++			 * stray password check from succeeding. */
++			ses.authstate.pw_passwd = m_strdup("!!");
++			ses.authstate.pw_synthetic = 1;
++		}
++#endif
+ 		return;
+ 	}
+ 	ses.authstate.pw_uid = pw->pw_uid;
+--- a/src/svr-auth.c	2026-11-09 03:32:39.533660290 +0000
++++ b/src/svr-auth.c	2026-11-09 03:32:39.533660290 +0000
+@@ -314,6 +314,13 @@
+ 		usershell = "/bin/sh";
+ 	}
+ 
++	/* The synthesized Android root shell is /system/bin/sh. There is no
++	 * /etc/shells on the phone, and the libc default list is /bin/sh
++	 * and /bin/csh, so the check below would reject the login. */
++	if (ses.authstate.pw_synthetic) {
++		goto goodshell;
++	}
++
+ 	/* check the shell is valid. If /etc/shells doesn't exist, getusershell()
+ 	 * should return some standard shells like "/bin/sh" and "/bin/csh" (this
+ 	 * is platform-specific) */
+@@ -510,11 +517,19 @@
+ 	/* We can only change uid/gid as root ... */
+ 	if (getuid() == 0) {
+ 
+-		if ((setgid(ses.authstate.pw_gid) < 0) ||
+-			(initgroups(ses.authstate.pw_name, 
+-						ses.authstate.pw_gid) < 0)) {
++		if (setgid(ses.authstate.pw_gid) < 0) {
+ 			dropbear_exit("Error changing user group");
+ 		}
++		if (initgroups(ses.authstate.pw_name,
++					ses.authstate.pw_gid) < 0) {
++			/* Android has no /etc/group. The gid from setgid is enough
++			 * for the synthesized root account. A real passwd user
++			 * still has to resolve groups. */
++			if (!ses.authstate.pw_synthetic
++					|| setgroups(1, &ses.authstate.pw_gid) < 0) {
++				dropbear_exit("Error changing user group");
++			}
++		}
+ 
+ #if DROPBEAR_SVR_DROP_PRIVS
+ 		/* Retain utmp saved group so that wtmp/utmp can be written */
+--- a/src/svr-chansession.c	2026-11-09 03:32:39.533660290 +0000
++++ b/src/svr-chansession.c	2026-11-09 03:32:39.533660290 +0000
+@@ -613,6 +613,20 @@
+ 	}
+ 
+ 	pw = getpwnam(ses.authstate.pw_name);
++	if (!pw && ses.authstate.pw_synthetic) {
++		/* pty_setowner wants a passwd row. Android still has none. */
++		static struct passwd syn;
++		memset(&syn, 0, sizeof(syn));
++		syn.pw_name = ses.authstate.pw_name;
++		syn.pw_passwd = ses.authstate.pw_passwd
++			? ses.authstate.pw_passwd : "!!";
++		syn.pw_uid = ses.authstate.pw_uid;
++		syn.pw_gid = ses.authstate.pw_gid;
++		syn.pw_gecos = "";
++		syn.pw_dir = ses.authstate.pw_dir;
++		syn.pw_shell = ses.authstate.pw_shell;
++		pw = &syn;
++	}
+ 	if (!pw)
+ 		dropbear_exit("getpwnam failed after succeeding previously");
+ 	pty_setowner(pw, chansess->tty);
