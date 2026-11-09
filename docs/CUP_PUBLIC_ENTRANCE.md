@@ -109,27 +109,18 @@ The unit sets `StateDirectory=caddy`, `XDG_DATA_HOME=/var/lib/caddy`, and `XDG_C
 
 #### One-time move off `/caddy`
 
-The entrance is already live. The previous unit set no `HOME` and no `XDG_*`, and a system unit's working directory is `/`, so Caddy stored the account and the certificate in `/caddy`. Starting the new unit before this move makes Caddy look in an empty `/var/lib/caddy/caddy` and ask Let's Encrypt for a new certificate.
+The entrance is already live. The previous unit set no `HOME` and no `XDG_*`, and a system unit's working directory is `/`, so Caddy stored the account and the certificate in `/caddy`. Starting the new unit before this move makes Caddy look in an empty `/var/lib/caddy/caddy` and ask Let's Encrypt for a new certificate. `Restart=on-failure` would then retry every 3 seconds.
 
-Record the fingerprint while the current process is still serving. Stop Caddy, move the directory, then install the unit and start it. `mv` keeps the owner, group, and mode of `/caddy` and of every file inside it. Do not copy the tree in a way that rewrites ownership.
+`deploy/cup/migrate-caddy-state.sh apply` records the fingerprint in `/tmp/gsm-cert.before` while Caddy is still serving. It refuses to run, and does not stop Caddy, when `/var/lib/caddy/caddy` exists and is not empty: moving onto that directory would nest the tree, Caddy would start empty, and it would reissue. An empty destination directory is removed first. The move is `mv`, so the owner, group, and mode of `/caddy` and of every file inside it stay as they are.
+
+The first apply copies the installed unit to `/var/lib/caddy/gsm2computer-caddy.service.bak` and does not overwrite that backup later. It then installs this repo's unit, `systemctl enable --now`, and compares the fingerprint. If the fingerprint differs, it runs `systemctl stop` immediately and then `rollback`. A second apply, once the storage is `/var/lib/caddy/caddy` and the unit has `XDG_DATA_HOME=/var/lib/caddy`, does nothing.
 
 ```bash
-echo | openssl s_client -connect 62.83.35.197:443 -servername gsm.ta3leam.com 2>/dev/null \
-  | openssl x509 -noout -fingerprint -sha256 | tee /tmp/gsm-cert.before
-sudo systemctl stop gsm2computer-caddy.service
-sudo install -d -m 0755 /var/lib/caddy
-sudo mv /caddy /var/lib/caddy/caddy
-sudo install -m 0755 deploy/cup/gsm2computer-caddy-pre.sh /usr/local/sbin/gsm2computer-caddy-pre.sh
-sudo cp deploy/cup/gsm2computer-caddy.service /etc/systemd/system/gsm2computer-caddy.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now gsm2computer-caddy.service
-echo | openssl s_client -connect 62.83.35.197:443 -servername gsm.ta3leam.com 2>/dev/null \
-  | openssl x509 -noout -fingerprint -sha256 | tee /tmp/gsm-cert.after
-cmp /tmp/gsm-cert.before /tmp/gsm-cert.after
+sudo deploy/cup/migrate-caddy-state.sh apply
 sudo journalctl -u gsm2computer-caddy.service -n 50 --no-pager
 ```
 
-`cmp` exits 0 when the same certificate is still served. The journal after the start does not show a new issuance. `/caddy` is gone; the storage root is `/var/lib/caddy/caddy`.
+The script exits 0 only when the fingerprint matches. The journal after the start does not show a new issuance. `/caddy` is gone; the storage root is `/var/lib/caddy/caddy`.
 
 On a first install there is no `/caddy` directory. Install the unit and start it. The log shows a certificate obtained for the hostname.
 
@@ -198,7 +189,8 @@ Do these independently. You do not need to undo all of them.
 |---|---|
 | Firewall lockout, timer still running | Wait. It removes the TCP 443 rule. Or from the surviving SSH session: `sudo deploy/cup/gsm2computer-nft.sh revert` |
 | Firewall confirmed, want 443 closed | `sudo /usr/local/sbin/gsm2computer-nft.sh revert` (disables the boot unit, deletes the 443 rule, removes the include) |
-| Caddy certificate or proxy | `sudo systemctl disable --now gsm2computer-caddy.service` |
+| Caddy storage move | `sudo deploy/cup/migrate-caddy-state.sh rollback`. Stops Caddy, moves `/var/lib/caddy/caddy` back to `/caddy` (refusing if `/caddy` already has files), restores `/var/lib/caddy/gsm2computer-caddy.service.bak`, `daemon-reload`, starts the unit, and compares `/tmp/gsm-cert.before`. A mismatch stops Caddy again. `apply` runs this on its own when the fingerprint changes after `enable --now`. |
+| Caddy certificate or proxy, storage not moved | `sudo systemctl disable --now gsm2computer-caddy.service` |
 | Public hub socket | Comment out `GSM2COMPUTER_PUBLIC_ENABLE`, `systemctl --user restart gsm2computer-hub.service`. Tailscale `:8787` keeps the previous behavior |
 | Bad hub code | `git checkout <previous>` in the deployed checkout, restart the user unit. With `PUBLIC_ENABLE` unset the new code still serves only the Tailscale socket |
 | SSH keys-only too strict | `sudo rm /etc/ssh/sshd_config.d/99-gsm2computer-key-only.conf && sudo sshd -t && sudo systemctl reload ssh` |
