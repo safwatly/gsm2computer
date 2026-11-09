@@ -38,9 +38,11 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        // versionCode 347 rebuilds a silent playback track and acks SMS from the sent intent.
-        versionCode = 347
-        versionName = "0.2.8"
+        // versionCode 348 keeps the greeting: volume after the idle restore, no 3s
+        // incall_music teardown once the track is on telephony, call-start silence
+        // rebuilds in about a second.
+        versionCode = 348
+        versionName = "0.2.9"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

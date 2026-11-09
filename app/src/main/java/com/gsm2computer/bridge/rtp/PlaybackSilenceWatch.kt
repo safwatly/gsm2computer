@@ -2,18 +2,23 @@ package com.gsm2computer.bridge.rtp
 
 /**
  * Notices when hub audio was written to the call track and the track is not
- * delivering it. A fresh [android.media.AudioTrack] is created per call;
- * [android.media.AudioTrack.setPreferredDevice] on an already-playing track
- * makes AudioFlinger replace the native track and drop in-call-music routing.
+ * delivering it. A fresh [android.media.AudioTrack] is created per call.
+ * [android.media.AudioTrack.setPreferredDevice] replaces the native track
+ * (`restoreTrack_l` from `setOutputDevice`) even while Java still says the
+ * track is stopped, and that drops in-call-music routing.
  *
  * Only [eligible] samples count. Those are frames the playback loop dequeued
  * and wrote. Prebuffer silence and frames still sitting in the jitter buffer
  * are not eligible: their receive energy is not "playRMS should be loud."
- * One eligible sample is not enough. Near-zero output has to cover most of
- * the window. A stalled head counts only while it stays still: the next
- * advance clears that run, so a deep buffer that steps every few polls does
- * not rebuild. Closing a window, or leaving cooldown, starts the next window
- * on the following sample.
+ * One eligible sample is not enough. The first window of a call rebuilds
+ * once near-zero output has covered [startupSilentMs] and at least
+ * [startupElapsedMs] have passed, so the greeting is not lost for the whole
+ * 3s window. Later windows still need half of [windowMs]. A stalled head
+ * counts only while it stays still, and only against that longer bar: the
+ * next advance clears the run, so a deep buffer that steps every few polls
+ * does not rebuild. Closing a window, or leaving cooldown, starts the next
+ * window on the following sample. [Decision.evaluated] is set only when a
+ * window actually decides, so the call log can show holds as well as fires.
  */
 class PlaybackSilenceWatch(
     private val speechRms: Int = 200,
@@ -21,8 +26,11 @@ class PlaybackSilenceWatch(
     private val windowMs: Long = 3_000,
     private val cooldownMs: Long = 8_000,
     private val sampleGapCapMs: Long = 40,
+    private val startupElapsedMs: Long = 1_000,
+    private val startupSilentMs: Long = 600,
 ) {
     private val sustainedMs = windowMs / 2
+    private var opening = true
     private var windowStart = -1L
     private var lastAt = -1L
     private var silentMs = 0L
@@ -31,7 +39,15 @@ class PlaybackSilenceWatch(
     private var maxPlay = 0
     private var cooldownUntil = 0L
 
-    data class Decision(val rebuild: Boolean, val reason: String = "")
+    data class Decision(
+        val rebuild: Boolean,
+        val reason: String = "",
+        val evaluated: Boolean = false,
+        val silentMs: Long = 0,
+        val stallMs: Long = 0,
+        val maxInput: Int = 0,
+        val maxPlay: Int = 0,
+    )
 
     fun observe(
         nowMs: Long,
@@ -54,16 +70,13 @@ class PlaybackSilenceWatch(
             if (playRms <= silentRms) silentMs += gap
             if (!headAdvanced) stallMs += gap
         }
-        if (nowMs - windowStart < windowMs) return Decision(false)
-        val decision = decide()
-        windowStart = -1L
-        lastAt = -1L
-        silentMs = 0L
-        stallMs = 0L
-        maxInput = 0
-        maxPlay = 0
-        if (decision.rebuild) cooldownUntil = nowMs + cooldownMs
-        return decision
+        val elapsed = nowMs - windowStart
+        if (opening && elapsed >= startupElapsedMs && silentMs >= startupSilentMs) {
+            val reason = "call-start rx speech rms=$maxInput but playRMS=$maxPlay"
+            return finish(nowMs, snapshot(true, reason))
+        }
+        if (elapsed < windowMs) return Decision(false)
+        return finish(nowMs, decide())
     }
 
     private fun openWindow(nowMs: Long) {
@@ -77,12 +90,34 @@ class PlaybackSilenceWatch(
 
     private fun decide(): Decision {
         if (silentMs >= sustainedMs) {
-            return Decision(true, "rx speech rms=$maxInput but playRMS=$maxPlay")
+            return snapshot(true, "rx speech rms=$maxInput but playRMS=$maxPlay")
         }
         if (stallMs >= sustainedMs) {
-            return Decision(true, "track head stalled while rx rms=$maxInput playRMS=$maxPlay")
+            return snapshot(true, "track head stalled while rx rms=$maxInput playRMS=$maxPlay")
         }
-        return Decision(false)
+        return snapshot(false, "")
+    }
+
+    private fun snapshot(rebuild: Boolean, reason: String) = Decision(
+        rebuild = rebuild,
+        reason = reason,
+        evaluated = true,
+        silentMs = silentMs,
+        stallMs = stallMs,
+        maxInput = maxInput,
+        maxPlay = maxPlay,
+    )
+
+    private fun finish(nowMs: Long, decision: Decision): Decision {
+        windowStart = -1L
+        lastAt = -1L
+        silentMs = 0L
+        stallMs = 0L
+        maxInput = 0
+        maxPlay = 0
+        opening = false
+        if (decision.rebuild) cooldownUntil = nowMs + cooldownMs
+        return decision
     }
 }
 
@@ -95,6 +130,15 @@ internal fun playbackRebuildOnRoute(routedType: Int, telephonyType: Int): Boolea
     if (routedType < 0) return null
     return routedType != telephonyType
 }
+
+/**
+ * The 3s false→true re-toggle is for a track whose route is not telephony yet.
+ * Repeating it once the track is already on telephony tears the incall-music
+ * usecase down, and the HAL can take the rest of the greeting to bring it back.
+ * An unknown route (`routedType < 0`) still re-toggles.
+ */
+internal fun incallRetoggleNeeded(routedType: Int, telephonyType: Int): Boolean =
+    routedType != telephonyType
 
 /** Energy of one hub downlink frame, before the playback loop rewrites it. */
 object FrameEnergy {

@@ -941,8 +941,10 @@ class RtpSession(
 
     private fun timeoutLoop() {
         // Early re-assertion at 3s: combat Android re-revoking RECORD_AUDIO
-        // when screen is off, and re-toggle incall_music after speaker route
-        // is fully settled (~1.5s after configureAudioBridge).
+        // when the screen is off. incall_music is re-toggled only if the
+        // playback track is not already on TYPE_TELEPHONY. A second
+        // false→true on that route tears the usecase down and the greeting
+        // is gone until the HAL brings it back.
         try { Thread.sleep(3_000) } catch (_: InterruptedException) { return }
         if (running.get()) {
             reAssertAppOps()
@@ -1054,9 +1056,13 @@ class RtpSession(
     private val jbCatchupFrames = 25  // catch up to 500 ms
 
     /**
-     * New track every call, and again when playback goes silent. Preferred
-     * device is set only while the track is stopped. setPreferredDevice on a
-     * playing track is what produces restoreTrack_l.
+     * New track every call, and again when playback goes silent. The public
+     * builder cannot pass a device into native_setup, so the first IAudioTrack
+     * is on the default output. setPreferredDevice while that track is stopped
+     * is what logs `restoreTrack_l ... from setOutputDevice()`: AudioFlinger
+     * replaces the native track so the replacement is created on the selected
+     * device. Volume is applied after that replacement. Doing the same call
+     * while the track is playing invalidates it instead.
      */
     private fun createPlaybackTrack(usage: Int, contentType: Int): AudioTrack? {
         val playRates = if (wsMode) listOf(48000, 16000, 8000) else listOf(playbackRate)
@@ -1109,25 +1115,49 @@ class RtpSession(
     }
 
     private fun armPlaybackTrack(track: AudioTrack) {
-        try {
-            track.setVolume(1f)
-        } catch (_: Exception) {
-        }
         val dev = telephonyOutput()
         if (dev != null && track.playState != AudioTrack.PLAYSTATE_PLAYING) {
             val ok = try {
                 track.setPreferredDevice(dev)
+                true
             } catch (e: Exception) {
                 Log.w(TAG, "setPreferredDevice failed: ${e.message}")
                 false
             }
-            Log.i(TAG, "AudioTrack armed on TYPE_TELEPHONY: $ok (id=${dev.id})")
+            Log.i(
+                TAG,
+                "setPreferredDevice TYPE_TELEPHONY id=${dev.id} while stopped " +
+                    "(AudioFlinger restoreTrack_l from setOutputDevice): $ok",
+            )
         } else if (profile.routing.playbackToTelephony && dev == null) {
             Log.w(TAG, "TYPE_TELEPHONY device not found — playback will use default device")
+        }
+        try {
+            track.setVolume(1f)
+        } catch (_: Exception) {
         }
         if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
             track.play()
         }
+        primePlayback(track)
+    }
+
+    /** One 20 ms silence write so incall_music sees an active STREAM_MUSIC output. */
+    private fun primePlayback(track: AudioTrack) {
+        val bytes = (playbackRate.coerceAtLeast(8_000) * 2 / 50).coerceAtMost(4_096)
+        val silence = ByteArray(bytes)
+        val wrote = try {
+            track.write(silence, 0, silence.size)
+        } catch (e: Exception) {
+            Log.w(TAG, "playback prime failed: ${e.message}")
+            -1
+        }
+        val routed = try {
+            track.routedDevice?.type ?: -1
+        } catch (_: Exception) {
+            -1
+        }
+        Log.i(TAG, "playback primed $wrote bytes before incall_music routed=$routed")
     }
 
     private fun applyPlaybackRoute(routedType: Int) {
@@ -1225,6 +1255,20 @@ class RtpSession(
             advanced,
             eligible,
         )
+        if (decision.evaluated) {
+            val routed = try {
+                track.routedDevice?.type ?: -1
+            } catch (_: Exception) {
+                -1
+            }
+            val verdict = if (decision.rebuild) "rebuild (${decision.reason})" else "hold"
+            val line = "playback silence: eval silentMs=${decision.silentMs} " +
+                "stallMs=${decision.stallMs} maxIn=${decision.maxInput} maxPlay=${decision.maxPlay} " +
+                "routed=$routed -> $verdict"
+            Log.i(TAG, line)
+            BridgeLog.i(line)
+            listener?.onRtpStats(line)
+        }
         val leftTelephony = playbackRebuild.getAndSet(false)
         if (!running.get()) return
         if (decision.rebuild) {
@@ -1762,17 +1806,29 @@ class RtpSession(
     private fun reToggleIncallMusic() {
         val param = profile.routing.incallMusicParam
         if (param.isEmpty()) return
+        val routed = try {
+            audioTrack?.routedDevice?.type ?: -1
+        } catch (_: Exception) {
+            -1
+        }
+        if (!incallRetoggleNeeded(routed, AudioDeviceInfo.TYPE_TELEPHONY)) {
+            val line = "$param re-toggle skipped; track already on TYPE_TELEPHONY"
+            Log.i(TAG, line)
+            listener?.onRtpStats(line)
+            return
+        }
         try {
             val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
             am?.let {
+                Log.i(TAG, "$param re-toggle: routed=$routed (not telephony yet)")
                 it.setParameters("${param}=false")
                 Thread.sleep(50)
                 it.setParameters("${param}=true")
                 GsmCallManager.enforceVolumes(it)
-                Log.i(TAG, "${param} re-toggled (3s safety), mode=${it.mode}")
+                Log.i(TAG, "$param re-toggled (3s safety), mode=${it.mode}")
             }
         } catch (e: Exception) {
-            Log.w(TAG, "${param} re-toggle failed: ${e.message}")
+            Log.w(TAG, "$param re-toggle failed: ${e.message}")
         }
     }
 
