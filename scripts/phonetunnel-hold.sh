@@ -12,9 +12,12 @@ logger -t phonetunnel "session client=${SSH_CLIENT:-unknown} orig=${SSH_ORIGINAL
 
 if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
     logger -t phonetunnel "rejected command" 2>/dev/null || true
+    echo "phonetunnel: command refused" >&2
     exit 1
 fi
 
+# No command was requested. This is still not a shell.
+echo "phonetunnel: no shell" >&2
 trap 'exit 0' HUP INT TERM
 while true; do
     sleep 3600

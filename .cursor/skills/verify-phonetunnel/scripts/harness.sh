@@ -23,6 +23,20 @@ run_dir() {
     cat "$RUNFILE"
 }
 
+phone_status() {
+    local run="$1"
+    if [ -z "$run" ]; then
+        run=$(run_dir)
+    fi
+    PHONETUNNEL_STATE="$run/state" \
+        PHONETUNNEL_MODDIR="$MODULE" \
+        PHONETUNNEL_CONFIG="$run/state/config.env" \
+        PHONETUNNEL_DBCLIENT="$run/bin/dbclient" \
+        PHONETUNNEL_DROPBEAR="$run/bin/dropbear" \
+        PHONETUNNEL_DROPBEARKEY="$run/bin/dropbearkey" \
+        sh "$MODULE/bin/status.sh"
+}
+
 free_port() {
     python3 - << 'PY'
 import socket
@@ -83,10 +97,7 @@ cmd_doctor() {
             run=$(cat "$RUNFILE")
             echo "stand-in run dir: $run"
             if [ -f "$run/state/config.env" ]; then
-                PHONETUNNEL_STATE="$run/state" \
-                    PHONETUNNEL_MODDIR="$MODULE" \
-                    PHONETUNNEL_CONFIG="$run/state/config.env" \
-                    sh "$MODULE/bin/status.sh" || true
+                phone_status || true
             fi
         else
             echo "stand-in: not launched"
@@ -120,7 +131,8 @@ cmd_launch() {
     fi
     # OpenSSH refuses pubkey auth when the shadow field starts with '!'.
     sudo usermod -p '*' phonetunnel
-    sudo usermod -s /usr/sbin/nologin phonetunnel
+    # nologin ignores ForceCommand. /bin/sh is what actually runs the hold script.
+    sudo usermod -s /bin/sh phonetunnel
 
     local cup_port ssh_remote adb_remote phone_ssh phone_adb
     cup_port=$(free_port)
@@ -317,14 +329,13 @@ cmd_drive_tunnel() {
     out="$EVIDENCE/tunnel-up.txt"
     {
         echo "drive tunnel-up $(date -Is)"
-        PHONETUNNEL_STATE="$run/state" \
-            PHONETUNNEL_MODDIR="$MODULE" \
-            PHONETUNNEL_CONFIG="$run/state/config.env" \
-            sh "$MODULE/bin/status.sh"
-        grep -q '^tunnel=up$' <(PHONETUNNEL_STATE="$run/state" \
-            PHONETUNNEL_MODDIR="$MODULE" \
-            PHONETUNNEL_CONFIG="$run/state/config.env" \
-            sh "$MODULE/bin/status.sh")
+        phone_status "$run"
+        phone_status "$run" > "$run/status.out"
+        grep -q '^tunnel=up$' "$run/status.out"
+        grep -q '^tunnel_session=up$' "$run/status.out"
+        grep -q '^phone_sshd=listening$' "$run/status.out"
+        grep -q '^phone_adb_managed=untouched$' "$run/status.out"
+        grep -E -q '^host_fingerprint=SHA256:' "$run/status.out"
 
         local nonce
         nonce="tunnel-$(date +%s)-$$"
@@ -393,10 +404,38 @@ PY
 cmd_drive_shell() {
     local run nonce
     run=$(run_dir)
+    # shellcheck disable=SC1091
+    . "$run/ports"
     nonce="shell-$(date +%s)-$$"
     {
         echo "drive phone-shell $(date -Is)"
         shell_echo "$nonce"
+        if grep -q 'no-pty' "$run/state/authorized_keys"; then
+            die "shell key still sets no-pty, so a rescue shell cannot allocate a TTY"
+        fi
+        echo "shell key does not set no-pty"
+        # qemu-user cannot set a controlling tty (TIOCSCTTY, missing pts slave).
+        # A real PTY is an on-device check. Here we only require that the
+        # failure, if any, is that qemu limit and not a rejected pty request.
+        set +e
+        ssh -tt -i "$run/phone_shell_ed25519" \
+            -p "$SSH_REMOTE" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$run/phone_known_hosts" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            "$(id -un)@127.0.0.1" 'if [ -t 0 ]; then echo pty=yes; else echo pty=no; fi' \
+            > "$run/pty.out" 2> "$run/pty.err"
+        set -e
+        echo "pty stdout=$(tr -d '\r' < "$run/pty.out")"
+        if grep -q 'pty=yes' "$run/pty.out"; then
+            echo "pty allocated in this stand-in"
+        else
+            grep -E -q 'TIOCSCTTY|/dev/pts' "$run/state/phonetunnel.log" \
+                || die "pty failed for a reason other than qemu-user tty setup"
+            echo "pty not proven here: qemu-user cannot set a controlling tty"
+        fi
         echo "phone-shell ok"
     } | tee "$EVIDENCE/phone-shell.txt"
     grep -q "$nonce" "$EVIDENCE/phone-shell.txt"
@@ -519,13 +558,27 @@ cmd_drive_watchdog() {
     mkdir -p "$wd/bin" "$wd/state"
     cat > "$wd/bin/ip" << EOF
 #!/bin/sh
-if [ "\${1:-}" = "-o" ] && [ "\${2:-}" = "addr" ]; then
-    if [ -f "$wd/tailscale_up" ]; then
-        echo "1: tailscale0    inet 100.64.0.2/32 scope global tailscale0"
-    fi
+mode=\$(cat "$wd/ip.mode" 2>/dev/null || echo missing)
+if [ "\$mode" = error ]; then
+    echo "ip: invalid argument" >&2
+    exit 1
+fi
+if [ "\$mode" = missing ]; then
+    echo "Device \\"tailscale0\\" does not exist." >&2
+    exit 1
+fi
+if [ "\$mode" = up ]; then
+    echo "3: tailscale0: <BROADCAST,UP> mtu 1280 qdisc fq_codel state UNKNOWN"
+    echo "    inet 100.64.0.2/32 scope global tailscale0"
     exit 0
 fi
-exit 0
+if [ "\$mode" = noinet ]; then
+    echo "3: tailscale0: <BROADCAST,UP> mtu 1280"
+    echo "    inet6 fe80::1/64 scope link"
+    exit 0
+fi
+echo "ip: unknown mode" >&2
+exit 1
 EOF
     cat > "$wd/bin/am" << EOF
 #!/bin/sh
@@ -537,6 +590,7 @@ EOF
 cat "$wd/dumpsys.txt"
 EOF
     chmod 755 "$wd/bin/ip" "$wd/bin/am" "$wd/bin/dumpsys"
+    printf 'missing\n' > "$wd/ip.mode"
     printf 'mCallState=0\n' > "$wd/dumpsys.txt"
     : > "$wd/am.log"
     cat > "$wd/state/config.env" << 'EOF'
@@ -591,6 +645,38 @@ EOF
         echo "during call, am lines: $lines"
         [ "$lines" -eq 2 ]
 
+        # Unknown telephony is not idle. A high streak and a cleared
+        # rate-limit must still not call am.
+        inhibit() {
+            printf '0\n' > "$wd/state/watchdog.last"
+            printf '9\n' > "$wd/state/watchdog.streak"
+            "${env_prefix[@]}" sh "$MODULE/bin/watchdog.sh" once
+            lines=$(wc -l < "$wd/am.log" | tr -d ' ')
+            echo "$1, am lines: $lines"
+            [ "$lines" -eq 2 ]
+        }
+        : > "$wd/dumpsys.txt"
+        inhibit "empty dumpsys"
+        printf '%s\n' "Can't find service: telephony.registry" > "$wd/dumpsys.txt"
+        inhibit "dumpsys error text"
+        printf '%s\n' "mCallState=0" "mPreciseCallState=FG_ACTIVE" > "$wd/dumpsys.txt"
+        inhibit "mPreciseCallState=FG_ACTIVE"
+        printf 'mCallState=0\n' > "$wd/dumpsys.txt"
+        printf 'error\n' > "$wd/ip.mode"
+        inhibit "ip error"
+        printf 'missing\n' > "$wd/ip.mode"
+        mv "$wd/bin/dumpsys" "$wd/bin/dumpsys.hide"
+        inhibit "dumpsys not on PATH"
+        mv "$wd/bin/dumpsys.hide" "$wd/bin/dumpsys"
+
+        # A real missing interface plus an explicit idle is still a restart.
+        printf '0\n' > "$wd/state/watchdog.last"
+        printf '1\n' > "$wd/state/watchdog.streak"
+        "${env_prefix[@]}" sh "$MODULE/bin/watchdog.sh" once
+        lines=$(wc -l < "$wd/am.log" | tr -d ' ')
+        echo "after explicit idle and missing interface, am lines: $lines"
+        [ "$lines" -eq 4 ]
+
         # A config that names the bridge package must not call am.
         sed 's/TS_PACKAGE=com.tailscale.ipn/TS_PACKAGE=com.gsm2computer.bridge/' \
             "$wd/state/config.env" > "$wd/state/config.bad"
@@ -604,10 +690,338 @@ EOF
             sh "$MODULE/bin/watchdog.sh" once
         lines=$(wc -l < "$wd/am.log" | tr -d ' ')
         echo "bridge package in config, am lines: $lines"
-        [ "$lines" -eq 2 ]
+        [ "$lines" -eq 4 ]
         grep -q 'TS_PACKAGE must be com.tailscale.ipn' "$wd/state/phonetunnel.log"
         echo "watchdog ok"
     } | tee "$EVIDENCE/watchdog.txt"
+}
+
+cmd_drive_supervise() {
+    local run
+    run=$(run_dir)
+    # shellcheck disable=SC1091
+    . "$run/ports"
+    local out="$EVIDENCE/supervise.txt"
+    {
+        echo "drive supervise $(date -Is)"
+        local tun drop i nonce back
+        tun=$(cat "$run/state/tunnel.pid")
+        drop=$(cat "$run/state/dropbear.pid")
+        echo "kill dropbear pid $drop; tunnel pid $tun must stay"
+        kill "$drop"
+        back=0
+        for i in $(seq 1 20); do
+            if [ -f "$run/state/dropbear.pid" ] \
+                && [ "$(cat "$run/state/dropbear.pid")" != "$drop" ] \
+                && tcp_open "$PHONE_SSH"; then
+                back=1
+                break
+            fi
+            sleep 1
+        done
+        echo "sshd restarted=$back tunnel_now=$(cat "$run/state/tunnel.pid" 2>/dev/null || echo none)"
+        [ "$back" = 1 ]
+        [ "$(cat "$run/state/tunnel.pid")" = "$tun" ]
+        nonce="resshd-$(date +%s)"
+        wait_shell "$nonce"
+        echo "shell after sshd restart under the same tunnel ($nonce)"
+
+        # A dropbear that exits immediately must not leave tunnel=up.
+        mv "$run/bin/dropbear" "$run/bin/dropbear.real"
+        printf '%s\n' '#!/bin/sh' 'exit 1' > "$run/bin/dropbear"
+        chmod 755 "$run/bin/dropbear"
+        kill "$(cat "$run/state/dropbear.pid")" 2>/dev/null || true
+        back=0
+        for i in $(seq 1 15); do
+            phone_status "$run" > "$run/status.down" || true
+            if grep -q '^phone_sshd=down$' "$run/status.down" \
+                && grep -q '^tunnel=down$' "$run/status.down" \
+                && grep -q '^tunnel_session=up$' "$run/status.down"; then
+                back=1
+                break
+            fi
+            sleep 1
+        done
+        echo "while sshd cannot start:"
+        cat "$run/status.down" || true
+        [ "$back" = 1 ]
+        [ "$(cat "$run/state/tunnel.pid")" = "$tun" ]
+        mv "$run/bin/dropbear.real" "$run/bin/dropbear"
+        back=0
+        for i in $(seq 1 20); do
+            if tcp_open "$PHONE_SSH"; then
+                phone_status "$run" > "$run/status.back" || true
+                if grep -q '^tunnel=up$' "$run/status.back"; then
+                    back=1
+                    break
+                fi
+            fi
+            sleep 1
+        done
+        echo "after dropbear restored, tunnel_up=$back"
+        [ "$back" = 1 ]
+        [ "$(cat "$run/state/tunnel.pid")" = "$tun" ]
+        nonce="rebin-$(date +%s)"
+        wait_shell "$nonce"
+        echo "shell after binary restored ($nonce)"
+        echo "supervise ok"
+    } | tee "$out"
+}
+
+cmd_drive_policy() {
+    local out="$EVIDENCE/policy.txt"
+    {
+        echo "drive policy $(date -Is)"
+        local plog
+        plog=$(mktemp -d)
+        trap 'if [ -f /run/phonetunnel-policy/ok/sshd.pid ]; then sudo kill "$(cat /run/phonetunnel-policy/ok/sshd.pid)" 2>/dev/null || true; fi; if [ -n "${dpid:-}" ]; then kill "$dpid" 2>/dev/null || true; fi; sudo rm -rf /run/phonetunnel-policy; sudo rm -f /tmp/pt-stream-sock; rm -rf "'"$plog"'"' EXIT
+        local hits
+        hits=$(grep -R -n -E 'setprop|persist\.adb|service\.adb|start adbd' "$MODULE" --include='*.sh' \
+            | grep -v -E ':[0-9]+:[[:space:]]*#' || true)
+        if [ -n "$hits" ]; then
+            printf '%s\n' "$hits"
+            die "module scripts still reconfigure adbd"
+        fi
+        echo "module scripts do not set adb tcp properties or start adbd"
+
+        local tmp
+        tmp=$(mktemp -d)
+        cat > "$tmp/config.env" << 'EOF'
+CUP_HOST=127.0.0.1
+CUP_PORT=1
+CUP_USER=phonetunnel
+KEEPALIVE_SEC=0
+BACKOFF_INITIAL_SEC=0
+BACKOFF_MAX_SEC=0
+SSH_REMOTE_PORT=2
+ADB_REMOTE_PORT=3
+PHONE_SSH_PORT=4
+PHONE_ADB_PORT=5
+TS_PACKAGE=com.tailscale.ipn
+TS_ACTIVITY=com.tailscale.ipn/com.tailscale.ipn.IPNActivity
+TS_CHECK_SEC=0
+TS_DOWN_STREAK=0
+TS_RESTART_MIN_SEC=0
+EOF
+        PHONETUNNEL_STATE="$tmp" \
+            PHONETUNNEL_LOG="$tmp/phonetunnel.log" \
+            PHONETUNNEL_CONFIG="$tmp/config.env" \
+            PHONETUNNEL_MODDIR="$MODULE" \
+            sh -c '
+                . "$PHONETUNNEL_MODDIR/bin/common.sh"
+                load_config
+                echo "check=$TS_CHECK_SEC"
+                echo "restart=$TS_RESTART_MIN_SEC"
+                echo "streak=$TS_DOWN_STREAK"
+                echo "keep=$KEEPALIVE_SEC"
+                echo "backoff=$BACKOFF_INITIAL_SEC"
+                echo "clamped=$PHONETUNNEL_TIMERS_CLAMPED"
+            ' > "$tmp/timers.out"
+        cat "$tmp/timers.out"
+        grep -q '^check=15$' "$tmp/timers.out"
+        grep -q '^restart=60$' "$tmp/timers.out"
+        grep -q '^streak=2$' "$tmp/timers.out"
+        grep -q '^keep=45$' "$tmp/timers.out"
+        grep -q '^clamped=1$' "$tmp/timers.out"
+        rm -rf "$tmp"
+        echo "zero timers were raised"
+
+        sudo mkdir -p /run/sshd /run/phonetunnel-policy
+        sudo chmod 755 /run/phonetunnel-policy
+        # shell is /bin/sh so ForceCommand is actually executed.
+        sudo usermod -s /bin/sh phonetunnel
+
+        policy_fail_closed() {
+            local work before after
+            work=/run/phonetunnel-policy/conflict
+            sudo rm -rf "$work"
+            sudo mkdir -p "$work/etc/ssh" "$work/inc"
+            sudo ssh-keygen -t ed25519 -f "$work/etc/ssh/ssh_host_ed25519_key" -N "" -C policy >/dev/null
+            sudo chmod 600 "$work/etc/ssh/ssh_host_ed25519_key"
+            sudo tee "$work/inc/loose.conf" >/dev/null << 'EOF'
+Match User phonetunnel
+    AllowTcpForwarding yes
+    PermitOpen any
+    AllowStreamLocalForwarding yes
+EOF
+            sudo tee "$work/etc/ssh/sshd_config" >/dev/null << EOF
+Include $work/inc/loose.conf
+Port 1
+ListenAddress 127.0.0.1
+HostKey $work/etc/ssh/ssh_host_ed25519_key
+UsePAM no
+PasswordAuthentication no
+PubkeyAuthentication yes
+EOF
+            before=$(sudo sha256sum "$work/etc/ssh/sshd_config")
+            if sudo "$SETUP" --root "$work" --cup-host 127.0.0.1 --cup-port 1 \
+                --ssh-port 2222 --adb-port 5556 >"$plog/conflict.out" 2>"$plog/conflict.err"; then
+                echo "conflict setup unexpectedly succeeded"
+                cat "$plog/conflict.err"
+                die "loose Include Match was accepted"
+            fi
+            after=$(sudo sha256sum "$work/etc/ssh/sshd_config")
+            echo "conflict setup refused"
+            cat "$plog/conflict.err"
+            [ "$before" = "$after" ]
+            if sudo grep -q 'BEGIN gsm2computer-phonetunnel' "$work/etc/ssh/sshd_config"; then
+                die "failed setup left its Match block in place"
+            fi
+            echo "conflict config restored byte for byte"
+        }
+        policy_fail_closed
+
+        local work port ssh_r adb_r
+        work=/run/phonetunnel-policy/ok
+        port=$(free_port)
+        ssh_r=$(free_port)
+        adb_r=$(free_port)
+        sudo rm -rf "$work"
+        sudo mkdir -p "$work/etc/ssh"
+        sudo ssh-keygen -t ed25519 -f "$work/etc/ssh/ssh_host_ed25519_key" -N "" -C policyok >/dev/null
+        sudo chmod 600 "$work/etc/ssh/ssh_host_ed25519_key"
+        # A later loose Match must lose, because the script inserts first.
+        sudo tee "$work/etc/ssh/sshd_config" >/dev/null << EOF
+Port $port
+ListenAddress 127.0.0.1
+HostKey $work/etc/ssh/ssh_host_ed25519_key
+PidFile $work/sshd.pid
+UsePAM no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile $work/home/phonetunnel/.ssh/authorized_keys
+Match User phonetunnel
+    AllowTcpForwarding yes
+    PermitOpen any
+    AllowStreamLocalForwarding yes
+EOF
+        sudo "$SETUP" --root "$work" --cup-host 127.0.0.1 --cup-port "$port" \
+            --ssh-port "$ssh_r" --adb-port "$adb_r" >"$plog/ok-setup.out"
+        echo "strict Match inserted ahead of a later loose Match"
+        sudo /usr/sbin/sshd -T -C user=phonetunnel,host=127.0.0.1,addr=127.0.0.1 \
+            -f "$work/etc/ssh/sshd_config" | awk '$1 ~ /^(allowtcpforwarding|allowstreamlocalforwarding|permitopen|permittty|forcecommand)$/'
+        sudo chmod 755 "$work" "$work/home" "$work/home/phonetunnel" "$work/home/phonetunnel/.ssh" || true
+        sudo chown -R phonetunnel:phonetunnel "$work/home/phonetunnel"
+        sudo chmod 700 "$work/home/phonetunnel" "$work/home/phonetunnel/.ssh"
+        sudo chmod 600 "$work/home/phonetunnel/.ssh/authorized_keys"
+        sudo mkdir -p /run/sshd
+        sudo /usr/sbin/sshd -f "$work/etc/ssh/sshd_config"
+        sleep 0.3
+
+        local id_ossh
+        id_ossh=$plog/id_openssh
+        sudo cp "$work/root/phonetunnel-install/id_ed25519" "$plog/id_dropbear"
+        sudo chown "$(id -u):$(id -g)" "$plog/id_dropbear"
+        chmod 600 "$plog/id_dropbear"
+        dropbearconvert dropbear openssh "$plog/id_dropbear" "$id_ossh"
+        chmod 600 "$id_ossh"
+
+        local cout cerr
+        cout=$plog/cmd.out
+        cerr=$plog/cmd.err
+        if ssh -i "$id_ossh" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -p "$port" phonetunnel@127.0.0.1 'echo pwned' >"$cout" 2>"$cerr"; then
+            die "phonetunnel command session succeeded"
+        fi
+        echo "command stdout=$(cat "$cout")"
+        echo "command stderr=$(cat "$cerr")"
+        grep -q 'phonetunnel: command refused' "$cerr"
+        if grep -q pwned "$cout"; then
+            die "requested command was executed"
+        fi
+        if grep -q 'not available' "$cerr"; then
+            die "nologin swallowed ForceCommand"
+        fi
+
+        ssh -i "$id_ossh" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -p "$port" -N -T -o ExitOnForwardFailure=yes \
+            -R "127.0.0.1:${ssh_r}:127.0.0.1:9" phonetunnel@127.0.0.1 \
+            >"$plog/r.out" 2>"$plog/r.err" &
+        local rpid=$!
+        sleep 0.6
+        if ! kill -0 "$rpid" 2>/dev/null; then
+            cat "$plog/r.err"
+            die "allowed reverse forward failed"
+        fi
+        kill "$rpid" 2>/dev/null || true
+        wait "$rpid" 2>/dev/null || true
+        echo "allowed -R stayed up"
+
+        if ssh -i "$id_ossh" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -p "$port" -N -T -o ExitOnForwardFailure=yes \
+            -R "127.0.0.1:39999:127.0.0.1:9" phonetunnel@127.0.0.1 \
+            >"$plog/bad.out" 2>"$plog/bad.err"; then
+            die "disallowed -R was accepted"
+        fi
+        echo "disallowed -R refused"
+
+        local dest lport
+        dest=$(free_port)
+        python3 - "$dest" << 'PY' &
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(5)
+while True:
+    c, _ = s.accept()
+    c.sendall(b"dest-ok\n")
+    c.close()
+PY
+        local dpid=$!
+        sleep 0.2
+        lport=$(free_port)
+        ssh -i "$id_ossh" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -p "$port" -N -T -o ExitOnForwardFailure=yes \
+            -L "127.0.0.1:${lport}:127.0.0.1:${dest}" phonetunnel@127.0.0.1 \
+            >"$plog/l.out" 2>"$plog/l.err" &
+        local lpid=$!
+        sleep 0.5
+        python3 - "$lport" << 'PY' > "$plog/l.probe" 2>&1 || true
+import socket, sys
+s = socket.socket()
+s.settimeout(2)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+    s.sendall(b"x")
+    data = s.recv(32)
+    sys.stdout.write(repr(data))
+except Exception as e:
+    sys.stdout.write(type(e).__name__ + ": " + str(e))
+PY
+        kill "$lpid" 2>/dev/null || true
+        wait "$lpid" 2>/dev/null || true
+        kill "$dpid" 2>/dev/null || true
+        echo "local forward probe: $(cat "$plog/l.probe")"
+        echo "local forward log: $(cat "$plog/l.err")"
+        if grep -q 'dest-ok' "$plog/l.probe"; then
+            die "-L reached a destination"
+        fi
+        grep -E -q 'administratively prohibited|ConnectionReset|Connection reset|refused' \
+            "$plog/l.err" "$plog/l.probe"
+
+        sudo rm -f /tmp/pt-stream-sock
+        if ssh -i "$id_ossh" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -p "$port" -N -T -o ExitOnForwardFailure=yes \
+            -R "/tmp/pt-stream-sock:127.0.0.1:9" phonetunnel@127.0.0.1 \
+            >"$plog/s.out" 2>"$plog/s.err"; then
+            die "unix-socket forward was accepted"
+        fi
+        if [ -S /tmp/pt-stream-sock ]; then
+            die "unix-socket forward created a socket"
+        fi
+        echo "streamlocal refused: $(grep -E 'Error|administratively' "$plog/s.err" || true)"
+        sudo kill "$(cat "$work/sshd.pid")" 2>/dev/null || true
+        echo "policy ok"
+    } | tee "$out"
+    sudo rm -rf /run/phonetunnel-policy
+    sudo rm -f /tmp/pt-stream-sock
 }
 
 assert_system_sshd_untouched() {
@@ -622,7 +1036,9 @@ cmd_drive_all() {
     cmd_drive_shell
     cmd_drive_adb
     cmd_drive_reconnect
+    cmd_drive_supervise
     cmd_drive_watchdog
+    cmd_drive_policy
     assert_system_sshd_untouched
     local run
     run=$(run_dir)
@@ -694,10 +1110,12 @@ case "${1:-}" in
     drive-adb) cmd_drive_adb ;;
     drive-reconnect) cmd_drive_reconnect ;;
     drive-watchdog) cmd_drive_watchdog ;;
+    drive-supervise) cmd_drive_supervise ;;
+    drive-policy) cmd_drive_policy ;;
     drive-all) cmd_drive_all ;;
     cleanup) cmd_cleanup ;;
     *)
-        echo "usage: harness.sh doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-watchdog|drive-all|cleanup" >&2
+        echo "usage: harness.sh doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-supervise|drive-watchdog|drive-policy|drive-all|cleanup" >&2
         exit 2
         ;;
 esac

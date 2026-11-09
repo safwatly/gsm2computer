@@ -7,7 +7,7 @@
 - Cup localhost gains exactly two listeners, the shell port and the adb port.
 - A reverse forward to any other port is refused.
 - A local (`-L`) forward's data path is refused.
-- `phonetunnel-status` reports `tunnel=up`.
+- `phonetunnel-status` reports `tunnel=up` only when the session is alive and the phone sshd is listening, plus `host_fingerprint=SHA256:...` and `phone_adb_managed=untouched`.
 
 ## How to get to it (user POV)
 

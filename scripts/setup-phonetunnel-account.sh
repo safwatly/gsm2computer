@@ -139,19 +139,26 @@ if [ "$DRY" -eq 0 ] && [ "$APPLY_SYSTEM" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-NL="/usr/sbin/nologin"
-if [ ! -x "$NL" ]; then
-    if [ -x /sbin/nologin ]; then
-        NL="/sbin/nologin"
-    else
-        NL="/bin/false"
+# nologin does not run ForceCommand. sshd execs "$SHELL -c <forcecommand>",
+# and nologin ignores -c, prints "not available", and exits. /bin/sh runs
+# the hold script. The hold script is what refuses a command. -N forwards
+# do not open a session, so they never run it.
+SHELL_BIN=""
+for _sh in /bin/sh /usr/bin/sh; do
+    if [ -x "$_sh" ]; then
+        SHELL_BIN=$_sh
+        break
     fi
+done
+if [ -z "$SHELL_BIN" ]; then
+    echo "no /bin/sh to run ForceCommand" >&2
+    exit 1
 fi
 
 # OpenSSH treats a shadow password starting with ! as a locked account
 # and refuses public-key logins. '*' is "no password" without the lock.
-# The shell is nologin; ForceCommand is what actually runs for a session.
-# -N port forwards do not need a shell. This was checked on OpenSSH 9.6.
+# Checked on OpenSSH 9.6: the first matching Match keyword wins, so this
+# block is inserted before any other Match and then re-read with sshd -T.
 
 match_block() {
     cat << EOF
@@ -159,6 +166,7 @@ match_block() {
 # Managed by scripts/setup-phonetunnel-account.sh. Do not edit by hand.
 Match User ${USER_NAME}
     AllowTcpForwarding remote
+    AllowStreamLocalForwarding no
     GatewayPorts no
     PermitTTY no
     X11Forwarding no
@@ -175,8 +183,9 @@ EOF
 
 if [ "$DRY" -eq 1 ]; then
     say "dry-run: would install $HOLD_SRC -> $HOLD_DST"
-    say "dry-run: would ensure user $USER_NAME shell=$NL shadow='*' (only when --root /)"
-    say "dry-run: would write Match block to the end of $SSHD_CONFIG"
+    say "dry-run: would ensure user $USER_NAME shell=$SHELL_BIN shadow='*' (only when --root /)"
+    say "dry-run: would insert Match before any other Match in $SSHD_CONFIG"
+    say "dry-run: would refuse to continue if sshd -T for $USER_NAME is looser than that Match"
     say "dry-run: would generate or reuse keys in $BUNDLE"
     say "dry-run: would install a restricted authorized_keys at $AUTH_KEYS"
     if [ "$APPLY_SYSTEM" -eq 1 ]; then
@@ -195,7 +204,7 @@ if [ "$APPLY_SYSTEM" -eq 1 ]; then
     if ! id "$USER_NAME" >/dev/null 2>&1; then
         useradd --system --create-home --home-dir "/home/${USER_NAME}" --shell "$NL" "$USER_NAME"
     fi
-    usermod -s "$NL" "$USER_NAME"
+    usermod -s "$SHELL_BIN" "$USER_NAME"
     # shellcheck disable=SC2016
     usermod -p '*' "$USER_NAME"
     chmod 750 "/home/${USER_NAME}"
@@ -227,7 +236,10 @@ chmod 644 "$BUNDLE/id_ed25519.pub" "$BUNDLE/phone_shell_ed25519.pub"
 
 TUNNEL_PUB=$(awk '{print $1" "$2}' "$BUNDLE/id_ed25519.pub")
 TUNNEL_BLOB=$(awk '{print $2}' "$BUNDLE/id_ed25519.pub")
-AUTH_LINE="restrict,port-forwarding,permitlisten=\"127.0.0.1:${SSH_REMOTE_PORT}\",permitlisten=\"127.0.0.1:${ADB_REMOTE_PORT}\" ${TUNNEL_PUB} phonetunnel-phone"
+# permitopen is a single non-routable TEST-NET target so re-enabling
+# port-forwarding cannot open a local (-L) forward to a real host.
+# restrict does not disable unix-socket forwards; sshd_config does.
+AUTH_LINE="restrict,port-forwarding,permitlisten=\"127.0.0.1:${SSH_REMOTE_PORT}\",permitlisten=\"127.0.0.1:${ADB_REMOTE_PORT}\",permitopen=\"192.0.2.1:9\" ${TUNNEL_PUB} phonetunnel-phone"
 
 install -d -m 700 "${HOME_DIR}/.ssh"
 if [ -f "$AUTH_KEYS" ]; then
@@ -263,7 +275,9 @@ chmod 644 "$KNOWN"
 SHELL_PUB=$(awk '{print $1" "$2}' "$BUNDLE/phone_shell_ed25519.pub")
 # Options dropbear 2025.89 actually parses. Do not add OpenSSH-only
 # words here; an unknown option makes dropbear ignore the whole key.
-printf '%s\n' "no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty ${SHELL_PUB} phonetunnel-shell" \
+# no-pty would block the rescue shell. Forwarding stays off.
+# A command without a TTY still works; ssh -t allocates a PTY.
+printf '%s\n' "no-port-forwarding,no-agent-forwarding,no-X11-forwarding ${SHELL_PUB} phonetunnel-shell" \
     > "$BUNDLE/authorized_keys"
 chmod 600 "$BUNDLE/authorized_keys"
 
@@ -286,30 +300,91 @@ TS_RESTART_MIN_SEC=900
 EOF
 chmod 600 "$BUNDLE/config.env"
 
-# Append or replace the Match block at the end of sshd_config.
-# A drop-in under sshd_config.d is not used: Debian and Ubuntu Include
-# that directory near the top of sshd_config, and a Match there would
-# capture every global setting that follows it.
+# First Match keyword wins. Appending this block loses to an earlier
+# Match User / Match all that already set AllowTcpForwarding or PermitOpen.
+# Insert before the first Match. A Match inside an Include that is
+# processed first still wins; sshd -T below refuses that and restores.
 BACKUP="${SSHD_CONFIG}.bak.phonetunnel"
 cp -a "$SSHD_CONFIG" "$BACKUP"
+BLOCK="${SSHD_CONFIG}.phonetunnel-block"
+match_block > "$BLOCK"
 awk '
     BEGIN {skip=0}
     $0=="# BEGIN gsm2computer-phonetunnel" {skip=1; next}
     $0=="# END gsm2computer-phonetunnel" {skip=0; next}
     skip==0 {print}
-' "$SSHD_CONFIG" > "${SSHD_CONFIG}.new"
-match_block >> "${SSHD_CONFIG}.new"
+' "$SSHD_CONFIG" > "${SSHD_CONFIG}.stripped"
+awk -v block="$BLOCK" '
+    BEGIN {inserted=0}
+    /^[[:space:]]*Match[[:space:]]/ && inserted==0 {
+        while ((getline line < block) > 0) print line
+        inserted=1
+    }
+    {print}
+    END {
+        if (inserted==0) {
+            while ((getline line < block) > 0) print line
+        }
+    }
+' "${SSHD_CONFIG}.stripped" > "${SSHD_CONFIG}.new"
 mv "${SSHD_CONFIG}.new" "$SSHD_CONFIG"
+rm -f "$BLOCK" "${SSHD_CONFIG}.stripped"
 
 if [ -x /usr/sbin/sshd ]; then
     SSHD_BIN=/usr/sbin/sshd
 else
     SSHD_BIN=sshd
 fi
-if ! "$SSHD_BIN" -t -f "$SSHD_CONFIG"; then
+
+restore_sshd() {
     cp -a "$BACKUP" "$SSHD_CONFIG"
-    echo "sshd -t failed. Restored $BACKUP" >&2
+    echo "restored $SSHD_CONFIG; sshd was not reloaded" >&2
+}
+
+if ! "$SSHD_BIN" -t -f "$SSHD_CONFIG"; then
+    restore_sshd
+    echo "sshd -t failed." >&2
     exit 1
+fi
+
+EFFECTIVE=$("$SSHD_BIN" -T -C "user=${USER_NAME},host=127.0.0.1,addr=127.0.0.1" -f "$SSHD_CONFIG" 2>"${SSHD_CONFIG}.T.err") || {
+    echo "sshd -T failed:" >&2
+    cat "${SSHD_CONFIG}.T.err" >&2
+    restore_sshd
+    exit 1
+}
+rm -f "${SSHD_CONFIG}.T.err"
+
+setting() {
+    printf '%s\n' "$EFFECTIVE" | awk -v k="$1" '$1==k { $1=""; sub(/^ /,""); print; exit }'
+}
+
+fail_effective() {
+    echo "effective sshd settings for ${USER_NAME} are not the tunnel policy." >&2
+    echo "An earlier Match (often in sshd_config.d, included before this file) won." >&2
+    echo "Fix that Match, then re-run. sshd was not reloaded." >&2
+    printf '%s\n' "$EFFECTIVE" | awk '$1 ~ /^(allowtcpforwarding|allowstreamlocalforwarding|permitopen|permitlisten|permittty|x11forwarding|allowagentforwarding|gatewayports|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|forcecommand)$/ {print}' >&2
+    restore_sshd
+    exit 1
+}
+
+[ "$(setting allowtcpforwarding)" = "remote" ] || fail_effective
+[ "$(setting allowstreamlocalforwarding)" = "no" ] || fail_effective
+[ "$(setting permitopen)" = "none" ] || fail_effective
+[ "$(setting permittty)" = "no" ] || fail_effective
+[ "$(setting x11forwarding)" = "no" ] || fail_effective
+[ "$(setting allowagentforwarding)" = "no" ] || fail_effective
+[ "$(setting gatewayports)" = "no" ] || fail_effective
+[ "$(setting passwordauthentication)" = "no" ] || fail_effective
+[ "$(setting kbdinteractiveauthentication)" = "no" ] || fail_effective
+[ "$(setting pubkeyauthentication)" = "yes" ] || fail_effective
+[ "$(setting forcecommand)" = "$HOLD_DST" ] || fail_effective
+
+got_listen=$(printf '%s\n' "$EFFECTIVE" | awk '$1=="permitlisten" { for (i=2;i<=NF;i++) print $i }' | sort -u)
+want_listen=$(printf '%s\n' "127.0.0.1:${SSH_REMOTE_PORT}" "127.0.0.1:${ADB_REMOTE_PORT}" | sort)
+if [ "$got_listen" != "$want_listen" ]; then
+    echo "permitlisten is '$got_listen', want only the two localhost ports" >&2
+    fail_effective
 fi
 
 if [ "$APPLY_SYSTEM" -eq 1 ]; then

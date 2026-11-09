@@ -53,7 +53,9 @@ One feature:
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-shell
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-adb
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-reconnect
+.cursor/skills/verify-phonetunnel/scripts/harness.sh drive-supervise
 .cursor/skills/verify-phonetunnel/scripts/harness.sh drive-watchdog
+.cursor/skills/verify-phonetunnel/scripts/harness.sh drive-policy
 ```
 
 All of them, in that order:
@@ -73,11 +75,13 @@ Each drive writes a file under `/opt/cursor/artifacts/verify-phonetunnel/`
 | File | What it shows |
 |---|---|
 | `doctor.txt` | binary, qemu, dry-run side-effect check |
-| `tunnel-up.txt` | `tunnel=up`, a shell nonce, a refused extra `-R`, a refused `-L` data path |
-| `phone-shell.txt` | a nonce printed by a shell on the phone side |
+| `tunnel-up.txt` | `tunnel=up` only with sshd listening, host fingerprint, `phone_adb_managed=untouched`, a shell nonce, a refused extra `-R`, a refused `-L` data path |
+| `phone-shell.txt` | a nonce from a command, shell key has no `no-pty`, pty result or the qemu tty limit |
 | `adb-forward.txt` | `adb_reply=adb-standin-ok` through the cup adb port |
 | `reconnect.txt` | shell works after killing the client, after an iptables drop, and after restarting the stand-in sshd |
-| `watchdog.txt` | no restart on one miss, restart at the streak, no second restart inside the rate limit, no restart while `mCallState=2` |
+| `supervise.txt` | dropbear restarts under the same tunnel pid; a dead dropbear makes `tunnel=down` while `tunnel_session=up` |
+| `watchdog.txt` | streak restart, rate limit, `mCallState=2`, empty dumpsys, dumpsys error, `mPreciseCallState=FG_ACTIVE`, `ip` error, missing dumpsys, and a bridge package name do not over-restart; an explicit idle plus a missing interface does |
+| `policy.txt` | zero timers are raised, an earlier Include Match is refused and the config restored, key and Match block the extra `-R`, `-L`, and unix-socket forward, and ForceCommand runs |
 | `phonetunnel.log` | supervisor log copied at the end of `drive-all` |
 | `system-sshd.txt` | the system sshd config was not edited |
 | `drive-all.txt` | `drive-all ok` |
@@ -105,7 +109,7 @@ and does not edit `/etc/ssh/sshd_config`.
 
 ```sh
 .cursor/skills/verify-phonetunnel/scripts/harness.sh \
-  doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-watchdog|drive-all|cleanup
+  doctor|launch|drive-tunnel|drive-shell|drive-adb|drive-reconnect|drive-supervise|drive-watchdog|drive-policy|drive-all|cleanup
 ```
 
 Cup account setup, used by `launch` with `--root` so it does not touch
@@ -143,15 +147,21 @@ the line is idle, after the real cup setup in `docs/PHONETUNNEL.md`.
   `qemu-aarch64-static`, not on the Moto CPU and not under Android
   SELinux or Magisk labels.
 - The shell through the tunnel is the harness uid and `/bin/sh`, not
-  `root` and `/system/bin/sh`.
+  `root` and `/system/bin/sh`. A PTY was not established: qemu-user
+  fails `ioctl(TIOCSCTTY)` and `/dev/pts/0`. The key does not set
+  `no-pty`. `ssh -t` on the phone is still unchecked.
 - Adb is a Python process that answers `adb-probe` with
   `adb-standin-ok`. It is not `adbd`. There is no `adb connect`, no RSA
-  prompt, and no `/data/misc/adb/adb_keys`.
+  prompt, no `/data/misc/adb/adb_keys`, and no `ro.adb.secure`. The
+  module scripts do not start adbd; that choice is untested on a real
+  adbd.
 - The watchdog uses fake `ip`, `am`, and `dumpsys` on `PATH`. It does
-  not start `com.tailscale.ipn`.
+  not start `com.tailscale.ipn`. Toybox `ip`, real `dumpsys` output, Doze,
+  and the radio were not exercised.
 - The network cut is `iptables` OUTPUT DROP to the stand-in ssh port on
   loopback, not a Wi-Fi to mobile switch and not carrier NAT.
-- The cup reboot is kill and restart of that private sshd.
+- The cup reboot is kill and restart of that private sshd. `sshd -T`
+  in `drive-policy` reads that private config, not cup's live sshd.
 - The phone sshd key directory is `~/.phonetunnel-keys` because
   `getprop` is missing. On the phone it is `/dev/phonetunnel-keys`.
 - Call-idle is a text file the fake `dumpsys` prints. The bridge app is

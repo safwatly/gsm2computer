@@ -3,7 +3,8 @@
 ## Sub-features
 
 - From cup, `ssh -p 2222 root@127.0.0.1` with `phone_shell_ed25519` runs a command on the phone.
-- The phone sshd has no password auth, no TTY request required for a simple command, and no forwarding (`-j -k`).
+- The phone sshd has no password auth and no forwarding (`-j -k`).
+- The shell key does not set `no-pty`, so `ssh -t` can be an interactive rescue shell. A command without a TTY still works.
 - The tunnel account on cup cannot itself be used as a shell.
 
 ## How to get to it (user POV)
@@ -37,7 +38,9 @@ up, `shred` that private key on cup; the command above then has no key.
 Uses the OpenSSH client and `phone_shell_ed25519` against the stand-in
 reverse port, with `StrictHostKeyChecking=yes` and a known_hosts file
 filled at launch. The remote command is `printf` of a nonce. The drive
-fails if the nonce is not in the output.
+fails if the nonce is missing or if the shell key still contains
+`no-pty`. It then requests a TTY. qemu-user fails that with
+`ioctl(TIOCSCTTY)` and the evidence says the pty was not proven.
 
 Evidence: `/opt/cursor/artifacts/verify-phonetunnel/phone-shell.txt`.
 
@@ -46,6 +49,8 @@ Evidence: `/opt/cursor/artifacts/verify-phonetunnel/phone-shell.txt`.
 - The stand-in shell user is the harness uid, not `root`, and the shell
   is `/bin/sh`, not `/system/bin/sh`. `id` on the real phone should show
   `uid=0`.
+- Interactive `ssh -t` is not proven here. qemu-user cannot set a
+  controlling tty. Confirm that on the phone.
 - Dropbear's `authorized_keys` options are a short list
   (`no-port-forwarding`, `no-agent-forwarding`, `no-X11-forwarding`,
   `no-pty`, `restrict`, `command=`, `permitopen=`). An OpenSSH-only

@@ -36,21 +36,35 @@ if _p=$(read_pid "$STATE_DIR/supervisor.pid"); then
     _sup=up
 fi
 _tpid=none
-_tun=down
+_session=down
 if _p=$(read_pid "$STATE_DIR/tunnel.pid"); then
     _tpid=$_p
+    _session=up
+fi
+# tunnel=up is the shell path, not merely a live ssh process.
+_tun=down
+if [ "$_session" = up ] && [ "$_sshd" = listening ]; then
     _tun=up
 fi
 
-_ts=down
-_out=""
-if _out=$(${IP_BIN:-ip} -o addr show tailscale0 2>/dev/null); then
-    if printf '%s\n' "$_out" | grep -q 'inet '; then
-        _ts=up
+_fp=unavailable
+if [ -s "$STATE_DIR/dropbear_ed25519_host_key" ]; then
+    _line=$("$DROPBEARKEY" -y -f "$STATE_DIR/dropbear_ed25519_host_key" 2>/dev/null | awk '/^Fingerprint:/ {print $2; exit}' || true)
+    if [ -n "${_line:-}" ]; then
+        _fp=$_line
     fi
 fi
-_ts_addr=$(printf '%s\n' "${_out:-}" | awk '/inet / {print $4; exit}')
-[ -n "$_ts_addr" ] || _ts_addr=none
+
+_ts=$(tailscale_state)
+_ts_addr=none
+if [ "$_ts" = up ]; then
+    _ts_addr=$(${IP_BIN:-ip} addr show tailscale0 2>/dev/null | awk '/inet / {print $2; exit}' || true)
+    [ -n "$_ts_addr" ] || _ts_addr=none
+fi
+_clamped=no
+if [ "${PHONETUNNEL_TIMERS_CLAMPED:-0}" = 1 ]; then
+    _clamped=yes
+fi
 
 _wd=$(cat "$STATE_DIR/watchdog.last_iso" 2>/dev/null || true)
 [ -n "$_wd" ] || _wd=never
@@ -67,11 +81,15 @@ printf '%s\n' "known_hosts=$_kh"
 printf '%s\n' "supervisor=$_sup"
 printf '%s\n' "supervisor_pid=$_spid"
 printf '%s\n' "tunnel=$_tun"
+printf '%s\n' "tunnel_session=$_session"
 printf '%s\n' "tunnel_pid=$_tpid"
 printf '%s\n' "phone_sshd=$_sshd"
 printf '%s\n' "phone_sshd_port=127.0.0.1:$PHONE_SSH_PORT"
+printf '%s\n' "host_fingerprint=$_fp"
 printf '%s\n' "phone_adb=$_adb"
+printf '%s\n' "phone_adb_managed=untouched"
 printf '%s\n' "phone_adb_port=127.0.0.1:$PHONE_ADB_PORT"
+printf '%s\n' "timers_clamped=$_clamped"
 printf '%s\n' "cup_ssh_forward=127.0.0.1:$SSH_REMOTE_PORT"
 printf '%s\n' "cup_adb_forward=127.0.0.1:$ADB_REMOTE_PORT"
 printf '%s\n' "keepalive_sec=$KEEPALIVE_SEC"

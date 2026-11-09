@@ -56,6 +56,36 @@ is_num() {
     return 0
 }
 
+# Print up, down, or unknown. An ip error is unknown, not down: a
+# missing -o flag or a toybox failure must not restart a healthy Tailscale.
+tailscale_state() {
+    _ip="${IP_BIN:-ip}"
+    if ! command -v "$_ip" >/dev/null 2>&1; then
+        printf '%s\n' unknown
+        return 0
+    fi
+    _out=$("$_ip" addr show tailscale0 2>&1)
+    _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        if printf '%s\n' "$_out" | grep -E -q -i 'does not exist|Cannot find device|No such device'; then
+            printf '%s\n' down
+            return 0
+        fi
+        printf '%s\n' unknown
+        return 0
+    fi
+    if ! printf '%s\n' "$_out" | grep -q 'tailscale0'; then
+        printf '%s\n' unknown
+        return 0
+    fi
+    if printf '%s\n' "$_out" | grep -q 'inet '; then
+        printf '%s\n' up
+        return 0
+    fi
+    printf '%s\n' down
+    return 0
+}
+
 # Accept a config value made of a restricted character set.
 safe_token() {
     case "$1" in
@@ -106,17 +136,36 @@ load_config() {
         return 1
     fi
     # A zero keepalive never notices a dead path. A zero backoff spins.
+    # The watchdog interval and restart gap have higher floors: 0 is a
+    # busy loop, and a 0 restart gap would force-stop Tailscale on every sample.
+    PHONETUNNEL_TIMERS_CLAMPED=0
     if [ "$KEEPALIVE_SEC" -lt 1 ]; then
+        log_msg "config: KEEPALIVE_SEC ${KEEPALIVE_SEC} raised to 45"
         KEEPALIVE_SEC=45
+        PHONETUNNEL_TIMERS_CLAMPED=1
     fi
     if [ "$BACKOFF_INITIAL_SEC" -lt 1 ]; then
+        log_msg "config: BACKOFF_INITIAL_SEC ${BACKOFF_INITIAL_SEC} raised to 1"
         BACKOFF_INITIAL_SEC=1
+        PHONETUNNEL_TIMERS_CLAMPED=1
     fi
     if [ "$BACKOFF_MAX_SEC" -lt "$BACKOFF_INITIAL_SEC" ]; then
         BACKOFF_MAX_SEC="$BACKOFF_INITIAL_SEC"
     fi
-    if [ "$TS_DOWN_STREAK" -lt 1 ]; then
-        TS_DOWN_STREAK=1
+    if [ "$TS_CHECK_SEC" -lt 15 ]; then
+        log_msg "config: TS_CHECK_SEC ${TS_CHECK_SEC} raised to 15"
+        TS_CHECK_SEC=15
+        PHONETUNNEL_TIMERS_CLAMPED=1
+    fi
+    if [ "$TS_RESTART_MIN_SEC" -lt 60 ]; then
+        log_msg "config: TS_RESTART_MIN_SEC ${TS_RESTART_MIN_SEC} raised to 60"
+        TS_RESTART_MIN_SEC=60
+        PHONETUNNEL_TIMERS_CLAMPED=1
+    fi
+    if [ "$TS_DOWN_STREAK" -lt 2 ]; then
+        log_msg "config: TS_DOWN_STREAK ${TS_DOWN_STREAK} raised to 2"
+        TS_DOWN_STREAK=2
+        PHONETUNNEL_TIMERS_CLAMPED=1
     fi
     # The watchdog may only restart Tailscale. A bad config must not
     # force-stop the bridge package.

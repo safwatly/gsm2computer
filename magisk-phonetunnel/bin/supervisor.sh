@@ -99,6 +99,11 @@ start_phone_sshd() {
         fi
         return 0
     fi
+    # The listener is gone. Drop a wedged pid so the next start can bind.
+    if _p=$(read_pid "$STATE_DIR/dropbear.pid"); then
+        kill "$_p" 2>/dev/null || true
+    fi
+    rm -f "$STATE_DIR/dropbear.pid"
     if [ ! -s "$STATE_DIR/dropbear_ed25519_host_key" ]; then
         log_msg "generating dropbear host key"
         if ! "$DROPBEARKEY" -t ed25519 -f "$STATE_DIR/dropbear_ed25519_host_key" >>"$LOG_FILE" 2>&1; then
@@ -135,22 +140,6 @@ start_phone_sshd() {
     return 1
 }
 
-ensure_adb() {
-    if port_listening "$PHONE_ADB_PORT"; then
-        return 0
-    fi
-    if ! command -v setprop >/dev/null 2>&1; then
-        log_msg "adbd not listening on $PHONE_ADB_PORT"
-        return 1
-    fi
-    # Only start adbd when the port is closed. Do not restart an
-    # already-listening adbd; that would drop the operator's session.
-    log_msg "starting adbd on tcp $PHONE_ADB_PORT"
-    setprop service.adb.tcp.port "$PHONE_ADB_PORT" || true
-    setprop persist.adb.tcp.port "$PHONE_ADB_PORT" || true
-    start adbd >>"$LOG_FILE" 2>&1 || true
-}
-
 keys_ready() {
     [ -f "$STATE_DIR/id_ed25519" ] && [ -f "$STATE_DIR/home/.ssh/known_hosts" ]
 }
@@ -176,6 +165,15 @@ connect_once() {
         "$CUP_HOST" >>"$LOG_FILE" 2>&1 &
     _child=$!
     printf '%s\n' "$_child" > "$STATE_DIR/tunnel.pid"
+    # dbclient can stay up after dropbear dies. Restart the sshd in
+    # place so the reverse shell port recovers without a new login.
+    while kill -0 "$_child" 2>/dev/null; do
+        if ! port_listening "$PHONE_SSH_PORT"; then
+            log_msg "phone sshd not listening; restarting it"
+            start_phone_sshd || log_msg "phone sshd restart failed"
+        fi
+        sleep 2
+    done
     wait "$_child"
     _rc=$?
     rm -f "$STATE_DIR/tunnel.pid"
@@ -206,8 +204,25 @@ while true; do
         sleep 30
         continue
     fi
-    start_phone_sshd || true
-    ensure_adb || true
+    # Do not open the tunnel until the phone sshd is actually listening.
+    # adbd is not started or reconfigured: stock adbd would listen on
+    # every interface, and a persisted tcp port would survive removal.
+    if ! start_phone_sshd; then
+        log_msg "phone sshd is down; not opening the tunnel"
+        sleep "$backoff"
+        _next=$((backoff * 2))
+        if [ "$_next" -gt "$BACKOFF_MAX_SEC" ]; then
+            backoff="$BACKOFF_MAX_SEC"
+        else
+            backoff="$_next"
+        fi
+        continue
+    fi
+    if port_listening "$PHONE_ADB_PORT"; then
+        log_msg "phone adb port $PHONE_ADB_PORT is already listening; forwarding it"
+    else
+        log_msg "phone adb port $PHONE_ADB_PORT is not listening; the adb forward will have nothing behind it"
+    fi
     _start=$(date +%s)
     connect_once
     _rc=$?

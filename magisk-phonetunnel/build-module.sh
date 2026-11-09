@@ -22,7 +22,7 @@ file bin/dropbearmulti | grep -q 'static-pie' || {
 
 chmod 755 bin/dropbearmulti bin/dropbear bin/dbclient bin/dropbearkey \
     bin/supervisor.sh bin/watchdog.sh bin/status.sh bin/ctl.sh \
-    service.sh post-fs-data.sh customize.sh \
+    service.sh post-fs-data.sh customize.sh uninstall.sh \
     system/bin/phonetunnel-status system/bin/phonetunnel-ctl
 
 OUT="$ROOT/phonetunnel-magisk.zip"
@@ -32,6 +32,7 @@ zip -r "$OUT" \
     customize.sh \
     post-fs-data.sh \
     service.sh \
+    uninstall.sh \
     config.example.env \
     BINARIES.md \
     README.md \

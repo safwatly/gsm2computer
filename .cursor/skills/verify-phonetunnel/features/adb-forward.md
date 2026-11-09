@@ -3,8 +3,8 @@
 ## Sub-features
 
 - Cup `127.0.0.1:5556` is forwarded to the phone's adb port `127.0.0.1:5555`.
-- An adbd that is already listening is left running, so an existing Tailscale adb session is not dropped at install.
-- If the port is closed, the supervisor sets `service.adb.tcp.port` and `persist.adb.tcp.port` and runs `start adbd`.
+- The module does not start adbd and does not set `service.adb.tcp.port` or `persist.adb.tcp.port`. Stock adbd would listen on every interface, and a persisted port would survive module removal. `start adbd` would also not restart an already-running daemon.
+- If the port is already open, the forward reaches it. If it is closed, status says `phone_adb=down` and `phone_adb_managed=untouched`.
 
 ## How to get to it (user POV)
 
@@ -37,6 +37,8 @@ Evidence: `/opt/cursor/artifacts/verify-phonetunnel/adb-forward.txt`.
 - The stand-in listener is a Python banner, not `adbd`. It does not
   speak the adb protocol, so `adb connect` against the stand-in fails
   and that is expected. The drive proves the TCP forward only.
+- `drive-policy` greps the module scripts and fails if they set adb
+  properties or run `start adbd`. That is not a test of real adbd.
 - The real phone still needs the cup adb key in `/data/misc/adb/adb_keys`
   before the first `adb connect`. This skill never writes that file.
 - Production maps cup 5556 to phone 5555. The stand-in picks free ports

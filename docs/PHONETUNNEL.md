@@ -46,31 +46,37 @@ The script:
 2. Generates two keys under `/root/phonetunnel-install/` (mode 700):
    - `id_ed25519` from `dropbearkey`. This is the phone's tunnel identity.
      The matching public line goes in `phonetunnel`'s `authorized_keys`
-     with `restrict,port-forwarding` and `permitlisten` for
-     `127.0.0.1:2222` and `127.0.0.1:5556` only.
+     with `restrict`, `port-forwarding`, `permitlisten` for
+     `127.0.0.1:2222` and `127.0.0.1:5556` only, and `permitopen="192.0.2.1:9"`
+     (TEST-NET, so a local `-L` forward cannot reach a real host).
    - `phone_shell_ed25519` from `ssh-keygen`. Cup's OpenSSH client uses
-     this to log into the phone. The public line is written for Dropbear,
-     with `no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty`.
+     this to log into the phone. The public line is written for Dropbear
+     with `no-port-forwarding,no-agent-forwarding,no-X11-forwarding`.
+     A PTY is allowed, so `ssh -t` is an interactive rescue shell.
+     A command without `-t` still works.
 3. Writes `known_hosts` in Dropbear's form (`hostname algo base64`, no
    brackets, no hash) for every host key in `/etc/ssh`.
 4. Writes `config.env` and `authorized_keys` for the phone.
-5. Installs `/usr/local/sbin/phonetunnel-hold` and appends a `Match User
-   phonetunnel` block to the **end** of `/etc/ssh/sshd_config` (between
-   `# BEGIN gsm2computer-phonetunnel` markers). A file under
-   `sshd_config.d` is not used: Debian includes that directory near the
-   top, so a `Match` there would capture later global settings.
-6. Runs `sshd -t` and reloads ssh. If the test fails, the previous
-   config is restored.
+5. Installs `/usr/local/sbin/phonetunnel-hold` and inserts a `Match User
+   phonetunnel` block **before any other Match** in `/etc/ssh/sshd_config`.
+   OpenSSH keeps the first value it saw for each keyword, so a block
+   appended at the end loses to an earlier `Match`. The account shell is
+   `/bin/sh`, not `nologin`: sshd runs `$SHELL -c` the ForceCommand, and
+   `nologin` ignores `-c` and never runs the hold script. The Match sets
+   `AllowTcpForwarding remote`, `AllowStreamLocalForwarding no`,
+   `PermitOpen none`, `PermitTTY no`, and `PermitListen` for the two
+   localhost ports. `restrict` does not turn off unix-socket forwards;
+   `AllowStreamLocalForwarding no` does.
+6. Runs `sshd -t`, then `sshd -T -C user=phonetunnel,host=127.0.0.1,addr=127.0.0.1`.
+   If the effective settings are any looser (an earlier Match inside
+   `sshd_config.d` is the usual cause), the previous config is restored
+   and sshd is not reloaded. A clean result reloads ssh.
 
-The Match block sets `AllowTcpForwarding remote`, `PermitOpen none`,
-`PermitListen 127.0.0.1:2222 127.0.0.1:5556`, `PermitTTY no`,
-`GatewayPorts no`, and `ForceCommand` to the hold script. `ssh -N` (what
-the phone uses) does not run ForceCommand. A client that asks for a
-shell or a command runs the hold script, which ignores
-`SSH_ORIGINAL_COMMAND` and exits 1 if a command was requested. An
-interactive session with no command sleeps, so it is still not a shell.
-Do not point ForceCommand at `/bin/false`; that exits and tears the
-session down.
+`ssh -N` (what the phone uses) does not run ForceCommand. A client that
+asks for a command runs the hold script, which prints
+`phonetunnel: command refused` and exits 1. The requested command is
+not executed. Do not point the account shell at `nologin` or
+`/bin/false`; neither one runs the hold script.
 
 Re-running the script keeps existing key files and replaces only this
 account's authorized_keys line and the marked Match block.
@@ -116,9 +122,20 @@ key), not cup's file.
 
 Before reboot, append cup's adb public key to
 `/data/misc/adb/adb_keys` if you want `adb connect` from cup. A headless
-phone cannot click the RSA prompt. The module does not write that file.
-If `127.0.0.1:5555` is already listening, the module leaves adbd alone
-so the adb session you are using is not dropped.
+phone cannot click the RSA prompt. The module does not write that file
+and it does not start adbd.
+
+Stock `adbd` has no localhost bind. Setting its TCP port makes it listen
+on every interface, and the persisted property would still be set after
+this module is removed. `start adbd` also does not restart an adbd that
+is already running, so it cannot change the bind of the session you are
+using. The module therefore never sets `service.adb.tcp.port` or
+`persist.adb.tcp.port` and never starts or stops adbd. The reverse
+forward still points at `127.0.0.1:5555`. If something is already
+listening there (the adb you used to install), cup can use it. If
+nothing is listening, `phonetunnel-status` says `phone_adb=down` and
+`phone_adb_managed=untouched`. Bringing adb up is an operator action,
+not something the module does.
 
 ```sh
 adb shell su -c 'magisk --install-module /data/local/tmp/phonetunnel-magisk.zip'
@@ -131,7 +148,10 @@ Reboot only while the line is idle. After boot:
 adb shell su -c phonetunnel-status
 ```
 
-`tunnel=up` means cup can connect. From cup:
+`tunnel=up` means the SSH session is up **and** the phone sshd is
+listening. A live `dbclient` with a dead sshd is `tunnel=down` and
+`tunnel_session=up`. `host_fingerprint` is the phone Dropbear host key
+(`SHA256:...`). From cup:
 
 ```sh
 ssh -i /root/phonetunnel-install/phone_shell_ed25519 \
@@ -156,8 +176,10 @@ adb shell su -c 'touch /data/adb/modules/gsm2computer-phonetunnel/remove'
 adb reboot
 ```
 
-Magisk removes the module on that boot. `gsm2computer-bridge` stays.
-Do not run `magisk --remove-modules`.
+Magisk runs `uninstall.sh` on that boot. It stops this module's
+processes only. It does not change adb properties, and it does not
+stop the bridge. `gsm2computer-bridge` stays. Do not run
+`magisk --remove-modules`.
 
 Disable without uninstalling:
 
@@ -184,11 +206,16 @@ of the config is next to it as `sshd_config.bak.phonetunnel`.
   bytes a day, not a poll of the public internet beyond the one SSH
   session.
 - The supervisor is `renice`d to 10.
-- The watchdog only force-stops `com.tailscale.ipn`. The package name
-  is fixed in the script. A bad config value cannot aim it at
-  `com.gsm2computer.bridge`. It skips the restart when
-  `dumpsys telephony.registry` shows `mCallState=1` or `2`. If `dumpsys`
-  is missing on a phone (`getprop` exists), it does not restart.
+- The watchdog only force-stops `com.tailscale.ipn`. Any other
+  `TS_PACKAGE` is rejected, so a bad config cannot aim it at
+  `com.gsm2computer.bridge`. It restarts only when `dumpsys
+  telephony.registry` contains `mCallState=0` and no active precise or
+  legacy call state (`mPreciseCallState=FG_ACTIVE` counts as a call).
+  Empty output, a dumpsys error, or an unrecognized dump is not idle.
+  `ip addr show tailscale0` must succeed and show the interface with no
+  IPv4 before a miss counts. An `ip` error is not a down interface.
+  `TS_CHECK_SEC` below 15 is raised to 15. `TS_RESTART_MIN_SEC` below
+  60 is raised to 60. The loop never sleeps 0.
 - Phone sshd key directory: Dropbear rejects `authorized_keys` if any
   parent directory is group- or world-writable. `/data` on Android
   usually is, so on a phone the keys are copied to

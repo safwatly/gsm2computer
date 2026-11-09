@@ -15,26 +15,29 @@ if [ "${1:-}" = "once" ]; then
     once=1
 fi
 
-tailscale_up() {
-    _ip="${IP_BIN:-ip}"
-    _out=$("$_ip" -o addr show tailscale0 2>/dev/null || true)
-    printf '%s\n' "$_out" | grep -q 'inet '
-}
-
-# 0 = a call is active (or we cannot tell on a real phone) -> do not restart.
-# 1 = idle.
-call_active() {
+# 0 only when dumpsys telephony.registry explicitly shows idle.
+# Empty output, a dumpsys error, or an unrecognized state is not idle.
+call_verified_idle() {
     if ! command -v dumpsys >/dev/null 2>&1; then
-        if command -v getprop >/dev/null 2>&1; then
-            log_msg "watchdog: dumpsys missing; not restarting Tailscale"
-            return 0
-        fi
+        log_msg "watchdog: dumpsys missing; not restarting Tailscale"
         return 1
     fi
-    _dump=$(dumpsys telephony.registry 2>/dev/null || true)
-    if printf '%s\n' "$_dump" | grep -E 'mCallState=[12]' >/dev/null 2>&1; then
+    _dump=$(dumpsys telephony.registry 2>&1)
+    _rc=$?
+    if [ "$_rc" -ne 0 ] || [ -z "$_dump" ]; then
+        log_msg "watchdog: dumpsys telephony.registry unusable; not restarting Tailscale"
+        return 1
+    fi
+    # Precise and legacy states both count. FG_ACTIVE can appear while
+    # mCallState is still 0; that is a live call.
+    if printf '%s\n' "$_dump" | grep -E -q \
+        'mPreciseCallState=(FG_ACTIVE|BG_ACTIVE|DIALING|ALERTING|INCOMING|WAITING|HOLDING|DISCONNECTING)|mCallState=[1-9]|mRingingCallState=[1-9]|mForegroundCallState=[1-9]|mBackgroundCallState=[1-9]'; then
+        return 1
+    fi
+    if printf '%s\n' "$_dump" | grep -E -q 'mCallState=0'; then
         return 0
     fi
+    log_msg "watchdog: telephony state is not an explicit idle; not restarting Tailscale"
     return 1
 }
 
@@ -43,12 +46,18 @@ watchdog_once() {
         log_msg "watchdog: config invalid"
         return 0
     fi
-    if call_active; then
+    if ! call_verified_idle; then
         log_msg "watchdog: call active or unknown; leaving Tailscale alone"
         printf '0\n' > "$STATE_DIR/watchdog.streak"
         return 0
     fi
-    if tailscale_up; then
+    _ts=$(tailscale_state)
+    if [ "$_ts" = up ]; then
+        printf '0\n' > "$STATE_DIR/watchdog.streak"
+        return 0
+    fi
+    if [ "$_ts" != down ]; then
+        log_msg "watchdog: tailscale state unknown; not restarting"
         printf '0\n' > "$STATE_DIR/watchdog.streak"
         return 0
     fi
@@ -93,6 +102,12 @@ fi
 log_msg "watchdog loop start"
 while true; do
     watchdog_once || true
-    load_config || true
-    sleep "$TS_CHECK_SEC"
+    _sleep=60
+    if load_config; then
+        _sleep=$TS_CHECK_SEC
+    fi
+    if ! is_num "$_sleep" || [ "$_sleep" -lt 15 ]; then
+        _sleep=60
+    fi
+    sleep "$_sleep"
 done

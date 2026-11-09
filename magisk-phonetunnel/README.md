@@ -11,10 +11,10 @@ Full cup and phone procedure: [docs/PHONETUNNEL.md](../docs/PHONETUNNEL.md).
 `service.sh` starts `bin/supervisor.sh`, which:
 
 - runs Dropbear on `127.0.0.1:2222` (key-only, no forwarding, no passwords)
-- if nothing is already listening on `127.0.0.1:5555`, starts adbd on that port; it does not restart an adbd that is already up
-- keeps one `dbclient` session to cup (`62.83.35.197:22` by default) with two reverse forwards: cup `127.0.0.1:2222` to the phone sshd, and cup `127.0.0.1:5556` to phone adb
+- does not start or reconfigure adbd. Stock adbd would listen on every interface, and a persisted TCP port would survive removal of this module. The reverse forward to cup `127.0.0.1:5556` targets whatever is already listening on the phone at `127.0.0.1:5555`
+- keeps one `dbclient` session to cup (`62.83.35.197:22` by default) with two reverse forwards: cup `127.0.0.1:2222` to the phone sshd, and cup `127.0.0.1:5556` to that existing adb port. The session is not opened until the phone sshd is listening, and a dead sshd is restarted while the session stays up. `tunnel=up` requires both
 - reconnects with backoff (2s, then doubles, cap 60s) after a network change, a cup reboot, or a dead session; a session that lasted at least 60s resets the backoff
-- runs `bin/watchdog.sh`, which restarts only `com.tailscale.ipn` when `tailscale0` has no IPv4 for 3 checks (about 3 minutes), at most once per 15 minutes, and never during a call
+- runs `bin/watchdog.sh`, which restarts only `com.tailscale.ipn` when `ip` shows `tailscale0` with no IPv4 for 3 checks (about 3 minutes), at most once per 15 minutes, and only when telephony dumpsys explicitly says idle. An unknown call state or an `ip` error does not restart anything
 
 The phone identity must be a Dropbear private key. An OpenSSH private key is refused. The setup script on cup generates the right file.
 
@@ -74,9 +74,10 @@ adb shell su -c 'touch /data/adb/modules/gsm2computer-phonetunnel/remove'
 adb reboot
 ```
 
-Reboot while the line is idle. That removes only this module on the next
-boot. Do not run `magisk --remove-modules`; that also removes
-`gsm2computer-bridge`.
+Reboot while the line is idle. Magisk runs `uninstall.sh`, which stops
+this module's processes and leaves adb properties alone (they were never
+set). That removes only this module. Do not run `magisk --remove-modules`;
+that also removes `gsm2computer-bridge`.
 
 To disable without deleting:
 
