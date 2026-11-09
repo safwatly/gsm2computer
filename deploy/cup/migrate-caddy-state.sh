@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Move Caddy's ACME storage from /caddy to /var/lib/caddy/caddy, or put it back.
+# Copy Caddy's ACME storage from /caddy to /var/lib/caddy/caddy and switch the
+# unit. /caddy is left in place. Rollback only puts the previous unit back.
 #
 #   migrate-caddy-state.sh apply
 #   migrate-caddy-state.sh rollback
 #
-# apply refuses to move when the destination exists and is not an empty
-# directory, so `mv` cannot nest the tree. It keeps the previous unit file,
-# starts the new unit, and compares the certificate fingerprint. A mismatch
-# stops Caddy immediately and runs rollback. A second apply, once the new
-# layout is in place, does nothing.
+# apply refuses, without stopping Caddy, when the destination already has
+# different files. The fingerprint and the unit backup are stored under
+# /var/lib/caddy. Any failure after the stop restores that unit explicitly.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -17,11 +16,12 @@ NEW=${GSM2COMPUTER_CADDY_STATE_NEW:-/var/lib/caddy/caddy}
 UNIT_NAME=${GSM2COMPUTER_CADDY_UNIT:-gsm2computer-caddy.service}
 UNIT_DEST=${GSM2COMPUTER_CADDY_UNIT_DEST:-/etc/systemd/system/$UNIT_NAME}
 UNIT_SRC=${GSM2COMPUTER_CADDY_UNIT_SRC:-$SCRIPT_DIR/gsm2computer-caddy.service}
-UNIT_BACKUP=${GSM2COMPUTER_CADDY_UNIT_BACKUP:-/var/lib/caddy/gsm2computer-caddy.service.bak}
+STATE_PARENT=$(dirname "$NEW")
+UNIT_BACKUP=${GSM2COMPUTER_CADDY_UNIT_BACKUP:-$STATE_PARENT/gsm2computer-caddy.service.bak}
 PRE_SRC=${GSM2COMPUTER_CADDY_PRE_SRC:-$SCRIPT_DIR/gsm2computer-caddy-pre.sh}
 PRE_DEST=${GSM2COMPUTER_CADDY_PRE_DEST:-/usr/local/sbin/gsm2computer-caddy-pre.sh}
-BEFORE=${GSM2COMPUTER_CADDY_FINGERPRINT_BEFORE:-/tmp/gsm-cert.before}
-AFTER=${GSM2COMPUTER_CADDY_FINGERPRINT_AFTER:-/tmp/gsm-cert.after}
+BEFORE=${GSM2COMPUTER_CADDY_FINGERPRINT_BEFORE:-$STATE_PARENT/gsm-cert.before}
+AFTER=${GSM2COMPUTER_CADDY_FINGERPRINT_AFTER:-$STATE_PARENT/gsm-cert.after}
 CONNECT=${GSM2COMPUTER_CADDY_CONNECT:-62.83.35.197:443}
 SERVERNAME=${GSM2COMPUTER_CADDY_SERVERNAME:-gsm.ta3leam.com}
 
@@ -47,41 +47,28 @@ read_fingerprint() {
     | openssl x509 -noout -fingerprint -sha256
 }
 
-save_before() {
-  local parent
-  parent=$(dirname "$BEFORE")
-  install -d -m 0755 "$parent"
-  read_fingerprint | tee "$BEFORE" >/dev/null
+# Non-empty destination whose files are not the source tree.
+destination_conflicts() {
+  if [[ ! -e "$NEW" ]]; then
+    return 1
+  fi
+  if [[ ! -d "$NEW" ]]; then
+    return 0
+  fi
+  if dir_empty "$NEW"; then
+    return 1
+  fi
+  ! diff -rq "$OLD" "$NEW" >/dev/null 2>&1
+}
+
+save_fingerprint() {
+  install -d -m 0755 "$(dirname "$BEFORE")"
+  read_fingerprint >"$BEFORE"
   [[ -s "$BEFORE" ]] || die "could not read the certificate fingerprint"
 }
 
-ensure_new_parent() {
-  local parent
-  parent=$(dirname "$NEW")
-  if [[ ! -d "$parent" ]]; then
-    install -d -m 0755 "$parent"
-  fi
-}
-
-# mv of a directory onto an existing directory nests the tree inside it.
-prepare_dest_absent() {
-  local dest=$1
-  if [[ -d "$dest" ]]; then
-    if dir_empty "$dest"; then
-      rmdir "$dest"
-      return 0
-    fi
-    die "$dest already exists and is not empty; refusing to nest the certificate tree"
-  fi
-  if [[ -e "$dest" ]]; then
-    die "$dest exists and is not a directory; refusing the move"
-  fi
-}
-
 backup_unit_once() {
-  local parent
-  parent=$(dirname "$UNIT_BACKUP")
-  install -d -m 0755 "$parent"
+  install -d -m 0755 "$(dirname "$UNIT_BACKUP")"
   if [[ -f "$UNIT_BACKUP" ]]; then
     return 0
   fi
@@ -92,7 +79,7 @@ backup_unit_once() {
 }
 
 install_new_unit() {
-  [[ -f "$UNIT_SRC" ]] || die "new unit missing: $UNIT_SRC"
+  [[ -f "$UNIT_SRC" ]] || return 1
   install -d -m 0755 "$(dirname "$UNIT_DEST")"
   cp -a "$UNIT_SRC" "$UNIT_DEST"
   if [[ -f "$PRE_SRC" ]]; then
@@ -101,96 +88,79 @@ install_new_unit() {
   fi
 }
 
-restore_unit() {
-  [[ -f "$UNIT_BACKUP" ]] || die "no unit backup at $UNIT_BACKUP"
-  cp -a "$UNIT_BACKUP" "$UNIT_DEST"
+copy_state() {
+  install -d -m 0755 "$NEW"
+  cp -a "$OLD"/. "$NEW"/
 }
 
-stop_unit() {
-  systemctl stop "$UNIT_NAME"
+# Explicit recovery. set -e must not be what stops Caddy or puts the unit back.
+restore_old_unit() {
+  local why=$1
+  echo "migrate-caddy-state: $why; stopping and restoring the previous unit" >&2
+  systemctl stop "$UNIT_NAME" || true
+  if [[ ! -f "$UNIT_BACKUP" ]]; then
+    echo "migrate-caddy-state: no unit backup at $UNIT_BACKUP" >&2
+    exit 1
+  fi
+  cp -a "$UNIT_BACKUP" "$UNIT_DEST" || exit 1
+  systemctl daemon-reload || true
+  systemctl start "$UNIT_NAME" || true
+  exit 1
 }
 
 fingerprints_match() {
-  local parent
-  parent=$(dirname "$AFTER")
-  install -d -m 0755 "$parent"
-  read_fingerprint | tee "$AFTER" >/dev/null
+  install -d -m 0755 "$(dirname "$AFTER")"
+  read_fingerprint >"$AFTER" || return 1
   cmp -s "$BEFORE" "$AFTER"
 }
 
-already_applied() {
-  [[ ! -e "$OLD" ]] && [[ -d "$NEW" ]] && ! dir_empty "$NEW" && unit_is_new
-}
-
-already_rolled_back() {
-  [[ ! -e "$NEW" ]] && [[ -d "$OLD" ]] && ! dir_empty "$OLD" && [[ -f "$UNIT_DEST" ]] && ! unit_is_new
-}
-
-rollback_move() {
-  if already_rolled_back; then
-    echo "migrate-caddy-state: already at $OLD"
+apply_copy() {
+  [[ -d "$OLD" ]] || die "missing $OLD"
+  if destination_conflicts; then
+    die "$NEW is non-empty and differs from $OLD; Caddy is still running the current unit"
+  fi
+  if unit_is_new && [[ -d "$NEW" ]] && ! dir_empty "$NEW"; then
+    echo "migrate-caddy-state: already copied to $NEW"
     return 0
   fi
-  if [[ -e "$OLD" && -d "$NEW" ]] && ! dir_empty "$NEW" && ! dir_empty "$OLD"; then
-    die "$OLD and $NEW both exist; refusing to nest the certificate tree"
-  fi
-  stop_unit || true
-  if [[ -d "$NEW" ]]; then
-    if [[ -d "$OLD" ]] && dir_empty "$OLD"; then
-      rmdir "$OLD"
-    fi
-    if [[ -e "$OLD" ]]; then
-      die "$OLD exists; refusing to nest the certificate tree"
-    fi
-    mv "$NEW" "$OLD"
-  elif [[ ! -d "$OLD" ]]; then
-    die "neither $NEW nor $OLD exists; nothing to roll back"
-  fi
-  restore_unit
-  systemctl daemon-reload
-  systemctl start "$UNIT_NAME"
-  if ! fingerprints_match; then
-    echo "migrate-caddy-state: fingerprint still differs after rollback; stopping Caddy" >&2
-    stop_unit || true
-    die "rollback served a different certificate; Caddy is stopped"
-  fi
-  echo "migrate-caddy-state: restored $OLD"
-}
-
-apply_move() {
-  if already_applied; then
-    echo "migrate-caddy-state: already at $NEW"
-    return 0
-  fi
-  if [[ ! -e "$OLD" ]]; then
-    die "missing $OLD and the new layout is not in place"
-  fi
-  if [[ -d "$NEW" ]] && ! dir_empty "$NEW"; then
-    die "$NEW already exists and is not empty; refusing to nest the certificate tree"
-  fi
-  if [[ -e "$NEW" && ! -d "$NEW" ]]; then
-    die "$NEW exists and is not a directory; refusing the move"
-  fi
-  save_before
-  stop_unit
-  ensure_new_parent
+  save_fingerprint
   backup_unit_once
-  if [[ -d "$NEW" ]] && dir_empty "$NEW"; then
-    rmdir "$NEW"
+  systemctl stop "$UNIT_NAME" || die "could not stop $UNIT_NAME; left the current unit in place"
+  if ! copy_state; then
+    restore_old_unit "copy into $NEW failed"
   fi
-  prepare_dest_absent "$NEW"
-  mv "$OLD" "$NEW"
-  install_new_unit
-  systemctl daemon-reload
-  systemctl enable --now "$UNIT_NAME"
+  if ! install_new_unit; then
+    restore_old_unit "could not install the new unit"
+  fi
+  if ! systemctl daemon-reload; then
+    restore_old_unit "daemon-reload failed"
+  fi
+  if ! systemctl start "$UNIT_NAME"; then
+    restore_old_unit "start failed"
+  fi
   if ! fingerprints_match; then
-    echo "migrate-caddy-state: fingerprint changed; stopping Caddy" >&2
-    stop_unit || true
-    echo "migrate-caddy-state: rolling back" >&2
-    rollback_move || true
-    die "fingerprint changed; rolled back to $OLD"
+    restore_old_unit "fingerprint changed"
   fi
-  echo "migrate-caddy-state: applied, certificate unchanged"
+  echo "migrate-caddy-state: applied, certificate unchanged; $OLD left in place"
+}
+
+rollback_unit() {
+  systemctl stop "$UNIT_NAME" || true
+  if [[ ! -f "$UNIT_BACKUP" ]]; then
+    die "no unit backup at $UNIT_BACKUP"
+  fi
+  cp -a "$UNIT_BACKUP" "$UNIT_DEST" || die "could not restore $UNIT_BACKUP"
+  systemctl daemon-reload || true
+  systemctl start "$UNIT_NAME" || true
+  if [[ ! -s "$BEFORE" ]]; then
+    echo "migrate-caddy-state: no saved fingerprint; restored the previous unit"
+    return 0
+  fi
+  if ! fingerprints_match; then
+    echo "migrate-caddy-state: fingerprint differs from $BEFORE" >&2
+    exit 1
+  fi
+  echo "migrate-caddy-state: restored the previous unit, certificate unchanged"
 }
 
 usage() {
@@ -200,12 +170,7 @@ usage() {
 
 cmd=${1:-}
 case "$cmd" in
-  apply) apply_move ;;
-  rollback)
-    if [[ ! -s "$BEFORE" ]]; then
-      save_before
-    fi
-    rollback_move
-    ;;
+  apply) apply_copy ;;
+  rollback) rollback_unit ;;
   *) usage ;;
 esac
