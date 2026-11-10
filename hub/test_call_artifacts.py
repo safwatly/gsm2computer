@@ -682,6 +682,46 @@ class DownlinkTests(unittest.TestCase):
             self.assertEqual(len(left), 2)
             self.assertTrue(all("20261103" in name or "20261102" in name for name in left))
 
+    def test_prune_removes_nested_call_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside_s:
+            root = Path(tmp)
+            outside = Path(outside_s)
+            old = root / "20261102T005107Z-grokbot"
+            (old / "report").mkdir(parents=True)
+            (old / "report" / "summary.txt").write_text("old")
+            (old / "phone").mkdir()
+            (old / "phone" / "clip.wav").write_bytes(b"wav")
+            (outside / "precious.txt").write_text("stay")
+            (old / "phone" / "leak").symlink_to(outside / "precious.txt")
+            link = root / "20261101T000000Z-grokbot"
+            link.symlink_to(outside, target_is_directory=True)
+            kept = root / "20261110T090156Z-grokbot"
+            kept.mkdir()
+            (kept / "phone").mkdir()
+            (kept / "phone" / "clip.wav").write_bytes(b"new")
+            _prune(root, 1)
+            self.assertFalse(old.exists())
+            self.assertTrue((kept / "phone" / "clip.wav").is_file())
+            self.assertEqual((outside / "precious.txt").read_text(), "stay")
+            self.assertTrue(link.is_symlink())
+            self.assertTrue(outside.is_dir())
+
+    def test_prune_failure_does_not_block_maybe_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(call_tap, "RECORD_DIR", root), patch.object(
+                call_tap, "RECORD_ENABLED", True
+            ), patch.object(
+                call_tap, "_prune", side_effect=IsADirectoryError("report")
+            ), self.assertLogs("gsm2computer-hub", level="ERROR") as logs:
+                tap = CallTap.maybe_open(loopback=False, mode="grokbot")
+            self.assertIsNotNone(tap)
+            assert tap is not None
+            self.assertTrue(tap.dir.is_dir())
+            self.assertEqual(tap.dir.parent, root)
+            self.assertTrue(tap.call_id.endswith("-grokbot"))
+            self.assertTrue(any("prune failed" in line for line in logs.output))
+
 
 class AlertAndCallLogTests(unittest.TestCase):
     def test_call_ended_points_at_transcript(self) -> None:
