@@ -278,47 +278,107 @@ class El {
     this.text = text || '';
     this.children = children || [];
     this.parent = null;
+    this.tagName = this.attrs.tag ? String(this.attrs.tag).toUpperCase() : '';
     for (const child of this.children) child.parent = this;
   }
   getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; }
-  get innerText() { return this.text || this.children.map((c) => c.innerText).filter(Boolean).join(' '); }
+  get innerText() {
+    const parts = [];
+    if (this.text) parts.push(this.text);
+    for (const child of this.children) {
+      const value = child.innerText;
+      if (value) parts.push(value);
+    }
+    return parts.join(' ');
+  }
   get textContent() { return this.innerText; }
   querySelectorAll(sel) { return this._all().filter((el) => el !== this && match(el, sel)); }
   querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
   _all() { return [this, ...this.children.flatMap((c) => c._all())]; }
   contains(other) { return this._all().includes(other); }
   cloneNode() { return new El({...this.attrs}, this.text, this.children.map((c) => c.cloneNode())); }
+  remove() {
+    if (!this.parent) return;
+    this.parent.children = this.parent.children.filter((child) => child !== this);
+    this.parent = null;
+  }
+}
+function hasClass(el, name) {
+  return String(el.attrs.class || '').split(/\s+/).includes(name);
 }
 function match(el, sel) {
-  if (sel === '.sr-only, .thinking-container, time') return false;
+  if (sel.includes(',')) return sel.split(',').some((part) => match(el, part.trim()));
+  if (sel === '*') return true;
+  if (sel === '[aria-label]') return Object.prototype.hasOwnProperty.call(el.attrs, 'aria-label');
+  if (sel === '[aria-label^="Message actions"]') return String(el.attrs['aria-label'] || '').startsWith('Message actions');
+  if (sel === '[aria-label="Your answer"]') return el.attrs['aria-label'] === 'Your answer';
+  if (sel === '[aria-label="Voice chat feedback"]') return el.attrs['aria-label'] === 'Voice chat feedback';
+  if (sel === '.sand-row-timestamp') return hasClass(el, 'sand-row-timestamp');
+  if (sel === 'time' || sel === 'button') return String(el.attrs.tag || '') === sel;
   if (sel === '[role="log"][aria-label="Conversation transcript"]') {
     return el.attrs.role === 'log' && el.attrs['aria-label'] === 'Conversation transcript';
   }
-  if (sel === '[role="group"][aria-label$="message"]') {
-    return el.attrs.role === 'group' && String(el.attrs['aria-label'] || '').endsWith('message');
-  }
-  if (sel === '[data-testid="user-message"], [data-testid="assistant-message"], div.message-bubble') return false;
+  if (sel === 'article.sand-transcript-row') return el.attrs.tag === 'article' && hasClass(el, 'sand-transcript-row');
+  if (sel === 'article.sand-virtual-transcript__row') return el.attrs.tag === 'article' && hasClass(el, 'sand-virtual-transcript__row');
+  if (sel === '[role="article"].sand-transcript-row') return el.attrs.role === 'article' && hasClass(el, 'sand-transcript-row');
+  if (sel === '[role="article"].sand-virtual-transcript__row') return el.attrs.role === 'article' && hasClass(el, 'sand-virtual-transcript__row');
+  if (sel === '.sr-only' || sel === '.thinking-container') return false;
+  if (sel === '[data-testid="user-message"]' || sel === '[data-testid="assistant-message"]' || sel === 'div.message-bubble') return false;
   if (sel === 'a[href^="/c/"]') return false;
   return false;
 }
+function row(speaker, body, actionsLabel, stamp) {
+  return new El({ tag: 'article', role: 'article', class: 'sand-transcript-row sand-virtual-transcript__row', 'aria-label': '' }, '', [
+    new El({ class: 'sand-transcript-speaker' }, speaker, []),
+    new El({ tag: 'time', class: 'sand-row-timestamp' }, stamp, []),
+    new El({ role: 'group', 'aria-label': actionsLabel }, actionsLabel, []),
+    new El({ class: 'sand-transcript-body' }, body, []),
+    new El({ role: 'group', 'aria-label': 'Your answer' }, 'Your answer', []),
+    new El({ role: 'group', 'aria-label': 'Voice chat feedback' }, 'Voice chat feedback', []),
+  ]);
+}
 const log = new El({ role: 'log', 'aria-label': 'Conversation transcript' }, '', [
-  new El({ role: 'group', 'aria-label': 'Your message' }, 'Need a ride', []),
-  new El({ role: 'group', 'aria-label': 'Suzie message' }, '', [
-    new El({ role: 'group', 'aria-label': 'Suzie message' }, 'On the way', []),
+  row('You', 'Need a ride. You should hurry.', 'Message actions for You message at 8:20:01 PM', '8:20 PM'),
+  row('Suzie', 'On the way, and Suzie will text you.', 'Message actions for Suzie message at 8:21:06 PM', '8:21 PM'),
+  new El({ tag: 'article', role: 'article', class: 'sand-virtual-transcript__row', 'aria-label': '' }, '', [
+    new El({ class: 'sand-transcript-heading' }, 'Suzie', [
+      new El({ tag: 'time', class: 'sand-row-timestamp' }, '8:22 PM', []),
+    ]),
+    new El({ role: 'group', 'aria-label': 'Message actions for Suzie message at 8:22:10 PM' }, 'Message actions for Suzie message at 8:22:10 PM', []),
+    new El({ class: 'sand-transcript-body' }, 'See you soon', []),
   ]),
-  new El({ role: 'group', 'aria-label': 'Open exchange with Bob' }, 'not a turn', []),
+  new El({ tag: 'article', role: 'article', class: 'sand-transcript-row sand-virtual-transcript__row', 'aria-label': '' }, '', [
+    new El({ class: 'sand-transcript-speaker' }, 'You', []),
+    new El({ class: 'sand-transcript-body' }, 'Still here', []),
+  ]),
+  new El({ role: 'group', 'aria-label': 'Pinned Bots' }, '(empty)', []),
+  new El({ role: 'group', 'aria-label': 'Message actions for Suzie message at 8:21:06 PM' }, 'not a turn', []),
 ]);
 const root = new El({}, '', [
-  new El({ role: 'group', 'aria-label': 'Your message' }, 'outside the log', []),
+  row('You', 'outside the log', 'Message actions for You message at 8:19:00 PM', '8:19 PM'),
   log,
 ]);
 assert.deepStrictEqual(gsm2VoiceTurns(root), []);
 const turns = gsm2DesktopTurns(root);
-assert.strictEqual(turns.length, 2);
+assert.strictEqual(turns.length, 4);
 assert.strictEqual(turns[0].speaker, 'caller');
-assert.strictEqual(turns[0].text, 'Need a ride');
+assert.strictEqual(turns[0].text, 'Need a ride. You should hurry.');
+assert.strictEqual(turns[0].timestamp, '8:20 PM');
 assert.strictEqual(turns[1].speaker, 'assistant');
-assert.strictEqual(turns[1].text, 'On the way');
+assert.strictEqual(turns[1].text, 'On the way, and Suzie will text you.');
+assert.strictEqual(turns[1].timestamp, '8:21 PM');
+assert.strictEqual(turns[2].speaker, 'assistant');
+assert.strictEqual(turns[2].text, 'See you soon');
+assert.strictEqual(turns[2].timestamp, '8:22 PM');
+assert.strictEqual(turns[3].speaker, 'caller');
+assert.strictEqual(turns[3].text, 'Still here');
+assert.strictEqual(turns[3].timestamp, null);
+for (const turn of turns) {
+  assert.ok(!turn.text.includes('Message actions'));
+  assert.ok(!turn.text.includes('Your answer'));
+  assert.ok(!turn.text.includes('Voice chat feedback'));
+  assert.ok(!turn.text.includes('8:2'));
+}
 """ % gt.VOICE_DOM_JS
         proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])

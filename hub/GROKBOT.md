@@ -95,12 +95,17 @@ must be loopback. The Grok Bot desktop shell is also accepted when that
 debugger socket is loopback and the page is exactly
 `file://…/resources/app.asar/dist/renderer/index.html` (the live page is
 `file:///opt/Grok%20Bot/resources/app.asar/dist/renderer/index.html`). Other
-`file://` URLs are ignored. That renderer is not the grok.com DOM: messages
-are `[role=group]` nodes labeled `Your message` or `<bot> message` inside
-the conversation log, not `data-testid` bubbles or `/c/` links. The reader
-uses the chat already on screen and does not click a sidebar bot. The list
-is virtualized, so only the mounted rows are saved; the reader does not
-scroll it.
+`file://` URLs are ignored. That renderer is not the grok.com DOM. Turns
+are `[role=article]` rows (`.sand-transcript-row` /
+`.sand-virtual-transcript__row`) inside
+`[role=log][aria-label="Conversation transcript"]`. Their `aria-label` is
+empty. The speaker is the row's name element, the short text `You` or the
+bot name, not a sentence in the message body. When a row has
+`Message actions for {name} message at {time}` chrome, that name picks the
+element. Action chrome, `Your answer`, `Voice chat feedback`, and
+timestamps stay out of the message text. The reader uses the chat already on screen and does not click a
+sidebar bot. The list is virtualized, so only the mounted rows are saved;
+the reader does not scroll it.
 
 The read gives up after about 12 seconds. A new call does not wait that out:
 it aborts the reader (about 1 second) and then runs `patchbay switch`, so the
