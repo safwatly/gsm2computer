@@ -661,6 +661,22 @@ def _env_flag(name: str, default: bool) -> bool:
 HEAL_ADMISSION_WAIT_S = 0.75
 
 
+def _note_pending_admission(waiting: bool) -> None:
+    """Make a socket that has not claimed yet visible to the Talk heal.
+
+    ``live_call.claim`` is what flips ``idle_check``, and it runs after the
+    wait. Until then a heal still looks idle, including when its health probe
+    is cancelled mid-navigate and ``page_heal_in_progress`` drops.
+    """
+    if get_talk_ui is None:
+        return
+    ui = get_talk_ui()
+    note = getattr(ui, "note_pending_admission", None) if ui is not None else None
+    if note is None:
+        return
+    note(waiting)
+
+
 async def _wait_for_page_heal() -> None:
     if get_talk_ui is None:
         return
@@ -2399,18 +2415,22 @@ async def handle_websocket(
             await writer.drain()
             return
 
-        # A Talk-page heal must not 503 this socket. Wait out a navigate that
-        # is already in flight, then admit. The heal aborts if this claim
-        # lands while Page.navigate is still awaiting.
-        await _wait_for_page_heal()
-        session_id = "hub-" + uuid.uuid4().hex[:16]
-        entrance = request_entrance()
-        if not live_call.claim(path, entrance=entrance.name):
-            LOG.warning("rejecting websocket: call slot raced %s", live_call.snapshot())
-            handshake.reject("call slot raced")
-            writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-            return
+        # A Talk-page heal must not 503 this socket. Register before the wait
+        # so the heal sees this admission while idle_check is still true, wait
+        # out a navigate that is already in flight, then claim.
+        _note_pending_admission(True)
+        try:
+            await _wait_for_page_heal()
+            session_id = "hub-" + uuid.uuid4().hex[:16]
+            entrance = request_entrance()
+            if not live_call.claim(path, entrance=entrance.name):
+                LOG.warning("rejecting websocket: call slot raced %s", live_call.snapshot())
+                handshake.reject("call slot raced")
+                writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
+                await writer.drain()
+                return
+        finally:
+            _note_pending_admission(False)
         global last_assistant_silent
         last_assistant_silent = None
         live_call.session_id = session_id

@@ -6,7 +6,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from talk_chromium import OpenClawTalkUI, TalkUiError, cdp_http, on_chat_main, page_ready
+from talk_chromium import (
+    CdpSession,
+    OpenClawTalkUI,
+    TalkUiError,
+    _swallow_task,
+    cdp_http,
+    on_chat_main,
+    page_ready,
+)
 
 ORIGIN = "https://hub-cup.mining-ling.ts.net"
 GOOD = {"url": ORIGIN + "/chat/main", "hasTalkButton": True}
@@ -83,6 +91,113 @@ class HealTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.ui.page_heal_in_progress)
         methods = [c.args[0] for c in self.session.call.await_args_list]
         self.assertEqual(["Page.navigate", "Page.stopLoading"], methods)
+
+    async def test_navigate_that_returns_while_a_call_is_waiting_stops_loading(self):
+        async def call(method, params=None, timeout_s=5.0):
+            if method == "Page.navigate":
+                self.ui.note_pending_admission(True)
+                return {}
+            if method == "Page.stopLoading":
+                return {}
+            raise AssertionError(method)
+
+        self.session.call.side_effect = call
+        result = await self.ui._heal_page_url(self.session, BAD)
+        self.assertEqual(result, "aborted: call claimed during navigate")
+        self.assertTrue(self.ui.idle_check())
+        self.assertFalse(self.ui.page_heal_in_progress)
+        methods = [c.args[0] for c in self.session.call.await_args_list]
+        self.assertEqual(["Page.navigate", "Page.stopLoading"], methods)
+
+    async def test_probe_cancel_stops_loading_while_a_call_is_waiting(self):
+        """The health probe is cancelled. The idle callback stays true.
+
+        Admission is only a pending note, so the heal must not be the idle-poll
+        abort. stopLoading has to run before page_heal_in_progress clears.
+        """
+        started = asyncio.Event()
+        release = asyncio.Event()
+        stopped_while_healing = asyncio.Event()
+
+        async def call(method, params=None, timeout_s=5.0):
+            if method == "Page.navigate":
+                started.set()
+                await release.wait()
+                return {}
+            if method == "Page.stopLoading":
+                if self.ui.page_heal_in_progress:
+                    stopped_while_healing.set()
+                return {}
+            raise AssertionError(method)
+
+        self.session.call.side_effect = call
+        self.ui._connect_page = AsyncMock(return_value=self.session)
+        probe = asyncio.create_task(self.ui._health_page_probe())
+        await asyncio.wait_for(started.wait(), timeout=2)
+        self.ui.note_pending_admission(True)
+        probe.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(probe, timeout=2)
+        release.set()
+        self.assertTrue(self.ui.idle_check())
+        self.assertEqual(1, self.ui.pending_admissions)
+        self.assertFalse(self.ui.page_heal_in_progress)
+        self.assertTrue(stopped_while_healing.is_set())
+        methods = [c.args[0] for c in self.session.call.await_args_list]
+        self.assertEqual(["Page.navigate", "Page.stopLoading"], methods)
+
+    async def test_cancelled_cdp_call_drops_pending(self):
+        class HungWs:
+            async def send(self, data: str) -> None:
+                return None
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.sleep(3600)
+                raise StopAsyncIteration
+
+            async def close(self) -> None:
+                return None
+
+        session = CdpSession(HungWs())
+        try:
+            task = asyncio.create_task(session.call("Page.navigate", {"url": GOOD["url"]}))
+            await asyncio.sleep(0.05)
+            self.assertEqual(1, len(session._pending))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual({}, session._pending)
+        finally:
+            await session.close()
+
+    async def test_swallow_does_not_adopt_a_cancelled_child(self):
+        async def child() -> None:
+            await asyncio.sleep(30)
+
+        task = asyncio.create_task(child())
+        task.cancel()
+        await _swallow_task(task)
+        await asyncio.sleep(0)
+
+    async def test_swallow_reraises_when_this_task_is_cancelled(self):
+        async def child() -> None:
+            await asyncio.sleep(30)
+
+        child_task = asyncio.create_task(child())
+
+        async def parent() -> None:
+            await _swallow_task(child_task)
+
+        parent_task = asyncio.create_task(parent())
+        await asyncio.sleep(0)
+        parent_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await parent_task
+        child_task.cancel()
+        await asyncio.gather(child_task, return_exceptions=True)
 
     async def test_call_arrives_during_probe(self):
         async def evaluate(*args):

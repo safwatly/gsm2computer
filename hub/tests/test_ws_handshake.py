@@ -92,6 +92,34 @@ class HandshakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("device=moto-g84", text)
         self.assertIn("entrance=tailscale", text)
 
+    async def test_pending_admission_is_visible_before_the_heal_wait(self) -> None:
+        ui = OpenClawTalkUI()
+        ui.idle_check = lambda: True
+        ui.page_heal_in_progress = True
+        real = ui.note_pending_admission
+
+        def wrapped(waiting: bool) -> None:
+            real(waiting)
+            if waiting:
+                self.assertTrue(ui.idle_check())
+                self.assertFalse(ui._idle_for_page_heal())
+                ui.page_heal_in_progress = False
+
+        ui.note_pending_admission = wrapped
+        writer = _Writer()
+        device = hub._current_device_id.set("moto-g84")
+        try:
+            with patch.object(hub.live_call, "claim", return_value=False), patch.object(
+                hub, "get_talk_ui", return_value=ui
+            ):
+                await hub.handle_websocket(None, writer, _headers(), "/")  # type: ignore[arg-type]
+        finally:
+            hub._current_device_id.reset(device)
+        self.assertIn(b"409", bytes(writer.buf))
+        self.assertNotIn(b"503", bytes(writer.buf))
+        self.assertEqual(0, ui.pending_admissions)
+        self.assertFalse(hub.live_call.busy)
+
     async def test_admission_error_is_logged_with_peer_and_device(self) -> None:
         writer = _Writer()
         device = hub._current_device_id.set("pixel-7")
