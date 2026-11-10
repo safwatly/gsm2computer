@@ -22,6 +22,16 @@ internal object MotoVoiceVolume {
 
     fun restoreIndex(stored: Int?): Int? = stored?.takeIf { it >= 0 }
 
+    /**
+     * Hangup write. Null while a bridge is open, so a late restore cannot
+     * pull the stream down under a call that has already raised it, and
+     * null when nothing was saved.
+     */
+    fun restoreWrite(bridgeOpen: Boolean, stored: Int?): Int? {
+        if (bridgeOpen) return null
+        return restoreIndex(stored)
+    }
+
     fun read(prefs: SharedPreferences): Int? {
         if (!prefs.contains(PREF_KEY)) return null
         return prefs.getInt(PREF_KEY, -1).takeIf { it >= 0 }

@@ -222,8 +222,60 @@ class MotoInjectGuardTest {
         assertTrue(flow.contains("readMotoHardwareMutes()"))
         val reader = session.substringAfter("fun readMotoHardwareMutes").substringBefore("fun readIncallDump")
         assertTrue(reader.contains("MotoMuteReadback.script()"))
+        assertTrue(reader.contains("RootShell.execForOutput"))
+        assertTrue(reader.contains("helperAccepted"))
+        assertTrue(reader.contains("versionScript()"))
         assertFalse(reader.contains("TinymixTrace.run"))
         assertFalse(reader.contains("tinymix write"))
+        assertFalse(reader.contains("Runtime.getRuntime"))
+    }
+
+    @Test
+    fun `no capture policy skips voice call capture on moto only`() {
+        val gsm = File("src/main/java/com/gsm2computer/bridge/gsm/GsmCallManager.kt").readText()
+        val session = File("src/main/java/com/gsm2computer/bridge/rtp/RtpSession.kt").readText()
+        val orchestrator = File("src/main/java/com/gsm2computer/bridge/bridge/CallOrchestrator.kt").readText()
+        val gate = gsm.substringAfter("fun suppressesVoiceCapture").substringBefore("private fun applyMotoMicrophone")
+        assertTrue(gate.contains("if (!isMotoProfile()) return false"))
+        assertTrue(gate.contains("opensVoiceCapture"))
+        val init = session.substringAfter("private fun initAudio").substringBefore("private fun captureInitAndLoop")
+        val beforeOpen = init.substringBefore("if (captureSuppressed())")
+        assertFalse(beforeOpen.contains("AudioRecord("))
+        val opened = init.substringAfter("if (captureSuppressed())")
+        assertTrue(opened.contains("AudioRecord("))
+        val capt = session.substringAfter("private fun captureInitAndLoop").substringBefore("private fun failCapture")
+        val early = capt.substringBefore("val configs")
+        assertTrue(early.contains("captureSuppressed()"))
+        assertTrue(early.contains("logCaptureSuppressed()"))
+        assertTrue(early.contains("return"))
+        assertFalse(early.contains("AudioRecord("))
+        assertTrue(session.contains("AUDIO-FLOW: capture disabled by policy=") ||
+            session.contains("captureDisabledLog()"))
+        val flow = session.substringAfter("val flowStats").substringBefore("listener?.onRtpStats(flowStats)")
+        assertTrue(flow.contains("flowCaptureNote()"))
+        val pump = orchestrator.substringAfter("fun startAudioPump").substringBefore("activeSession?.stop()")
+        val skipped = pump.substringAfter("suppressesVoiceCapture()").substringBefore("} else {")
+        assertTrue(skipped.contains("captureDisabledLog()"))
+        assertFalse(skipped.contains("MicIsolationGuard"))
+        assertTrue(pump.substringAfter("} else {").contains("MicIsolationGuard"))
+    }
+
+    @Test
+    fun `voice volume write and hangup restore share audioLock including forceReset`() {
+        val gsm = File("src/main/java/com/gsm2computer/bridge/gsm/GsmCallManager.kt").readText()
+        val orchestrator = File("src/main/java/com/gsm2computer/bridge/bridge/CallOrchestrator.kt").readText()
+        val enforce = gsm.substringAfter("fun enforceVolumes").substringBefore("private fun restoreAudio")
+        val locked = enforce.substringAfter("synchronized(audioLock)").substringBefore("Music stream")
+        assertTrue(locked.contains("voiceCallIndex"))
+        assertTrue(locked.contains("setStreamVolume"))
+        val restoreVol = gsm.substringAfter("fun restoreSavedVoiceVolume").substringBefore("private fun voiceCallIndex")
+        assertTrue(restoreVol.contains("synchronized(audioLock)"))
+        assertTrue(restoreVol.contains("restoreWrite(bridgeAudioOpen"))
+        val reset = orchestrator.substringAfter("private fun forceReset").substringBefore("private fun telecomLabel")
+        assertTrue(reset.contains("if (GsmCallManager.isMotoProfile())"))
+        assertTrue(reset.contains("restoreBridgedAudio(\"force-reset\")"))
+        assertTrue(reset.indexOf("restoreBridgedAudio") < reset.indexOf("activeSession?.stop()"))
+        assertFalse(reset.contains("restoreAudio()"))
     }
 
     @Test

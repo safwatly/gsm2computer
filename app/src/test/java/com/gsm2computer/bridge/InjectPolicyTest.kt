@@ -53,6 +53,31 @@ class InjectPolicyTest {
         assertFalse(policy.writesVoiceTxMute)
         assertEquals(MicApiAction.FORCE_TRUE, policy.micApi)
         assertEquals("set-true", policy.micApi.wire)
+        assertTrue(policy.opensVoiceCapture)
+    }
+
+    @Test
+    fun `hal_owned_no_capture matches hal_owned and leaves capture closed`() {
+        val policy = InjectPolicy.parse("hal_owned_no_capture")
+        assertEquals(InjectPolicy.HAL_OWNED_NO_CAPTURE, policy)
+        assertEquals("hal_owned_no_capture", policy.wire)
+        assertEquals(InjectPolicy.HAL_OWNED.writesVoiceTxMute, policy.writesVoiceTxMute)
+        assertEquals(InjectPolicy.HAL_OWNED.micApi, policy.micApi)
+        assertTrue(policy.writesVoiceTxMute)
+        assertEquals(MicApiAction.FORCE_FALSE, policy.micApi)
+        assertFalse(policy.opensVoiceCapture)
+        assertTrue(InjectPolicy.HAL_OWNED.opensVoiceCapture)
+        assertTrue(InjectPolicy.HAL_OWNED_NO_UNMUTE.opensVoiceCapture)
+        assertTrue(InjectPolicy.HAL_OWNED_API_MUTE.opensVoiceCapture)
+        assertTrue(InjectPolicy.DEFAULT.opensVoiceCapture)
+        assertEquals(InjectPolicy.HAL_OWNED_API_MUTE, InjectPolicy.DEFAULT)
+        assertTrue(InjectPolicy.recognized("HAL_OWNED_NO_CAPTURE"))
+        assertEquals(PolicyLogLevel.INFO, InjectPolicy.logLevel("hal_owned_no_capture"))
+        assertEquals(
+            "AUDIO-FLOW: capture disabled by policy=hal_owned_no_capture",
+            policy.captureDisabledLog(),
+        )
+        assertEquals(InjectPolicy.PROPERTY, "persist.gsm2computer.inject_policy")
     }
 
     @Test

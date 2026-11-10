@@ -17,4 +17,13 @@ class MotoVoiceVolumeTest {
         assertNull(MotoVoiceVolume.restoreIndex(null))
         assertNull(MotoVoiceVolume.restoreIndex(-1))
     }
+
+    @Test
+    fun `hangup restore does not write while a bridge is open`() {
+        assertEquals(5, MotoVoiceVolume.restoreWrite(bridgeOpen = false, stored = 5))
+        assertEquals(0, MotoVoiceVolume.restoreWrite(bridgeOpen = false, stored = 0))
+        assertNull(MotoVoiceVolume.restoreWrite(bridgeOpen = false, stored = null))
+        assertNull(MotoVoiceVolume.restoreWrite(bridgeOpen = false, stored = -1))
+        assertNull(MotoVoiceVolume.restoreWrite(bridgeOpen = true, stored = 5))
+    }
 }

@@ -4,18 +4,28 @@ package com.gsm2computer.bridge
  * Moto g84 injection experiment, chosen at call start from
  * [PROPERTY]. The profile is cached for the process, so the property is
  * read again on each call and a reinstall is not required to switch.
+ * Other device profiles do not read it.
  *
- * Every policy lets the HAL own Incall_Music. They differ only in the
- * Voice Tx Mute tuple and AudioManager.isMicrophoneMute.
+ * Every policy lets the HAL own Incall_Music. The first three differ
+ * only in the Voice Tx Mute tuple and AudioManager.isMicrophoneMute.
+ * [HAL_OWNED_NO_CAPTURE] matches [HAL_OWNED] and additionally leaves
+ * the voice-call capture closed for the whole call.
  */
 enum class InjectPolicy(
     val wire: String,
     val writesVoiceTxMute: Boolean,
     val micApi: MicApiAction,
+    val opensVoiceCapture: Boolean = true,
 ) {
     HAL_OWNED("hal_owned", true, MicApiAction.FORCE_FALSE),
     HAL_OWNED_NO_UNMUTE("hal_owned_no_unmute", false, MicApiAction.LEAVE),
     HAL_OWNED_API_MUTE("hal_owned_api_mute", false, MicApiAction.FORCE_TRUE),
+    HAL_OWNED_NO_CAPTURE(
+        "hal_owned_no_capture",
+        true,
+        MicApiAction.FORCE_FALSE,
+        opensVoiceCapture = false,
+    ),
     ;
 
     companion object {
@@ -48,6 +58,9 @@ enum class InjectPolicy(
             ""
         }
     }
+
+    /** AUDIO-FLOW line when this policy leaves voice-call capture closed. */
+    fun captureDisabledLog(): String = "AUDIO-FLOW: capture disabled by policy=$wire"
 }
 
 enum class PolicyLogLevel { INFO, WARN }
