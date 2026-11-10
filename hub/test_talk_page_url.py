@@ -1,10 +1,12 @@
 """Offline regression tests: never attach to production Chromium."""
+import asyncio
 import importlib.util
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from talk_chromium import OpenClawTalkUI, TalkUiError, on_chat_main, page_ready
+from talk_chromium import OpenClawTalkUI, TalkUiError, cdp_http, on_chat_main, page_ready
 
 ORIGIN = "https://hub-cup.mining-ling.ts.net"
 GOOD = {"url": ORIGIN + "/chat/main", "hasTalkButton": True}
@@ -106,6 +108,59 @@ class HealTests(unittest.IsolatedAsyncioTestCase):
         self.ui.idle_check = None
         with self.assertRaises(TalkUiError):
             await self.ui.reload_control_ui()
+
+    async def test_snapshot_does_not_touch_cdp_or_navigate(self):
+        def blocked(*_args, **_kwargs):
+            raise AssertionError("CDP HTTP on the health snapshot")
+
+        self.session.call = AsyncMock(side_effect=AssertionError("navigate on snapshot"))
+        with patch("talk_chromium._cdp_http", side_effect=blocked):
+            snap = self.ui.health_snapshot()
+        self.assertIsNone(snap["cdp"])
+        self.assertIsNone(snap["age_s"])
+        self.assertIsNone(snap["page"])
+        self.assertIn("url", snap)
+        self.session.call.assert_not_awaited()
+
+    async def test_cdp_http_stays_off_the_event_loop(self):
+        ticks = 0
+
+        async def tick() -> None:
+            nonlocal ticks
+            for _ in range(8):
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        def blocked(path: str, timeout_s: float = 2.0, method: str = "GET"):
+            time.sleep(0.25)
+            return {"Browser": "test", "path": path, "method": method}
+
+        with patch("talk_chromium._cdp_http", side_effect=blocked):
+            ticker = asyncio.create_task(tick())
+            await cdp_http("/json/version", timeout_s=1.0)
+            self.assertGreaterEqual(ticks, 5)
+            ticker.cancel()
+            try:
+                await ticker
+            except asyncio.CancelledError:
+                pass
+
+    async def test_refresh_heals_off_the_snapshot(self):
+        self.ui._connect_page = AsyncMock(return_value=self.session)
+        with patch("talk_chromium.cdp_ready", new=AsyncMock(return_value=True)), patch(
+            "talk_chromium.browser_pid", return_value=42
+        ):
+            before = self.ui.health_snapshot()
+            self.assertIsNone(before["page"])
+            await self.ui._refresh_cached_health()
+        self.session.call.assert_awaited_once_with("Page.navigate", {"url": GOOD["url"]})
+        after = self.ui.health_snapshot()
+        self.assertEqual(after["browser_pid"], 42)
+        self.assertTrue(after["cdp"])
+        self.assertFalse(after["page"]["onChatMain"])
+        self.assertEqual(after["page"]["heal"], "navigation requested")
+        self.assertIsNotNone(after["age_s"])
+        self.assertLess(after["age_s"], 5)
 
 
 if __name__ == "__main__":

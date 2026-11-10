@@ -656,6 +656,16 @@ def _env_flag(name: str, default: bool) -> bool:
     return str(raw).strip().lower() not in ("0", "false", "no", "off")
 
 
+def talk_status_for_health() -> dict[str, Any]:
+    """Cached Talk status for GET /health. Does not probe CDP or navigate."""
+    if get_talk_ui is None:
+        return {"error": "talk ui unavailable"}
+    ui = get_talk_ui()
+    ui.idle_check = lambda: not live_call.busy and active_bridge is None
+    ui.schedule_maintenance()
+    return ui.health_snapshot()
+
+
 def request_entrance() -> Entrance:
     """Listen socket for this connection. Unset means the Tailscale entrance."""
     current = _current_entrance.get()
@@ -2189,6 +2199,61 @@ async def _watch_call_path(slot: CallSlot, peer_ip: str, claimed_at: float) -> N
         await asyncio.sleep(5.0)
 
 
+class _HandshakeTrace:
+    """One device call-websocket upgrade. Logged before admission, then once more."""
+
+    def __init__(self, writer: asyncio.StreamWriter, path: str) -> None:
+        peer_of = getattr(writer, "get_extra_info", None)
+        try:
+            self.peer = peer_of("peername") if peer_of is not None else None
+        except Exception:
+            self.peer = None
+        self.device = _current_device_id.get() or "-"
+        self.entrance = request_entrance().name
+        self.path = path
+        self.started = time.monotonic()
+        self.settled = False
+        LOG.info(
+            "device ws handshake attempt entrance=%s path=%s peer=%s device=%s",
+            self.entrance,
+            path,
+            self.peer,
+            self.device,
+        )
+
+    def __enter__(self) -> "_HandshakeTrace":
+        return self
+
+    def __exit__(self, exc_type, exc, _tb) -> None:
+        if exc_type is not None:
+            self.error(f"{exc_type.__name__}: {exc}")
+
+    def finish(self, outcome: str, reason: str = "") -> None:
+        if self.settled:
+            return
+        self.settled = True
+        elapsed_ms = int((time.monotonic() - self.started) * 1000)
+        LOG.info(
+            "device ws handshake %s reason=%s entrance=%s path=%s peer=%s device=%s elapsed_ms=%s",
+            outcome,
+            reason or "-",
+            self.entrance,
+            self.path,
+            self.peer,
+            self.device,
+            elapsed_ms,
+        )
+
+    def reject(self, reason: str) -> None:
+        self.finish("rejected", reason)
+
+    def accept(self, reason: str = "") -> None:
+        self.finish("accepted", reason)
+
+    def error(self, reason: str) -> None:
+        self.finish("error", reason)
+
+
 async def handle_websocket(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -2199,139 +2264,144 @@ async def handle_websocket(
 
     tap: Optional[CallTap] = None
     e2e = CallSlot.path_is_e2e(path)
-    key = headers.get("sec-websocket-key")
-    if not key:
-        writer.write(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-        await writer.drain()
-        return
+    with _HandshakeTrace(writer, path) as handshake:
+        key = headers.get("sec-websocket-key")
+        if not key:
+            handshake.reject("missing sec-websocket-key")
+            writer.write(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return
     # Phone ingest on the public socket is the call route only. /loopback and
     # /e2e-test change the switchboard; they stay on the Tailscale entrance.
-    if request_entrance().name == ENTRANCE_PUBLIC and not public_route_allowed(
-        "GET", path if path.startswith("/") else f"/{path}", {"upgrade": "websocket"}
-    ):
-        writer.write(json_response(404, {"ok": False, "error": "not found"}))
-        await writer.drain()
-        return
+        if request_entrance().name == ENTRANCE_PUBLIC and not public_route_allowed(
+            "GET", path if path.startswith("/") else f"/{path}", {"upgrade": "websocket"}
+        ):
+            handshake.reject("public route not allowed")
+            writer.write(json_response(404, {"ok": False, "error": "not found"}))
+            await writer.drain()
+            return
 
-    resume_id = (headers.get("x-gsm-call-session") or "").strip()
-    admitted = await admit_relink(reader, writer, resume_id, key)
-    if admitted is RelinkAdmit.PARKED:
-        return
-    if admitted is RelinkAdmit.REJECTED:
-        # Lost the reservation, or the grace window is still open and this
-        # socket is not the one that took it. Do not supersede: that aborts
-        # the call the winner just joined.
-        LOG.warning(
-            "rejecting relink session_hdr=%s gap=%s %s utc=%s",
-            resume_id or "-",
-            live_call.link_gap_since is not None,
-            live_call.snapshot(),
-            _utc_now(),
-        )
-        writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
-        await writer.drain()
-        return
-
-    incoming_e2e = CallSlot.path_is_e2e(path)
-    if (live_call.busy or active_bridge is not None) and not incoming_e2e:
-        # Real Pixel call preempts a synthetic e2e self-test (never leave Safwat busy).
-        if live_call.busy and live_call.is_e2e:
+        resume_id = (headers.get("x-gsm-call-session") or "").strip()
+        admitted = await admit_relink(reader, writer, resume_id, key)
+        if admitted is RelinkAdmit.PARKED:
+            handshake.accept("relink")
+            return
+        if admitted is RelinkAdmit.REJECTED:
+            # Lost the reservation, or the grace window is still open and this
+            # socket is not the one that took it. Do not supersede: that aborts
+            # the call the winner just joined.
             LOG.warning(
-                "preempting e2e-test for real call path=%s %s",
-                path,
-                live_call.snapshot(),
-            )
-            freed = await preempt_e2e_for_real_call(live_call, wait_s=5.0)
-            # Wait for the e2e handler finally-path to drop active_bridge too.
-            deadline = time.monotonic() + 5.0
-            while active_bridge is not None and time.monotonic() < deadline:
-                await asyncio.sleep(0.1)
-            if not freed or live_call.busy or active_bridge is not None:
-                LOG.warning(
-                    "e2e preempt incomplete; rejecting real call %s active_bridge=%s",
-                    live_call.snapshot(),
-                    active_bridge is not None,
-                )
-                writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
-                await writer.drain()
-                return
-        elif live_call.link_gap_since is not None:
-            # Grace is still open. Supersede here would abort the live session.
-            LOG.warning(
-                "rejecting websocket during link gap %s utc=%s",
+                "rejecting relink session_hdr=%s gap=%s %s utc=%s",
+                resume_id or "-",
+                live_call.link_gap_since is not None,
                 live_call.snapshot(),
                 _utc_now(),
             )
+            handshake.reject("relink lost")
             writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
             await writer.drain()
             return
-        elif live_call.busy and reconnect_should_supersede(live_call.snapshot()):
-            # The Pixel only opens a new socket after it gave up on the old one
-            # (e.g. Tailscale hiccup). Retire the stale session and let this
-            # socket take the call instead of 409-ing the reconnect.
-            LOG.warning(
-                "Pixel reconnect supersedes stale call session %s", live_call.snapshot()
-            )
-            live_call.abort_call(SUPERSEDED_REASON)
-            deadline = time.monotonic() + RECONNECT_TAKEOVER_WAIT_S
-            while (live_call.busy or active_bridge is not None) and time.monotonic() < deadline:
-                await asyncio.sleep(0.1)
-            if live_call.busy or active_bridge is not None:
+
+        incoming_e2e = CallSlot.path_is_e2e(path)
+        if (live_call.busy or active_bridge is not None) and not incoming_e2e:
+            # Real Pixel call preempts a synthetic e2e self-test (never leave Safwat busy).
+            if live_call.busy and live_call.is_e2e:
                 LOG.warning(
-                    "stale session did not release in %.0fs; rejecting reconnect %s",
-                    RECONNECT_TAKEOVER_WAIT_S,
+                    "preempting e2e-test for real call path=%s %s",
+                    path,
                     live_call.snapshot(),
                 )
+                freed = await preempt_e2e_for_real_call(live_call, wait_s=5.0)
+                # Wait for the e2e handler finally-path to drop active_bridge too.
+                deadline = time.monotonic() + 5.0
+                while active_bridge is not None and time.monotonic() < deadline:
+                    await asyncio.sleep(0.1)
+                if not freed or live_call.busy or active_bridge is not None:
+                    LOG.warning(
+                        "e2e preempt incomplete; rejecting real call %s active_bridge=%s",
+                        live_call.snapshot(),
+                        active_bridge is not None,
+                    )
+                    handshake.reject("e2e preempt incomplete")
+                    writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
+                    await writer.drain()
+                    return
+            elif live_call.link_gap_since is not None:
+                # Grace is still open. Supersede here would abort the live session.
+                LOG.warning(
+                    "rejecting websocket during link gap %s utc=%s",
+                    live_call.snapshot(),
+                    _utc_now(),
+                )
+                handshake.reject("link gap")
                 writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
                 await writer.drain()
                 return
-            LOG.info("stale session released; Pixel reconnect re-attaching to the call")
+            elif live_call.busy and reconnect_should_supersede(live_call.snapshot()):
+                # The Pixel only opens a new socket after it gave up on the old one
+                # (e.g. Tailscale hiccup). Retire the stale session and let this
+                # socket take the call instead of 409-ing the reconnect.
+                LOG.warning(
+                    "Pixel reconnect supersedes stale call session %s", live_call.snapshot()
+                )
+                live_call.abort_call(SUPERSEDED_REASON)
+                deadline = time.monotonic() + RECONNECT_TAKEOVER_WAIT_S
+                while (live_call.busy or active_bridge is not None) and time.monotonic() < deadline:
+                    await asyncio.sleep(0.1)
+                if live_call.busy or active_bridge is not None:
+                    LOG.warning(
+                        "stale session did not release in %.0fs; rejecting reconnect %s",
+                        RECONNECT_TAKEOVER_WAIT_S,
+                        live_call.snapshot(),
+                    )
+                    handshake.reject("stale session did not release")
+                    writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
+                    await writer.drain()
+                    return
+                LOG.info("stale session released; Pixel reconnect re-attaching to the call")
+            elif live_call.busy or active_bridge is not None:
+                LOG.warning(
+                    "rejecting websocket: call already in progress %s",
+                    live_call.snapshot(),
+                )
+                handshake.reject("call already in progress")
+                writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
+                await writer.drain()
+                return
         elif live_call.busy or active_bridge is not None:
             LOG.warning(
-                "rejecting websocket: call already in progress %s",
+                "rejecting e2e websocket: call already in progress %s",
                 live_call.snapshot(),
             )
+            handshake.reject("e2e call already in progress")
             writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
             await writer.drain()
             return
-    elif live_call.busy or active_bridge is not None:
-        LOG.warning(
-            "rejecting e2e websocket: call already in progress %s",
-            live_call.snapshot(),
-        )
-        writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
-        await writer.drain()
-        return
 
-    # Keep call admission out of the short idle URL repair window.
-    # The flag lives on the Talk UI when that supervisor is current. A build
-    # that imported talk_chromium without the flag must still accept the call.
-    talk_ui = get_talk_ui() if get_talk_ui is not None else None
-    if talk_ui is not None and getattr(talk_ui, "page_heal_in_progress", False):
-        writer.write(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nConnection: close\r\n\r\n")
-        await writer.drain()
-        return
-    session_id = "hub-" + uuid.uuid4().hex[:16]
-    entrance = request_entrance()
-    if not live_call.claim(path, entrance=entrance.name):
-        LOG.warning("rejecting websocket: call slot raced %s", live_call.snapshot())
-        writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
-        await writer.drain()
-        return
-    global last_assistant_silent
-    last_assistant_silent = None
-    live_call.session_id = session_id
-    live_call.note_entrance(entrance.name, _current_device_id.get())
+        # A Talk-page heal must not 503 this socket. The call wins.
+        session_id = "hub-" + uuid.uuid4().hex[:16]
+        entrance = request_entrance()
+        if not live_call.claim(path, entrance=entrance.name):
+            LOG.warning("rejecting websocket: call slot raced %s", live_call.snapshot())
+            handshake.reject("call slot raced")
+            writer.write(b"HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return
+        global last_assistant_silent
+        last_assistant_silent = None
+        live_call.session_id = session_id
+        live_call.note_entrance(entrance.name, _current_device_id.get())
 
-    playback_sink = GSM_SINK
-    openclaw_bridge: Optional[Any] = None
-    watchdog_task: Optional[asyncio.Task] = None
-    rollover_task: Optional[asyncio.Task] = None
-    call_watchdog_task: Optional[asyncio.Task] = None
-    path_task: Optional[asyncio.Task] = None
-    bridge: Optional[PipewireBridge] = None
-    grok_voice: Optional[Any] = None
-    grok_switch_task: Optional[asyncio.Task] = None
+        playback_sink = GSM_SINK
+        openclaw_bridge: Optional[Any] = None
+        watchdog_task: Optional[asyncio.Task] = None
+        rollover_task: Optional[asyncio.Task] = None
+        call_watchdog_task: Optional[asyncio.Task] = None
+        path_task: Optional[asyncio.Task] = None
+        bridge: Optional[PipewireBridge] = None
+        grok_voice: Optional[Any] = None
+        grok_switch_task: Optional[asyncio.Task] = None
+
     try:
         accept = ws_accept_key(key)
         response = (
@@ -2343,6 +2413,7 @@ async def handle_websocket(
         )
         writer.write(response.encode("ascii"))
         await writer.drain()
+        handshake.accept()
         active_ws_writer = writer
 
         loopback = path.strip("/") == "loopback" or path.startswith("/loopback")
@@ -2649,6 +2720,8 @@ async def handle_websocket(
             else:
                 LOG.debug("ws event type=%s", etype)
     finally:
+        if not handshake.settled:
+            handshake.error("setup failed")
         abort_reason = live_call.abort_reason
         relink_gate.close()
         # Drop reject-gate refs first so a hung Talk/PipeWire stop cannot 409
@@ -2893,9 +2966,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 body["assistant_silent"] = last_assistant_silent
             if OPENCLAW_TALK_MODE == "webrtc-ui" and get_talk_ui is not None:
                 try:
-                    ui = get_talk_ui()
-                    ui.idle_check = lambda: not live_call.busy and active_bridge is None
-                    body["talk"] = await ui.health()
+                    body["talk"] = talk_status_for_health()
                     body["call"] = live_call.snapshot()
                 except Exception as exc:
                     body["talk"] = {"error": str(exc)}
@@ -3104,6 +3175,11 @@ async def main() -> None:
     if not servers:
         raise SystemExit("no listen socket could be bound")
     asyncio.create_task(_reap_stuck_call_slot())
+    if OPENCLAW_TALK_MODE == "webrtc-ui" and get_talk_ui is not None:
+        try:
+            talk_status_for_health()
+        except Exception:
+            LOG.warning("talk maintenance did not start", exc_info=True)
     described = ", ".join(
         f"{item.name}={item.host}:{item.listen_port} token_required={item.token_required}"
         for item in _active_entrances
