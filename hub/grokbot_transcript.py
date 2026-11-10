@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -33,7 +34,18 @@ FOLLOWUP_WAIT_S = float(os.environ.get("GSM2COMPUTER_GROKBOT_TRANSCRIPT_FOLLOWUP
 # The click expression is already on the wire before abort can run. It only
 # clicks if this page token is still the one the reader armed.
 CLICK_GUARD_MS = 150
-_KEPT_STATUSES = {"unmatched", "ambiguous", "aborted", "no_cdp", "error", "off_failed", "empty", "pending"}
+_KEPT_STATUSES = {
+    "unmatched",
+    "ambiguous",
+    "aborted",
+    "no_cdp",
+    "error",
+    "off_failed",
+    "empty",
+    "pending",
+    "not_found",
+    "unscoped",
+}
 
 # Runs in the Grok page. ``root`` defaults to document so tests can pass a fake tree.
 VOICE_DOM_JS = r"""
@@ -343,41 +355,77 @@ function gsm2DesktopStamp(row) {
   }
   return null;
 }
-function gsm2DesktopTurns(root) {
+function gsm2DesktopRowTurns(row, names) {
+  const stamp = gsm2DesktopStamp(row);
+  const explicit = gsm2DesktopExplicitUtterances(row);
+  const turns = [];
+  if (explicit) {
+    const botName = Array.from(names).find((name) => name !== "you" && name !== "your") || "";
+    for (const item of explicit) {
+      const label = item.role === "caller" ? "You" : botName;
+      const text = gsm2DesktopStripGlued(gsm2DesktopCollectText(item.el, names), label);
+      if (!item.role || !text) continue;
+      turns.push({ speaker: item.role, text: text, timestamp: stamp });
+    }
+    return turns;
+  }
+  for (const segment of gsm2DesktopSegments(row, names, gsm2DesktopActionsName(row))) {
+    turns.push({ speaker: segment.speaker, text: segment.text, timestamp: stamp });
+  }
+  return turns;
+}
+function gsm2DesktopRows(root) {
   const doc = root || document;
   const log = doc.querySelector && doc.querySelector('[role="log"][aria-label="Conversation transcript"]');
   if (!log || !log.querySelectorAll) return [];
-  const names = gsm2DesktopKnownNames(doc);
-  const rows = Array.from(log.querySelectorAll(
+  return Array.from(log.querySelectorAll(
     'article.sand-transcript-row, article.sand-virtual-transcript__row, [role="article"].sand-transcript-row, [role="article"].sand-virtual-transcript__row'
   ));
+}
+function gsm2DesktopTurns(root) {
+  const doc = root || document;
+  const names = gsm2DesktopKnownNames(doc);
   const turns = [];
   const seen = new Set();
-  for (const row of rows) {
+  for (const row of gsm2DesktopRows(doc)) {
     if (seen.has(row)) continue;
     seen.add(row);
-    const stamp = gsm2DesktopStamp(row);
-    const explicit = gsm2DesktopExplicitUtterances(row);
-    if (explicit) {
-      for (const item of explicit) {
-        const botName = Array.from(names).find((name) => name !== "you" && name !== "your") || "";
-        const label = item.role === "caller" ? "You" : botName;
-        const text = gsm2DesktopStripGlued(gsm2DesktopCollectText(item.el, names), label);
-        if (!item.role || !text) continue;
-        turns.push({ speaker: item.role, text: text, timestamp: stamp });
-      }
-      continue;
-    }
-    for (const segment of gsm2DesktopSegments(row, names, gsm2DesktopActionsName(row))) {
-      turns.push({ speaker: segment.speaker, text: segment.text, timestamp: stamp });
-    }
+    for (const turn of gsm2DesktopRowTurns(row, names)) turns.push(turn);
   }
   return turns;
+}
+function gsm2DesktopVoiceCapture(root) {
+  const doc = root || document;
+  const names = gsm2DesktopKnownNames(doc);
+  const voiceRows = [];
+  const seen = new Set();
+  for (const row of gsm2DesktopRows(doc)) {
+    if (seen.has(row)) continue;
+    seen.add(row);
+    const key = String((row.getAttribute && row.getAttribute("data-row-key")) || "");
+    if (!/^voice-call-call-/.test(key)) continue;
+    const durationNode = row.querySelector && row.querySelector("[data-voice-call-duration]");
+    const duration = durationNode
+      ? String(durationNode.textContent || durationNode.innerText || "").replace(/\s+/g, " ").trim()
+      : "";
+    const time = row.querySelector && row.querySelector("time");
+    const absolute = (time && time.getAttribute && time.getAttribute("datetime"))
+      || (row.getAttribute && (row.getAttribute("data-timestamp") || row.getAttribute("data-time") || row.getAttribute("data-started")))
+      || "";
+    voiceRows.push({
+      key: key,
+      timestamp: gsm2DesktopStamp(row),
+      absolute: absolute || null,
+      duration: duration || null,
+      turns: gsm2DesktopRowTurns(row, names),
+    });
+  }
+  return { voiceRows: voiceRows };
 }
 """
 
 _READ_EXPR = VOICE_DOM_JS + "\ngsm2VoiceTurns(document)"
-_DESKTOP_READ_EXPR = VOICE_DOM_JS + "\ngsm2DesktopTurns(document)"
+_DESKTOP_READ_EXPR = VOICE_DOM_JS + "\ngsm2DesktopVoiceCapture(document)"
 _SESSIONS_EXPR = VOICE_DOM_JS + "\ngsm2VoiceSessions(document)"
 # Grok Bot desktop shell. Not a grok.com host. The chat DOM is different.
 _DESKTOP_RENDERER_SUFFIX = "/resources/app.asar/dist/renderer/index.html"
@@ -489,6 +537,136 @@ def time_now() -> float:
     return datetime.now(timezone.utc).timestamp()
 
 
+_VOICE_ROW_KEY = re.compile(r"^voice-call-call-(?P<id>.+?)(?:@\d+)?$")
+_DURATION_HMS = re.compile(r"^(?:(\d+):)?(\d+):(\d+)$")
+_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)\b", re.I)
+
+
+def _parse_duration_s(value: Any) -> Optional[float]:
+    """Seconds from a voice-card duration. Clock-only stamps are not durations."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    clock = _DURATION_HMS.match(text)
+    if clock:
+        hours = int(clock.group(1) or 0)
+        minutes = int(clock.group(2))
+        seconds = int(clock.group(3))
+        return float(hours * 3600 + minutes * 60 + seconds)
+    total = 0.0
+    found = False
+    for match in _DURATION_PART.finditer(text):
+        found = True
+        amount = float(match.group(1))
+        unit = match.group(2)
+        if unit.startswith("h"):
+            total += amount * 3600
+        elif unit.startswith("m"):
+            total += amount * 60
+        else:
+            total += amount
+    return total if found else None
+
+
+def _voice_row_time(row: dict[str, Any]) -> Optional[float]:
+    """Absolute start of a voice-call row. A clock label such as ``8:18 PM`` is not one."""
+    key = str(row.get("key") or "")
+    matched = _VOICE_ROW_KEY.match(key)
+    candidates = [row.get("absolute"), row.get("timestamp")]
+    if matched:
+        candidates.append(matched.group("id"))
+    for candidate in candidates:
+        parsed = _parse_started(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def scope_desktop_voice(
+    raw: Any,
+    started_at: Optional[float],
+    ended_at: Optional[float],
+) -> dict[str, Any]:
+    """Keep the voice-call card for this call. Older mounted history is not saved.
+
+    A row counts only when ``data-row-key`` is ``voice-call-call-<id>`` and its
+    absolute time (``time[datetime]``, a data timestamp, or an epoch in the
+    key) falls in ``[start - slack, end + slack]``. ``data-voice-call-duration``
+    is recorded on the row. A clock stamp such as ``8:18 PM`` does not choose a
+    day, so a newest row that has only that stamp is ``unscoped`` and its turns
+    are dropped. No voice-call row is ``not_found``. A card in the window with
+    no utterances is ``empty``.
+    """
+    payload = raw
+    if isinstance(payload, str) and payload.strip():
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            payload = None
+    if not isinstance(payload, dict) or "voiceRows" not in payload:
+        return {
+            "status": "unscoped",
+            "error": "desktop transcript was not a voice-call row list",
+            "turns": [],
+        }
+    rows = [row for row in payload.get("voiceRows") or [] if isinstance(row, dict)]
+    rows = [row for row in rows if _VOICE_ROW_KEY.match(str(row.get("key") or ""))]
+    if not rows:
+        return {
+            "status": "not_found",
+            "error": "no voice-call row in the open transcript",
+            "turns": [],
+        }
+    if started_at is None:
+        return {
+            "status": "unscoped",
+            "error": "call start time is unknown; voice-call rows were not saved",
+            "turns": [],
+        }
+    end = time_now() if ended_at is None else float(ended_at)
+    window_start = float(started_at) - CALL_WINDOW_SLACK_S
+    window_end = end + CALL_WINDOW_SLACK_S
+    placed: list[tuple[float, dict[str, Any]]] = []
+    unplaced: list[dict[str, Any]] = []
+    for row in rows:
+        when = _voice_row_time(row)
+        if when is None:
+            unplaced.append(row)
+        else:
+            placed.append((when, row))
+    matched = [(when, row) for when, row in placed if window_start <= when <= window_end]
+    if not matched and unplaced:
+        newest = unplaced[-1]
+        label = str(newest.get("timestamp") or "").strip() or "no date"
+        duration = str(newest.get("duration") or "").strip()
+        parsed = _parse_duration_s(duration)
+        detail = f"newest voice-call row {newest.get('key')} is stamped {label}"
+        if duration:
+            detail += f" duration {duration}"
+            if parsed is not None:
+                detail += f" ({int(parsed)}s)"
+        detail += "; clock time is not tied to this call"
+        return {"status": "unscoped", "error": detail, "turns": []}
+    if not matched:
+        return {
+            "status": "not_found",
+            "error": "no voice-call row falls in this call's time window",
+            "turns": [],
+        }
+    matched.sort(key=lambda item: item[0])
+    if len(matched) >= 2 and matched[-1][0] == matched[-2][0]:
+        return {
+            "status": "unscoped",
+            "error": "two voice-call rows share the newest time in this call",
+            "turns": [],
+        }
+    _when, row = matched[-1]
+    turns = [turn for turn in (row.get("turns") or []) if isinstance(turn, dict)]
+    if not turns:
+        return {"status": "empty", "error": None, "turns": []}
+    return {"status": "ok", "turns": turns}
+
+
 def _loopback_http(url: str) -> Optional[str]:
     raw = (url or "").strip()
     if not raw:
@@ -555,8 +733,16 @@ def normalize_turns(raw: Any, call_id: str) -> dict[str, Any]:
     """Normalize CDP nodes or already-shaped turns. Empty input is status ``empty``.
 
     A reader result of ``unmatched`` or ``ambiguous`` stays that status. Turns
-    whose speaker is not caller or assistant are dropped.
+    whose speaker is not caller or assistant are dropped. ``not_found`` and
+    ``unscoped`` keep no turns, so an older mounted chat cannot be saved.
     """
+    if isinstance(raw, dict) and str(raw.get("status") or "") in {"not_found", "unscoped"}:
+        return {
+            "call_id": call_id,
+            "status": str(raw.get("status")),
+            "error": raw.get("error"),
+            "turns": [],
+        }
     if isinstance(raw, dict) and raw.get("status") in _KEPT_STATUSES and "turns" not in raw:
         return {
             "call_id": call_id,
@@ -912,9 +1098,12 @@ async def read_voice_turns(
         nid = [0]
         async with websockets.connect(ws_url, open_timeout=4, max_size=4_000_000) as ws:
             _raise_if_abort(abort)
-            # The desktop shell has no /c/ voice links. The open Suzie chat is the transcript.
+            # The desktop shell has no /c/ voice links. Keep the voice-call card
+            # for this call; the rest of the mounted history is not saved.
             if _is_desktop_renderer_url(str(page.get("url") or "")):
-                return await _turns_from(ws, nid, _DESKTOP_READ_EXPR)
+                raw = await _cdp_eval(ws, nid, _DESKTOP_READ_EXPR)
+                _raise_if_abort(abort)
+                return scope_desktop_voice(raw, started_at, ended_at)
             sessions = await _cdp_eval(ws, nid, _SESSIONS_EXPR)
             choice = select_voice_session(sessions, started_at, ended_at)
             if choice.get("status") != "chosen":

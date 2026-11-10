@@ -475,6 +475,156 @@ for (const turn of turns) {
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
 
 
+class DesktopScopeTests(unittest.TestCase):
+    def test_multi_day_history_keeps_only_this_call(self) -> None:
+        script = r"""
+const assert = require('assert');
+%s
+class El {
+  constructor(attrs, text, children) {
+    this.attrs = attrs || {};
+    this.text = text || '';
+    this.children = children || [];
+    this.parent = null;
+    this.tagName = this.attrs.tag ? String(this.attrs.tag).toUpperCase() : '';
+    for (const child of this.children) child.parent = this;
+  }
+  getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; }
+  get innerText() {
+    const parts = [];
+    if (this.text) parts.push(this.text);
+    for (const child of this.children) {
+      const value = child.innerText;
+      if (value) parts.push(value);
+    }
+    return parts.join(' ');
+  }
+  get textContent() { return this.innerText; }
+  querySelectorAll(sel) { return this._all().filter((el) => el !== this && match(el, sel)); }
+  querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+  _all() { return [this, ...this.children.flatMap((c) => c._all())]; }
+  contains(other) { return this._all().includes(other); }
+  cloneNode() { return new El({...this.attrs}, this.text, this.children.map((c) => c.cloneNode())); }
+  remove() {
+    if (!this.parent) return;
+    this.parent.children = this.parent.children.filter((child) => child !== this);
+    this.parent = null;
+  }
+}
+function hasClass(el, name) { return String(el.attrs.class || '').split(/\s+/).includes(name); }
+function match(el, sel) {
+  if (sel.includes(',')) return sel.split(',').some((part) => match(el, part.trim()));
+  if (sel === '*') return true;
+  if (sel === '[aria-label]') return Object.prototype.hasOwnProperty.call(el.attrs, 'aria-label');
+  if (sel === '[data-voice-call-duration]') return Object.prototype.hasOwnProperty.call(el.attrs, 'data-voice-call-duration');
+  if (sel === '[aria-label^="Message actions"]') return String(el.attrs['aria-label'] || '').startsWith('Message actions');
+  if (sel === '[aria-label="Your answer"]') return el.attrs['aria-label'] === 'Your answer';
+  if (sel === '[aria-label="Voice chat feedback"]') return el.attrs['aria-label'] === 'Voice chat feedback';
+  if (sel === '.sand-row-timestamp') return hasClass(el, 'sand-row-timestamp');
+  if (sel === 'time' || sel === 'button') return String(el.attrs.tag || '') === sel;
+  if (sel === '[role="log"][aria-label="Conversation transcript"]') {
+    return el.attrs.role === 'log' && el.attrs['aria-label'] === 'Conversation transcript';
+  }
+  if (sel === 'article.sand-transcript-row') return el.attrs.tag === 'article' && hasClass(el, 'sand-transcript-row');
+  if (sel === '[role="article"].sand-transcript-row') return el.attrs.role === 'article' && hasClass(el, 'sand-transcript-row');
+  if (sel === 'article.sand-virtual-transcript__row' || sel === '[role="article"].sand-virtual-transcript__row') return false;
+  return false;
+}
+function card(speaker, text) {
+  return new El({ tag: 'div', 'data-nest': 'card', 'data-speaker': speaker }, '', [
+    new El({ tag: 'div' }, text, []),
+  ]);
+}
+function voice(key, iso, label, duration, cards) {
+  return new El({ tag: 'div', role: 'article', class: 'sand-transcript-row', 'aria-label': '', 'data-row-key': key }, '', [
+    new El({ tag: 'time', class: 'sand-row-timestamp', datetime: iso }, label, []),
+    new El({ 'data-voice-call-duration': '' }, duration, []),
+    new El({ 'data-voice-call-transcript': '' }, '', cards),
+    new El({ role: 'group', 'aria-label': 'Voice chat feedback' }, 'Voice chat feedback', [
+      new El({ tag: 'button' }, 'Good', []),
+      new El({ tag: 'button' }, 'Bad', []),
+    ]),
+  ]);
+}
+const log = new El({ role: 'log', 'aria-label': 'Conversation transcript' }, '', [
+  new El({ tag: 'div', role: 'article', class: 'sand-transcript-row', 'aria-label': '' }, 'Need a ride from Monday', []),
+  voice('voice-call-call-monday@1', '2026-11-08T20:18:00-05:00', '8:18 PM', '4 min', [
+    card('user', 'Hello from Monday'),
+    card('assistant', 'هذا اتصال قديم'),
+  ]),
+  new El({ tag: 'div', role: 'article', class: 'sand-transcript-row', 'aria-label': '' }, 'رسالة قديمة', []),
+  voice('voice-call-call-early@2', '2026-11-10T01:26:00Z', '8:26 PM', '21s', [
+    card('user', 'just before this call'),
+  ]),
+  voice('voice-call-call-now@3', '2026-11-10T01:26:50Z', '8:26 PM', '21s', [
+    card('user', 'Hello'),
+    card('assistant', "I'm here"),
+  ]),
+]);
+const root = new El({}, '', [log]);
+const captured = gsm2DesktopVoiceCapture(root);
+const flat = JSON.stringify(captured);
+assert.ok(!flat.includes('Need a ride from Monday'));
+assert.ok(!flat.includes('رسالة قديمة'));
+assert.strictEqual(captured.voiceRows.length, 3);
+assert.strictEqual(captured.voiceRows[0].timestamp, '8:18 PM');
+assert.strictEqual(captured.voiceRows[0].duration, '4 min');
+assert.strictEqual(captured.voiceRows[0].absolute, '2026-11-08T20:18:00-05:00');
+console.log(JSON.stringify(captured));
+""" % gt.VOICE_DOM_JS
+        proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        payload = json.loads(proc.stdout)
+        start = datetime(2026, 11, 10, 1, 26, 43, tzinfo=timezone.utc).timestamp()
+        end = start + 21
+        scoped = gt.scope_desktop_voice(payload, start, end)
+        doc = gt.normalize_turns(scoped, "20261110T012643Z-grokbot")
+        self.assertEqual(doc["status"], "ok")
+        self.assertEqual([turn["text"] for turn in doc["turns"]], ["Hello", "I'm here"])
+        saved = json.dumps(doc, ensure_ascii=False)
+        self.assertNotIn("Hello from Monday", saved)
+        self.assertNotIn("هذا اتصال قديم", saved)
+        self.assertNotIn("just before this call", saved)
+        self.assertNotIn("Need a ride from Monday", saved)
+        self.assertNotIn("رسالة قديمة", saved)
+
+        clock_only = json.loads(json.dumps(payload))
+        for row in clock_only["voiceRows"]:
+            row["absolute"] = None
+        unscoped = gt.normalize_turns(gt.scope_desktop_voice(clock_only, start, end), "20261110T012643Z-grokbot")
+        self.assertEqual(unscoped["status"], "unscoped")
+        self.assertEqual(unscoped["turns"], [])
+        self.assertIn("voice-call-call-now@3", unscoped["error"])
+        self.assertIn("8:26 PM", unscoped["error"])
+        self.assertIn("21s", unscoped["error"])
+
+        old_only = {"voiceRows": [payload["voiceRows"][0]]}
+        missing = gt.normalize_turns(gt.scope_desktop_voice(old_only, start, end), "20261110T012643Z-grokbot")
+        self.assertEqual(missing["status"], "not_found")
+        self.assertEqual(missing["turns"], [])
+
+        early_only = {"voiceRows": [payload["voiceRows"][1]]}
+        early = gt.normalize_turns(gt.scope_desktop_voice(early_only, start, end), "20261110T012643Z-grokbot")
+        self.assertEqual(early["status"], "not_found")
+        self.assertEqual(early["turns"], [])
+
+        none = gt.normalize_turns(gt.scope_desktop_voice({"voiceRows": []}, start, end), "call")
+        self.assertEqual(none["status"], "not_found")
+        self.assertEqual(gt.scope_desktop_voice([{"speaker": "caller", "text": "old"}], start, end)["status"], "unscoped")
+        tied = json.loads(json.dumps(payload))
+        tied["voiceRows"] = [tied["voiceRows"][2], json.loads(json.dumps(tied["voiceRows"][2]))]
+        tied["voiceRows"][1]["key"] = "voice-call-call-twin@4"
+        tied["voiceRows"][1]["turns"] = [{"speaker": "caller", "text": "other card", "timestamp": "8:26 PM"}]
+        same = gt.normalize_turns(gt.scope_desktop_voice(tied, start, end), "call")
+        self.assertEqual(same["status"], "unscoped")
+        self.assertEqual(same["turns"], [])
+        self.assertEqual(gt._parse_duration_s("21s"), 21)
+        self.assertEqual(gt._parse_duration_s("4 min"), 240)
+        self.assertEqual(gt._parse_duration_s("0:21"), 21)
+        src = inspect.getsource(gt.read_voice_turns)
+        self.assertLess(src.index("scope_desktop_voice"), src.index("select_voice_session"))
+
+
 class DownlinkTests(unittest.TestCase):
     def test_resample_to_8k_and_keep_after_other_stems(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
