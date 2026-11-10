@@ -33,6 +33,9 @@ enum class InjectPolicy(
             return entries.any { it.wire == key.lowercase() }
         }
 
+        fun logLevel(raw: String?): PolicyLogLevel =
+            if (recognized(raw)) PolicyLogLevel.INFO else PolicyLogLevel.WARN
+
         /** Blank when the property is unset or Android is not on the classpath. */
         fun rawProperty(get: (String) -> String? = ::systemProperty): String =
             get(PROPERTY).orEmpty()
@@ -46,6 +49,8 @@ enum class InjectPolicy(
         }
     }
 }
+
+enum class PolicyLogLevel { INFO, WARN }
 
 /** What the Moto bridge does to AudioManager.isMicrophoneMute at call start. */
 enum class MicApiAction(val wire: String) {

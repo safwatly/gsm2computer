@@ -9,9 +9,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
+import android.media.AudioManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.telephony.TelephonyManager
 import android.util.Log
 import com.gsm2computer.bridge.BridgeConfig
 import com.gsm2computer.bridge.BuildConfig
@@ -140,7 +142,7 @@ class GatewayService : Service() {
 
         thread(name = "bridge-init") {
             forceAllowRecordAudio()
-            clearStaleMotoMusicMixers()
+            clearStaleMotoState()
             initOrchestrator(cfg)
         }
     }
@@ -292,23 +294,51 @@ class GatewayService : Service() {
     }
 
     /**
-     * Older builds left Incall_Music MM1/MM2 On after hangup. Clear them
-     * once, while this process is idle, and log the tinymix readback.
-     * A live call is left alone so the HAL's own route is not disturbed.
+     * Older builds left Incall_Music MM1/MM2 On, and a killed process can
+     * leave AudioManager.isMicrophoneMute set. Both are cleared only when
+     * ringing, dialing, active, and holding are all absent.
      */
-    private fun clearStaleMotoMusicMixers() {
+    private fun clearStaleMotoState() {
         val name = try {
             GsmCallManager.profile.name
         } catch (e: Exception) {
-            Log.w(TAG, "moto idle mixer clear skipped: ${e.message}")
+            Log.w(TAG, "moto startup cleanup skipped: ${e.message}")
             return
         }
         if (!name.startsWith("Moto g84")) return
-        val callActive = GsmCallManager.isCallActive
-        if (!MotoIdleMixers.shouldClear(name, callActive)) {
-            Log.i(TAG, "moto idle mixer clear skipped profile=$name callActive=$callActive")
+        val states = GsmCallManager.trackedCallStates()
+        val telephony = telephonyCallState()
+        val mode = audioMode()
+        if (!MotoIdleMixers.noCallAtAll(states, telephony, mode)) {
+            Log.i(TAG, "moto startup cleanup skipped calls=$states telephony=$telephony audioMode=$mode")
             return
         }
+        forceStartupMicUnmute()
+        clearIdleMusicMixers()
+    }
+
+    private fun telephonyCallState(): Int = try {
+        (getSystemService(TELEPHONY_SERVICE) as TelephonyManager).callState
+    } catch (_: Exception) {
+        -1
+    }
+
+    private fun audioMode(): Int = try {
+        (getSystemService(AUDIO_SERVICE) as AudioManager).mode
+    } catch (_: Exception) {
+        -1
+    }
+
+    private fun forceStartupMicUnmute() {
+        val am = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return
+        val before = am.isMicrophoneMute
+        am.isMicrophoneMute = false
+        val line = "moto startup micMute before=$before action=set-false after=${am.isMicrophoneMute}"
+        Log.i(TAG, line)
+        BridgeLog.i(line)
+    }
+
+    private fun clearIdleMusicMixers() {
         val clear = DeviceProfile.resolveCmd(MotoIdleMixers.CLEAR_CMD)
         if (clear.isEmpty()) {
             Log.w(TAG, "moto idle mixer clear skipped: tinymix not found")
@@ -339,6 +369,7 @@ class GatewayService : Service() {
     }
 
     override fun onDestroy() {
+        GsmCallManager.restoreBridgedAudio("destroy")
         stopGateway()
         super.onDestroy()
     }

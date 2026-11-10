@@ -1,5 +1,8 @@
 package com.gsm2computer.bridge
 
+import android.media.AudioManager
+import android.telecom.Call
+import android.telephony.TelephonyManager
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -20,6 +23,9 @@ class InjectPolicyTest {
         assertFalse(InjectPolicy.recognized("nope"))
         assertTrue(InjectPolicy.recognized(null))
         assertTrue(InjectPolicy.recognized(""))
+        assertEquals(PolicyLogLevel.WARN, InjectPolicy.logLevel("nope"))
+        assertEquals(PolicyLogLevel.INFO, InjectPolicy.logLevel(""))
+        assertEquals(PolicyLogLevel.INFO, InjectPolicy.logLevel("hal_owned"))
     }
 
     @Test
@@ -51,15 +57,40 @@ class InjectPolicyTest {
 
     @Test
     fun `idle MM1 and MM2 clear only runs for an idle moto`() {
-        assertTrue(MotoIdleMixers.shouldClear("Moto g84 (holi)", callActive = false))
-        assertFalse(MotoIdleMixers.shouldClear("Moto g84 (holi)", callActive = true))
-        assertFalse(MotoIdleMixers.shouldClear("Pixel 7 (Tensor G1)", callActive = false))
+        assertTrue(
+            MotoIdleMixers.shouldClear(
+                "Moto g84 (holi)",
+                emptyList(),
+                TelephonyManager.CALL_STATE_IDLE,
+                AudioManager.MODE_NORMAL,
+            ),
+        )
+        assertFalse(
+            MotoIdleMixers.shouldClear(
+                "Moto g84 (holi)",
+                listOf(Call.STATE_ACTIVE),
+                TelephonyManager.CALL_STATE_OFFHOOK,
+                AudioManager.MODE_IN_CALL,
+            ),
+        )
+        assertFalse(
+            MotoIdleMixers.shouldClear(
+                "Pixel 7 (Tensor G1)",
+                emptyList(),
+                TelephonyManager.CALL_STATE_IDLE,
+                AudioManager.MODE_NORMAL,
+            ),
+        )
         assertTrue(MotoIdleMixers.CLEAR_CMD.contains("MultiMedia1' 0"))
         assertTrue(MotoIdleMixers.CLEAR_CMD.contains("MultiMedia2' 0"))
         assertFalse(MotoIdleMixers.CLEAR_CMD.contains("MultiMedia9"))
         assertFalse(MotoIdleMixers.READBACK_CMD.contains("MultiMedia9"))
         assertTrue(MotoIdleMixers.READBACK_CMD.contains("MultiMedia1"))
         assertTrue(MotoIdleMixers.READBACK_CMD.contains("MultiMedia2"))
+        assertTrue(MotoIdleMixers.MUTE_PATH_CMD.contains("Voice Tx Device Mute"))
+        assertTrue(MotoIdleMixers.MUTE_PATH_CMD.contains("Voice Tx Mute"))
+        assertFalse(MotoIdleMixers.MUTE_PATH_CMD.contains("Mute' 0"))
+        assertFalse(MotoIdleMixers.MUTE_PATH_CMD.contains("Mute' 1"))
     }
 
     @Test

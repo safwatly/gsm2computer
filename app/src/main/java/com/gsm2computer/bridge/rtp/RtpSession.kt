@@ -12,7 +12,9 @@ import android.media.AudioRouting
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.util.Log
+import com.gsm2computer.bridge.ApiMuteTiming
 import com.gsm2computer.bridge.DeviceProfile
+import com.gsm2computer.bridge.InjectPolicy
 import com.gsm2computer.bridge.diag.BridgeLog
 import com.gsm2computer.bridge.realtime.UplinkWire
 import com.gsm2computer.bridge.RootShell
@@ -118,6 +120,8 @@ class RtpSession(
     @Volatile var captureRms = 0; private set
     @Volatile var playbackRms = 0; private set
     @Volatile var rawCaptureRms = 0; private set  // Before echo gate — 0 means source is silent
+    @Volatile private var playbackWroteAtMs = 0L
+    @Volatile private var apiMuteWaitStarted = false
     @Volatile var audioSourceName = "none"; private set
     @Volatile private var playbackUsageName = "MEDIA"
     @Volatile private var firstRxInfo = ""
@@ -740,6 +744,10 @@ class RtpSession(
                 // (HAL/modem not providing audio).  If rawCaptureRms>0 but
                 // captureRms=0, the echo gate is suppressing.
                 rawCaptureRms = pcmRms(pcmBuf)
+                if (GsmCallManager.observeCaptureRms(rawCaptureRms, System.currentTimeMillis())) {
+                    captureTap?.putMeta("api_mute", "reverted")
+                    captureTap?.putMeta("inject_policy_effective", InjectPolicy.HAL_OWNED_NO_UNMUTE.wire)
+                }
 
                 // Silence detection: only count during non-echo periods (when
                 // decayingPlaybackRms <= echoGateThreshold).  incall_music echo
@@ -1180,6 +1188,69 @@ class RtpSession(
             track.play()
         }
         primePlayback(track)
+        scheduleDeferredApiMute()
+    }
+
+    private fun notePlaybackWrite(bytes: Int) {
+        if (bytes > 0 && playbackWroteAtMs == 0L) playbackWroteAtMs = System.currentTimeMillis()
+    }
+
+    /**
+     * api_mute waits until this telephony track is playing and AudioFlinger
+     * shows INCALL_MUSIC, or until the first playback write has aged
+     * [ApiMuteTiming.WRITE_DELAY_MS]. The capture window is collected first.
+     */
+    private fun scheduleDeferredApiMute() {
+        if (apiMuteWaitStarted || !GsmCallManager.wantsDeferredApiMute()) return
+        apiMuteWaitStarted = true
+        Thread({
+            var lastLog = 0L
+            val armedAt = System.currentTimeMillis()
+            try {
+                while (running.get() && GsmCallManager.wantsDeferredApiMute()) {
+                    val track = audioTrack
+                    val playing = track?.playState == AudioTrack.PLAYSTATE_PLAYING
+                    val routed = track?.routedDevice?.type == AudioDeviceInfo.TYPE_TELEPHONY
+                    val now = System.currentTimeMillis()
+                    val observed = now - armedAt
+                    val dump = if (playing && routed && observed >= ApiMuteTiming.WRITE_DELAY_MS) {
+                        readIncallDump()
+                    } else {
+                        ""
+                    }
+                    val reason = ApiMuteTiming.decide(
+                        playing,
+                        routed,
+                        dump,
+                        playbackWroteAtMs,
+                        now,
+                        observedForMs = observed,
+                    )
+                    if (reason != null) {
+                        GsmCallManager.applyDeferredApiMute(reason)
+                        captureTap?.putMeta("api_mute_when", reason)
+                        break
+                    }
+                    if (now - lastLog >= 2_000L) {
+                        lastLog = now
+                        Log.i(TAG, "api mute waiting playing=$playing routed=$routed wroteAt=$playbackWroteAtMs")
+                    }
+                    Thread.sleep(200)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "api mute wait failed: ${e.message}")
+            }
+        }, "api-mute").apply { isDaemon = true }.start()
+    }
+
+    private fun readIncallDump(): String = try {
+        RootShell.execForOutput(
+            "dumpsys audio | grep -i -E 'INCALL_MUSIC|TELEPHONY_TX|Standby:' | head -c 4000",
+            2_500,
+        )
+    } catch (e: Exception) {
+        Log.w(TAG, "incall dump failed: ${e.message}")
+        ""
     }
 
     /** One 20 ms silence write so incall_music sees an active STREAM_MUSIC output. */
@@ -1192,6 +1263,7 @@ class RtpSession(
             Log.w(TAG, "playback prime failed: ${e.message}")
             -1
         }
+        notePlaybackWrite(wrote)
         val routed = try {
             track.routedDevice?.type ?: -1
         } catch (_: Exception) {
@@ -1430,8 +1502,12 @@ class RtpSession(
         Log.i(TAG, "Playback started (rate=$playbackRate usage=$playbackUsageName deepBuffer=true inject=false)")
         fun liveTrack(): AudioTrack = audioTrack ?: track
         fun out(buf: ByteArray, n: Int) {
-            if (phased != null) { phased.write(buf, n); return }
-            liveTrack().write(buf, 0, n)
+            if (phased != null) {
+                phased.write(buf, n)
+                notePlaybackWrite(n)
+                return
+            }
+            notePlaybackWrite(liveTrack().write(buf, 0, n))
         }
 
         // CRITICAL: Set incall_music_enabled=true AFTER AudioTrack.play().

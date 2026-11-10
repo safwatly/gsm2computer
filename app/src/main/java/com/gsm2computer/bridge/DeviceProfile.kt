@@ -600,8 +600,8 @@ data class DeviceProfile(
          *     inject policy. API mic mute is separate and policy-selected:
          *     the default sets isMicrophoneMute so the HAL can device-mute
          *     the handset mic without stream-muting in-call music.
-         *   - Capture caller-only via VOICE_DOWNLINK (incall-rec-downlink =
-         *     MultiMedia9 Mixer VOC_REC_DL), so injected audio cannot echo back.
+         *   - Capture is VOICE_CALL, so the recording hears both legs. The
+         *     TX_DEC/ADC cut is what keeps the room mic out of that mix.
          *   - `Voice Tx Mute` is a 3-value control (mute, VSID, ramp). The
          *     one-value `0` write hits session 0. When the call's inject
          *     policy asks for it, [VoiceTxMuteJob] writes VoiceMMode1
@@ -616,11 +616,12 @@ data class DeviceProfile(
          *     idle MM1/MM2 values are cleared once at service start.
          *   - `persist.gsm2computer.inject_policy` is read when the call
          *     goes ACTIVE. Default `hal_owned_api_mute` skips the Voice Tx
-         *     Mute tuple and sets AudioManager.isMicrophoneMute for the
-         *     bridge, then restores the previous value. `hal_owned` keeps
-         *     the session tuple and forces the API mic unmuted.
-         *     `hal_owned_no_unmute` writes neither. TX_DEC, ADC, and amp
-         *     isolation stay on for every policy.
+         *     Mute tuple. It sets AudioManager.isMicrophoneMute only after
+         *     the telephony track is playing and incall-music is up, then
+         *     restores the previous value. `hal_owned` keeps the session
+         *     tuple, forces the API mic unmuted, and restores the pre-call
+         *     value. `hal_owned_no_unmute` writes neither. TX_DEC, ADC, and
+         *     amp isolation stay on for every policy.
          */
         fun motoG84Holi() = DeviceProfile(
             name = "Moto g84 (holi)",
