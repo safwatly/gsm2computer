@@ -296,7 +296,8 @@ class GatewayService : Service() {
     /**
      * Older builds left Incall_Music MM1/MM2 On, and a killed process can
      * leave AudioManager.isMicrophoneMute set. Both are cleared only when
-     * ringing, dialing, active, and holding are all absent.
+     * ringing, dialing, active, and holding are all absent. A saved
+     * STREAM_VOICE_CALL index from a killed call is restored on that same gate.
      */
     private fun clearStaleMotoState() {
         val name = try {
@@ -315,6 +316,8 @@ class GatewayService : Service() {
         }
         forceStartupMicUnmute()
         clearIdleMusicMixers()
+        val am = getSystemService(AUDIO_SERVICE) as? AudioManager
+        GsmCallManager.restoreSavedVoiceVolume(am, "startup")
     }
 
     private fun telephonyCallState(): Int = try {

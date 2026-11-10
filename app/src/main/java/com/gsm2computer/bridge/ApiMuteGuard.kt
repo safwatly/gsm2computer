@@ -6,6 +6,9 @@ package com.gsm2computer.bridge
  * stream Voice Tx Mute. The signal is the output thread that carries the
  * flag, not a match anywhere in the dumpsys. A successful playback write
  * plus [WRITE_DELAY_MS] is the fallback when that thread never appears.
+ *
+ * The thread block is in `dumpsys media.audio_flinger`. `dumpsys audio`
+ * is AudioService and does not contain it, so the fallback always won.
  */
 internal object ApiMuteTiming {
     const val WRITE_DELAY_MS = 400L
@@ -14,7 +17,7 @@ internal object ApiMuteTiming {
     const val FALLBACK_LOG = "api_mute fallback: no usecase signal"
 
     /** Keep each output thread intact so Standby stays with its own flags. */
-    const val DUMP_CMD = "dumpsys audio | awk '" +
+    const val DUMP_CMD = "dumpsys media.audio_flinger | awk '" +
         "/Output thread/ || /- Output:/ { " +
         "if (block ~ /INCALL_MUSIC|TELEPHONY_TX|telephony-tx/) print block \"\\n\"; " +
         "block = \$0; next } " +

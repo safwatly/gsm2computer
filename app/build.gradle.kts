@@ -38,11 +38,12 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        // versionCode 352: Moto reads persist.gsm2computer.inject_policy at
-        // call start. Default hal_owned_api_mute. The HAL owns Incall_Music.
-        // hal_owned still uses the 351 session tuple. 348 stays held.
-        versionCode = 352
-        versionName = "0.2.13"
+        // versionCode 353: Moto raises STREAM_VOICE_CALL to max for the
+        // call and restores the saved index. Call-active Voice Tx Mute
+        // scheduling no longer overflows its debounce. api_mute reads
+        // dumpsys media.audio_flinger. AUDIO-FLOW logs the raw mute reads.
+        versionCode = 353
+        versionName = "0.2.14"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
