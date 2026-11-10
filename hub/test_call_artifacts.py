@@ -398,6 +398,23 @@ const log = new El({ role: 'log', 'aria-label': 'Conversation transcript' }, '',
     new El({ role: 'group', 'aria-label': 'Message actions for Suzie message at 4:11:08 AM' }, 'Message actions for Suzie message at 4:11:08 AM', []),
     new El({ class: 'sand-transcript-body' }, 'SuzieYou got a scam WhatsApp from a friend', []),
   ]),
+  new El({ tag: 'div', role: 'article', class: 'sand-transcript-row', 'aria-label': '', 'data-row-key': 'voice-call-call-7f3a@1' }, '', [
+    new El({ 'data-voice-call-transcript': '' }, '', [
+      new El({ tag: 'div', 'data-nest': 'card', 'data-speaker': 'user' }, '', [
+        new El({ tag: 'div' }, 'Hello', []),
+      ]),
+      new El({ tag: 'div', 'data-nest': 'card', 'data-speaker': 'assistant' }, '', [
+        new El({ tag: 'div' }, 'Hey Safwat.', []),
+      ]),
+      new El({ tag: 'div' }, 'not a card', []),
+    ]),
+    new El({ 'data-voice-call-summary': '' }, 'Talked about a ride', []),
+    new El({ 'data-voice-call-duration': '' }, '9 min', []),
+    new El({ role: 'group', 'aria-label': 'Voice chat feedback' }, 'Voice chat feedback', [
+      new El({ tag: 'button' }, 'Good', []),
+      new El({ tag: 'button' }, 'Bad', []),
+    ]),
+  ]),
   new El({ role: 'group', 'aria-label': 'Pinned Bots' }, '(empty)', []),
   new El({ role: 'group', 'aria-label': 'Message actions for Suzie message at 8:21:06 PM' }, 'not a turn', []),
 ]);
@@ -438,11 +455,19 @@ assert.strictEqual(turns[10].timestamp, '8:18 PM');
 assert.strictEqual(turns[14].speaker, 'assistant');
 assert.strictEqual(turns[14].text, 'You got a scam WhatsApp from a friend');
 assert.strictEqual(turns[14].timestamp, '4:11 AM');
-assert.strictEqual(turns.length, 15);
+assert.deepStrictEqual(turns.slice(15, 17).map((turn) => [turn.speaker, turn.text]), [
+  ['caller', 'Hello'],
+  ['assistant', 'Hey Safwat.'],
+]);
+assert.strictEqual(turns.length, 17);
 for (const turn of turns) {
   assert.ok(!turn.text.includes('Message actions'));
   assert.ok(!turn.text.includes('Your answer'));
   assert.ok(!turn.text.includes('Voice chat feedback'));
+  assert.ok(!turn.text.includes('not a card'));
+  assert.ok(!turn.text.includes('Talked about a ride'));
+  assert.ok(!turn.text.includes('9 min'));
+  assert.ok(turn.text !== 'Good' && turn.text !== 'Bad');
   assert.ok(!turn.text.includes('8:2'));
 }
 """ % gt.VOICE_DOM_JS
