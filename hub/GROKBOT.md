@@ -100,14 +100,21 @@ are `[role=article]` rows (`.sand-transcript-row` /
 `.sand-virtual-transcript__row`) inside
 `[role=log][aria-label="Conversation transcript"]`. Their `aria-label` is
 empty. A text row has one speaker, the name element `You` or the bot
-name. A voice-chat row is one article that holds several utterances.
-Each utterance with its own `data-role` (`user` or `assistant`),
-`sand-fill-bubble-user` / `sand-fill-bubble-agent` class, or `You` /
-bot-name label becomes its own turn. Text nodes inside an utterance are
-joined with spaces. A speaker name glued onto the following word
-(`SuzieYou`) is removed. `Message actions for {name} message at {time}`
-is chrome, and so are `Your answer`, `Voice chat feedback`, and
-timestamps. The reader uses the chat already on screen and does not click a
+name. A voice-chat row is one `[role=article]` that holds several
+utterances. Each utterance with its own `data-speaker` (`user` or
+`assistant`), `data-role`, `sand-fill-bubble-user` /
+`sand-fill-bubble-agent` class, or `You` / bot-name label becomes its
+own turn. Text nodes inside an utterance are joined with spaces. A
+speaker name glued onto the following word (`SuzieYou`) is removed.
+`Message actions for {name} message at {time}` is chrome, and so are
+`Your answer`, `Voice chat feedback`, and timestamps. The saved
+transcript is only the `voice-call-call-<id>` card whose absolute time
+falls in this call, with the same slack used for grok.com sessions
+(`GSM2COMPUTER_GROKBOT_TRANSCRIPT_SLACK_S`, 30s) on either side. A clock
+label such as `8:18 PM`, even with `data-voice-call-duration`, does not
+choose a day: the read is `unscoped` and older turns are not saved. No
+voice-call card is `not_found`. A card in the window with no utterances
+is `empty`. The reader uses the chat already on screen and does not click a
 sidebar bot. The list is virtualized, so only the mounted rows are saved;
 the reader does not scroll it.
 
