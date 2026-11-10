@@ -1,7 +1,6 @@
 package com.gsm2computer.bridge
 
 import java.util.Collections
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -337,44 +336,85 @@ internal fun preferTerminal(terminal: AtomicReference<DialStatus?>, next: DialSt
 
 /**
  * One pass racing every entrance. [claim] is the only way an [onOpen] may
- * install the socket. [seal] abandons everyone who has not won. Hangup and
- * a pass that finished with no 101 seal the race. One leg's 409 does not,
- * and neither does the clock while a sibling is still inside dial().
+ * install the socket. [seal] abandons every leg that has not won. [cancelAll]
+ * also abandons the winner, which is what hangup needs while that socket is
+ * not yet installed. One leg's 409 does not seal, and neither does the clock
+ * while a sibling is still inside dial().
+ *
+ * Cancel callbacks are keyed by the leg from [begin], not by URL. A token
+ * mint and its websocket are two callbacks on one leg, and a second attempt
+ * at the same URL is a different leg.
  */
 class EndpointRace {
     private val lock = Any()
+    private var nextLeg = 1L
+    private var winnerLeg: Long? = null
     private var winnerUrl: String? = null
     private var sealed = false
-    private val cancels = ConcurrentHashMap<String, () -> Unit>()
+    private val urls = HashMap<Long, String>()
+    private val cancels = ArrayList<Reg>()
+
+    private class Reg(val leg: Long, val cancel: () -> Unit)
 
     fun winner(): String? = synchronized(lock) { winnerUrl }
 
-    fun claim(url: String): Boolean {
-        val drop = synchronized(lock) {
-            if (sealed || winnerUrl != null) return false
-            winnerUrl = url
-            pendingCancels(url)
-        }
+    /** One dial attempt. The token POST and the websocket share this id. */
+    fun begin(url: String): Long = synchronized(lock) {
+        val id = nextLeg++
+        urls[id] = url
+        id
+    }
+
+    fun claim(leg: Long): Boolean = synchronized(lock) {
+        if (sealed || winnerLeg != null) return false
+        val url = urls[leg] ?: return false
+        winnerLeg = leg
+        winnerUrl = url
+        true
+    }
+
+    /** Cancel every leg except the one [claim] recorded. */
+    fun cancelLosers() {
+        val drop = synchronized(lock) { pending(winnerLeg) }
         drop.forEach { invoke(it) }
-        return true
     }
 
     fun seal() {
         val drop = synchronized(lock) {
             sealed = true
-            pendingCancels(winnerUrl)
+            pending(winnerLeg)
+        }
+        drop.forEach { invoke(it) }
+    }
+
+    /** Hangup. Includes the winner, which [seal] leaves alone. */
+    fun cancelAll() {
+        val drop = synchronized(lock) {
+            sealed = true
+            cancels.map { it.cancel }
         }
         drop.forEach { invoke(it) }
     }
 
     fun abandoned(url: String): Boolean = synchronized(lock) { abandonedLocked(url) }
 
-    fun track(url: String, cancel: () -> Unit) {
+    fun track(leg: Long, cancel: () -> Unit) {
         val runNow = synchronized(lock) {
-            cancels[url] = cancel
-            abandonedLocked(url)
+            if (urls[leg] == null) return
+            cancels.add(Reg(leg, cancel))
+            val winner = winnerLeg
+            when {
+                winner == null -> sealed
+                winner == leg -> false
+                else -> true
+            }
         }
         if (runNow) invoke(cancel)
+    }
+
+    /** A registration that is its own leg. Tests use this for a sibling URL. */
+    fun track(url: String, cancel: () -> Unit) {
+        track(begin(url), cancel)
     }
 
     private fun abandonedLocked(url: String): Boolean {
@@ -384,8 +424,8 @@ class EndpointRace {
         return winner != url
     }
 
-    private fun pendingCancels(keep: String?): List<() -> Unit> =
-        cancels.filterKeys { it != keep }.values.toList()
+    private fun pending(keep: Long?): List<() -> Unit> =
+        cancels.filter { it.leg != keep }.map { it.cancel }
 
     private fun invoke(cancel: () -> Unit) {
         try {

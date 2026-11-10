@@ -25,12 +25,13 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * WebSocket transport for the GSM bridge.
  *
- * A mid-call socket failure does not end the GSM call. This client keeps
- * retrying, with backoff, for the whole time [stop] has not run. [linkGraceMs]
- * still shapes the backoff (1s, 2s, …, 8s). When that window ends and the
- * call is still up, retries continue at the cap. [stop] runs on hangup.
- * Close code 1000 is a real hub hangup and is not retried. Silence is what
- * the caller hears during the gap.
+ * A mid-call socket failure does not end the GSM call while [offHook]
+ * stays true. This client keeps retrying, with backoff, for that whole
+ * time. [linkGraceMs] still shapes the backoff (1s, 2s, …, 8s). When that
+ * window ends and the call is still off-hook, retries continue at the cap.
+ * A null or throwing read counts as on-hook and the session stops, which
+ * is what tears the bridge down. Close code 1000 is a real hub hangup and
+ * is not retried. Silence is what the caller hears during the gap.
  *
  * Each connect races [endpoints] with [HubConnectionRoutine.connectRacing].
  * The first that opens is held until the socket dies. Uplink stays 16 kHz
@@ -47,6 +48,7 @@ class HubStreamClient(
     private val hubOwnedSession: Boolean = false,
     private val linkGraceMs: Long = HubLinkGrace.DEFAULT_GRACE_MS,
     private val onTrace: (kind: String, fields: Map<String, Any?>) -> Unit = { _, _ -> },
+    private val offHook: () -> Boolean = { true },
 ) : MediaTransport {
 
     private val http = OkHttpClient.Builder()
@@ -112,6 +114,9 @@ class HubStreamClient(
     /** Test seam. Dial thread, when this leg's budget expires, before the decision. */
     @Volatile internal var onAttemptTimeout: (() -> Unit)? = null
 
+    /** Test seam. OkHttp thread, after claim and before [HubCallDialer.Live.onOpen]. */
+    @Volatile internal var onClaimed: (() -> Unit)? = null
+
     override fun start(sink: MediaTransport.Sink) {
         this.sink = sink
         linkState = "connecting"
@@ -140,9 +145,23 @@ class HubStreamClient(
                     }
                     val now = System.currentTimeMillis()
                     grace.markLost(now)
-                    val baseDelay = HubRetry.delayWhileOffHook(grace, now, offHook = !closed)
+                    val stillOffHook = try {
+                        offHook()
+                    } catch (_: Exception) {
+                        false
+                    }
+                    val baseDelay = HubRetry.delayWhileOffHook(
+                        grace,
+                        now,
+                        offHook = stillOffHook && !closed,
+                    )
                     if (baseDelay == null) {
-                        fail("hub link grace expired after ${linkGraceMs}ms: $pending")
+                        val why = if (!stillOffHook) {
+                            "hub link down and the call is not off-hook: $pending"
+                        } else {
+                            "hub link grace expired after ${linkGraceMs}ms: $pending"
+                        }
+                        fail(why)
                         return
                     }
                     if (grace.retryDelayMs(now) == null && !loggedGraceHold) {
@@ -203,6 +222,10 @@ class HubStreamClient(
         val done = CountDownLatch(1)
         val socketRef = AtomicReference<WebSocket?>(null)
 
+        fun closeSnapshot() {
+            closeSocket(socketRef.get() ?: ws)
+        }
+
         fun finish(message: String?, clean: Boolean) {
             if (!finished.compareAndSet(false, true)) return
             if (clean) cleanClose.set(true)
@@ -212,9 +235,17 @@ class HubStreamClient(
 
         val live = object : HubCallDialer.Live {
             override fun onOpen(webSocket: WebSocket, request: DialRequest) {
+                socketRef.set(webSocket)
+                if (closed) {
+                    closeSocket(webSocket)
+                    return
+                }
                 reconnectArmed.set(false)
                 ws = webSocket
-                socketRef.set(webSocket)
+                if (closed) {
+                    closeSocket(webSocket)
+                    return
+                }
                 linkEndpoint = request.endpoint.url
                 linkEntrance = ""
                 linkState = "open"
@@ -282,11 +313,12 @@ class HubStreamClient(
         )
         dialer.beforeOwnSocket = beforeLegDecision
         dialer.onAttemptTimeout = onAttemptTimeout
+        dialer.onClaimed = onClaimed
         val routine = HubConnectionRoutine(
             targets,
             onAttempt = { attempt ->
                 BridgeLog.i(
-                    "hub dial pass=${attempt.pass} index=${attempt.index} url=${attempt.url} " +
+                    "hub dial pass=${attempt.pass} index=${attempt.index} " +
                         "outcome=${attempt.outcome} http=${attempt.httpStatus} " +
                         "detail=${attempt.detail.take(120)}",
                 )
@@ -296,14 +328,21 @@ class HubStreamClient(
             if (closed) {
                 DialResponse(DialStatus.STOP, 0, "stopped")
             } else {
-                BridgeLog.i("hub dial start url=${request.endpoint.url}")
+                BridgeLog.i("hub dial start")
                 dialer.dial(request, live)
             }
         }
         val result = routine.connectRacing(sessionId, maxPasses = 1) { !closed }
-        BridgeLog.i("connect ${result.summary()}")
+        BridgeLog.i(
+            "connect opened=${result.opened} stopped=${result.stopped} " +
+                "cancelled=${result.cancelled} pass=${result.pass} index=${result.index} " +
+                "attempts=${result.attempts.size}",
+        )
         if (!result.opened) {
-            if (closed || result.cancelled) return null
+            if (closed || result.cancelled) {
+                closeSnapshot()
+                return null
+            }
             if (result.stopped) {
                 val detail = result.detail.ifBlank { "hub stopped the dial" }
                 trace("ws_failure", mapOf("code" to 409, "message" to detail))
@@ -319,17 +358,20 @@ class HubStreamClient(
             try {
                 if (done.await(1, TimeUnit.SECONDS)) break
             } catch (_: InterruptedException) {
-                if (closed) return null
+                if (closed) {
+                    closeSnapshot()
+                    return null
+                }
             }
             if (closed) {
-                try {
-                    socket?.close(1000, "call ended")
-                } catch (_: Exception) {
-                }
+                closeSnapshot()
                 return null
             }
         }
-        if (closed) return null
+        if (closed) {
+            closeSnapshot()
+            return null
+        }
         linkState = "hold"
         ws = null
         try {
@@ -595,17 +637,21 @@ class HubStreamClient(
         closed = true
         linkState = "closed"
         retrying = false
-        activeRace?.seal()
+        activeRace?.cancelAll()
         trace("ws_closed", mapOf("code" to 1000, "reason" to "call ended", "local" to true))
         sessionThread?.interrupt()
         pingThread?.interrupt()
-        try {
-            ws?.close(1000, "call ended")
-        } catch (_: Exception) {
-        }
+        closeSocket(ws)
         ws = null
         try {
             http.dispatcher.executorService.shutdown()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun closeSocket(socket: WebSocket?) {
+        try {
+            socket?.close(1000, "call ended")
         } catch (_: Exception) {
         }
     }

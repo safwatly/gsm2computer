@@ -1,6 +1,7 @@
 package com.gsm2computer.bridge.realtime
 
 import com.gsm2computer.bridge.HubEndpoint
+import com.gsm2computer.bridge.bridge.gsmNeedsDisconnect
 import com.gsm2computer.bridge.rtp.MediaTransport
 import okhttp3.Response
 import okhttp3.WebSocket
@@ -141,6 +142,84 @@ class HubStreamRaceTest {
         }
     }
 
+    @Test
+    fun hangupBetweenClaimAndOnOpenClosesTheWinner() {
+        val server = MockWebServer()
+        val track = Track()
+        server.start()
+        val client = HubStreamClient(
+            endpoints = listOf(HubEndpoint(server.url("/").toString(), token)),
+            tokenUrl = "",
+            model = "hub",
+            voice = "marin",
+            instructions = "",
+            hubOwnedSession = true,
+            linkGraceMs = 5_000,
+        )
+        val sink = RecordingSink()
+        try {
+            enqueueUpgrade(server, track)
+            client.onClaimed = { client.stop() }
+            client.start(sink)
+            assertTrue(waitUntil(3_000) { track.closed.get() })
+            Thread.sleep(250)
+            assertEquals("closed", client.linkState)
+            assertTrue(track.closed.get())
+            assertTrue(sink.errors.isEmpty())
+            assertFalse(sink.holds.contains(true))
+        } finally {
+            client.stop()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun aNon1000DropWhileCallStateThrowsStopsRetriesAndTearsDown() {
+        val server = MockWebServer()
+        val track = Track()
+        server.start()
+        val disconnected = AtomicBoolean(false)
+        val client = HubStreamClient(
+            endpoints = listOf(HubEndpoint(server.url("/").toString(), token)),
+            tokenUrl = "",
+            model = "hub",
+            voice = "marin",
+            instructions = "",
+            hubOwnedSession = true,
+            linkGraceMs = 30_000,
+            offHook = { throw IllegalStateException("call.state") },
+        )
+        val sink = object : RecordingSink() {
+            override fun onError(msg: String) {
+                if (gsmNeedsDisconnect { throw IllegalStateException("call.state") }) {
+                    disconnected.set(true)
+                }
+                super.onError(msg)
+            }
+        }
+        try {
+            enqueueUpgrade(server, track)
+            client.start(sink)
+            assertTrue(track.opened.await(3, TimeUnit.SECONDS))
+            assertTrue(waitUntil(3_000) { client.linkState == "open" })
+            track.socket?.close(1001, "drop")
+            assertTrue(
+                "state=${client.linkState} errors=${sink.errors} holds=${sink.holds} " +
+                    "requests=${server.requestCount}",
+                waitUntil(3_000) { sink.errors.isNotEmpty() },
+            )
+            Thread.sleep(1_500)
+            assertTrue(disconnected.get())
+            assertFalse(client.isRetrying())
+            assertFalse(sink.holds.contains(true))
+            assertEquals(2, server.requestCount)
+            assertTrue(sink.errors.first().contains("not off-hook"))
+        } finally {
+            client.stop()
+            server.shutdown()
+        }
+    }
+
     private fun client(left: String, right: String) = HubStreamClient(
         endpoints = listOf(HubEndpoint(left, token), HubEndpoint(right, token)),
         tokenUrl = "",
@@ -201,7 +280,7 @@ class HubStreamRaceTest {
         }
     }
 
-    private class RecordingSink : MediaTransport.Sink {
+    private open class RecordingSink : MediaTransport.Sink {
         val errors = CopyOnWriteArrayList<String>()
         val holds = CopyOnWriteArrayList<Boolean>()
 

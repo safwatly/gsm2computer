@@ -42,6 +42,12 @@ class HubCallDialer(
      */
     internal var onAttemptTimeout: (() -> Unit)? = null
 
+    /**
+     * Test seam: OkHttp thread, after this leg has claimed the race and before
+     * [Live.onOpen]. Hangup here is the window where the socket is not yet `ws`.
+     */
+    internal var onClaimed: (() -> Unit)? = null
+
     fun mintedModel(): String = activeModel
 
     interface Live {
@@ -56,13 +62,14 @@ class HubCallDialer(
         if (race != null && race.abandoned(request.endpoint.url)) {
             return DialResponse(DialStatus.RETRYABLE, 0, "lost race")
         }
+        val legId = race?.begin(request.endpoint.url)
         val startedNs = System.nanoTime()
         fun remainingMs(): Long {
             val spent = (System.nanoTime() - startedNs) / 1_000_000L
             return (handshakeTimeoutMs - spent).coerceAtLeast(1L)
         }
         val minted = try {
-            mint(request) { remainingMs() }
+            mint(request, legId) { remainingMs() }
         } catch (failed: DialFailed) {
             return failed.response
         } catch (e: Exception) {
@@ -85,8 +92,8 @@ class HubCallDialer(
         if (race != null && race.abandoned(request.endpoint.url)) {
             return DialResponse(DialStatus.RETRYABLE, 0, "lost race")
         }
-        val leg = Leg(request, live, secrets)
-        race?.track(request.endpoint.url) { leg.socketRef.get()?.cancel() }
+        val leg = Leg(request, live, secrets, legId)
+        if (legId != null) race.track(legId) { leg.socketRef.get()?.cancel() }
         val socket = http.newWebSocket(builder.build(), leg)
         leg.socketRef.compareAndSet(null, socket)
         if (race != null && race.abandoned(request.endpoint.url)) {
@@ -103,9 +110,10 @@ class HubCallDialer(
         private val request: DialRequest,
         private val live: Live,
         private val secrets: List<String>,
+        legId: Long?,
     ) : WebSocketListener() {
         val socketRef = AtomicReference<WebSocket?>(null)
-        private val ownership = LegOwnership(request.race, request.endpoint.url)
+        private val ownership = LegOwnership(request.race, legId)
         private val failure = AtomicReference<DialResponse?>(null)
         private val latch = CountDownLatch(1)
 
@@ -124,7 +132,10 @@ class HubCallDialer(
             socketRef.compareAndSet(null, webSocket)
             try {
                 beforeOwnSocket?.invoke(ownership)
-                val owned = ownership.win { live.onOpen(webSocket, request) }
+                val owned = ownership.win(
+                    install = { live.onOpen(webSocket, request) },
+                    onClaimed = onClaimed,
+                )
                 if (!owned) {
                     note(DialResponse(DialStatus.RETRYABLE, 0, lostDetail()))
                     webSocket.cancel()
@@ -141,13 +152,20 @@ class HubCallDialer(
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             if (!ownership.hasWon()) {
+                val responseCode = response?.code ?: 0
+                val failed = failureResponse(
+                    responseCode,
+                    t.message ?: "websocket failure",
+                    secrets,
+                    request.sessionId,
+                )
+                // A failed upgrade can still carry an HTTP 2xx. That is not a win.
                 note(
-                    failureResponse(
-                        response?.code ?: 0,
-                        t.message ?: "websocket failure",
-                        secrets,
-                        request.sessionId,
-                    ),
+                    if (failed.status == DialStatus.OPENED) {
+                        failed.copy(status = DialStatus.RETRYABLE)
+                    } else {
+                        failed
+                    },
                 )
                 return
             }
@@ -156,6 +174,13 @@ class HubCallDialer(
                 response?.code ?: -1,
                 scrubSecrets(t.message ?: "websocket failure", secrets),
             )
+        }
+
+        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            try {
+                webSocket.close(code, reason.ifBlank { "closed" })
+            } catch (_: Exception) {
+            }
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
@@ -184,7 +209,7 @@ class HubCallDialer(
         }
     }
 
-    private fun mint(request: DialRequest, remainingMs: () -> Long): String {
+    private fun mint(request: DialRequest, legId: Long?, remainingMs: () -> Long): String {
         val secrets = listOf(request.endpoint.deviceToken)
         val url = if (hubOwned) {
             HubEndpoints.tokenUrl(HubEndpoints.httpOrigin(request.endpoint.url), "")
@@ -199,7 +224,7 @@ class HubCallDialer(
             builder.header(name, value)
         }
         val call = http.newCall(builder.build())
-        request.race?.track(request.endpoint.url) { call.cancel() }
+        if (legId != null) request.race?.track(legId) { call.cancel() }
         call.timeout().timeout(remainingMs(), TimeUnit.MILLISECONDS)
         call.execute().use { resp ->
             val body = resp.body?.string().orEmpty()
@@ -249,13 +274,19 @@ class HubCallDialer(
 
 /**
  * One leg's handshake and [EndpointRace.claim], as one decision.
- * [win] installs the socket before it returns. [lose] is the attempt budget.
- * The two cannot disagree: a timeout that returns after [win] observes the win,
- * and a [win] that arrives after [lose] does not install.
+ * [win] publishes the win under the lock, then installs the socket before it
+ * returns. [lose] is the attempt budget. The two cannot disagree: a timeout
+ * that returns after [win] observes the win, and a [win] that arrives after
+ * [lose] does not install.
+ *
+ * Sibling [EndpointRace.cancelLosers] and [install] run after the lock is
+ * released. The win flag is already visible, so the attempt budget cannot
+ * report a timeout for a leg that is about to install, and a sibling
+ * `onFailure` does not need this leg's lock.
  */
 internal class LegOwnership(
     private val race: EndpointRace?,
-    private val url: String,
+    private val leg: Long?,
 ) {
     private val lock = Any()
     private var won = false
@@ -263,18 +294,20 @@ internal class LegOwnership(
 
     fun hasWon(): Boolean = synchronized(lock) { won }
 
-    fun win(install: () -> Unit): Boolean {
+    fun win(install: () -> Unit, onClaimed: (() -> Unit)? = null): Boolean {
         synchronized(lock) {
             if (lost) return false
             if (won) return true
-            if (race != null && !race.claim(url)) {
+            if (race != null && (leg == null || !race.claim(leg))) {
                 lost = true
                 return false
             }
             won = true
-            install()
-            return true
         }
+        race?.cancelLosers()
+        onClaimed?.invoke()
+        install()
+        return true
     }
 
     /** True when this caller lost and should cancel. False when [win] already installed. */

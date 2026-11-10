@@ -19,6 +19,13 @@ object HubRetry {
         callState != STATE_DISCONNECTED && callState != STATE_DISCONNECTING
 
     /**
+     * True when [callState] is a live telephony state. Null is unreadable
+     * and counts as on-hook, the same as a throw at the call site.
+     */
+    fun isOffHook(callState: Int?): Boolean =
+        callState != null && keepsRetrying(callState)
+
+    /**
      * Milliseconds before the next dial. Null when the call is on-hook or
      * retrying is disabled. After the grace window, the capped backoff.
      */

@@ -1,6 +1,7 @@
 package com.gsm2computer.bridge.diag
 
 import android.telecom.Call
+import com.gsm2computer.bridge.bridge.gsmNeedsDisconnect
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -62,6 +63,11 @@ class HubRetryTest {
         assertNull(HubRetry.delayWhileOffHook(grace, 5_000L, offHook = false))
         assertFalse(HubRetry.holdLink(stillRetrying = false, callState = Call.STATE_ACTIVE))
         assertFalse(HubRetry.holdLink(stillRetrying = true, callState = null))
+        assertFalse(HubRetry.isOffHook(null))
+        assertTrue(HubRetry.isOffHook(Call.STATE_ACTIVE))
+        assertTrue(gsmNeedsDisconnect { throw IllegalStateException("call.state") })
+        assertFalse(gsmNeedsDisconnect { Call.STATE_DISCONNECTED })
+        assertTrue(gsmNeedsDisconnect { Call.STATE_ACTIVE })
         val stopped = HubLinkGrace(graceMs = 0L, initialDelayMs = 1_000L, maxDelayMs = 8_000L)
         stopped.markLost(0L)
         assertNull(HubRetry.delayWhileOffHook(stopped, 0L, offHook = true))

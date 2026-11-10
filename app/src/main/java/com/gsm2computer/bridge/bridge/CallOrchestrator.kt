@@ -207,6 +207,7 @@ class CallOrchestrator(
             hubOwnedSession = cfg.hubOwnedSession && cfg.endpoints.isNotEmpty(),
             linkGraceMs = cfg.hubLinkGraceMs,
             onTrace = { kind, fields -> callTrace?.event(kind, fields) },
+            offHook = { HubRetry.isOffHook(gsmCallState()) },
         )
         activeClient = transport
         startAudioPump(RtpPacket.PT_PCMU, transport)
@@ -304,11 +305,9 @@ class CallOrchestrator(
             activeSession = null
             activeClient = null
             val gsm = activeGsmCall
-            if (gsm != null) {
+            if (gsm != null && gsmNeedsDisconnect { gsm.state }) {
                 try {
-                    if (gsm.state != Call.STATE_DISCONNECTED) {
-                        gsm.disconnect()
-                    }
+                    gsm.disconnect()
                 } catch (e: Exception) {
                     Log.e(TAG, "Error disconnecting GSM: ${e.message}")
                 }
@@ -490,3 +489,15 @@ class CallOrchestrator(
         private const val STALE_STATE_TIMEOUT_MS = 60_000L
     }
 }
+
+/**
+ * Hangup still runs when the telephony state cannot be read. A throw from
+ * `call.state` is not "already disconnected".
+ */
+internal fun gsmNeedsDisconnect(readState: () -> Int): Boolean =
+    try {
+        readState() != Call.STATE_DISCONNECTED
+    } catch (e: Exception) {
+        Log.w("CallOrchestrator", "gsm state unreadable during teardown: ${e.message}")
+        true
+    }

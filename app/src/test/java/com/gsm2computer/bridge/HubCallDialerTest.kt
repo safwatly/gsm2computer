@@ -111,15 +111,15 @@ class HubCallDialerTest {
 
     @Test
     fun timeoutAndOpenAreOneDecision() {
-        val won = LegOwnership(null, "ws://winner")
-        assertTrue(won.win {})
+        val won = LegOwnership(null, null)
+        assertTrue(won.win(install = {}))
         assertFalse(won.lose())
         assertTrue(won.hasWon())
 
-        val lost = LegOwnership(null, "ws://loser")
+        val lost = LegOwnership(null, null)
         assertTrue(lost.lose())
         var installed = false
-        assertFalse(lost.win { installed = true })
+        assertFalse(lost.win(install = { installed = true }))
         assertFalse(installed)
         assertFalse(lost.hasWon())
     }
@@ -127,9 +127,10 @@ class HubCallDialerTest {
     @Test
     fun winAndLoseCannotDisagree() {
         repeat(200) {
-            val ownership = LegOwnership(EndpointRace(), "ws://leg")
+            val race = EndpointRace()
+            val ownership = LegOwnership(race, race.begin("ws://leg"))
             val installed = AtomicBoolean(false)
-            val open = Thread { ownership.win { installed.set(true) } }
+            val open = Thread { ownership.win(install = { installed.set(true) }) }
             val budget = Thread { ownership.lose() }
             open.start()
             budget.start()
@@ -288,6 +289,47 @@ class HubCallDialerTest {
             slow.shutdown()
             fast.shutdown()
         }
+    }
+
+    @Test
+    fun aFailedUpgradeWithHttp200IsNotOpened() {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setBody("""{"value":"hub-token","model":"hub"}"""))
+            server.enqueue(MockResponse().setResponseCode(200).setBody("not a socket"))
+            val response = dialer().dial(
+                DialRequest(HubEndpoint(server.url("/").toString(), secret), "hub-session"),
+                quietLive(),
+            )
+            assertEquals(DialStatus.RETRYABLE, response.status)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun cancelCallbacksAreKeyedByLeg() {
+        val race = EndpointRace()
+        val first = race.begin("ws://same")
+        val firstToken = AtomicBoolean(false)
+        val firstSocket = AtomicBoolean(false)
+        race.track(first) { firstToken.set(true) }
+        race.track(first) { firstSocket.set(true) }
+        val second = race.begin("ws://same")
+        val secondToken = AtomicBoolean(false)
+        val secondSocket = AtomicBoolean(false)
+        race.track(second) { secondToken.set(true) }
+        race.track(second) { secondSocket.set(true) }
+        assertTrue(race.claim(second))
+        race.cancelLosers()
+        assertTrue(firstToken.get())
+        assertTrue(firstSocket.get())
+        assertFalse(secondToken.get())
+        assertFalse(secondSocket.get())
+        race.cancelAll()
+        assertTrue(secondToken.get())
+        assertTrue(secondSocket.get())
     }
 
     private fun dialer(handshakeTimeoutMs: Long = 3_000): HubCallDialer = HubCallDialer(
