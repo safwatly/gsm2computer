@@ -351,6 +351,53 @@ const log = new El({ role: 'log', 'aria-label': 'Conversation transcript' }, '',
     new El({ class: 'sand-transcript-speaker' }, 'You', []),
     new El({ class: 'sand-transcript-body' }, 'Still here', []),
   ]),
+  new El({ tag: 'article', role: 'article', class: 'sand-transcript-row sand-virtual-transcript__row', 'aria-label': '', 'data-role': 'user' }, '', [
+    new El({ tag: 'time', class: 'sand-row-timestamp' }, '9:05 PM', []),
+    new El({}, '', [
+      new El({ class: 'sand-transcript-speaker' }, 'You', []),
+      new El({ class: 'sand-transcript-body' }, 'Hello.', []),
+    ]),
+    new El({}, '', [
+      new El({ class: 'sand-transcript-speaker' }, 'You', []),
+      new El({ class: 'sand-transcript-body' }, 'Hi.', []),
+    ]),
+    new El({}, '', [
+      new El({ class: 'sand-transcript-speaker' }, 'Suzie', []),
+      new El({ class: 'sand-transcript-body' }, 'Hey.', []),
+    ]),
+    new El({}, '', [
+      new El({ class: 'sand-transcript-speaker' }, 'You', []),
+      new El({ class: 'sand-transcript-body' }, "I'm here.", []),
+    ]),
+    new El({}, '', [
+      new El({ class: 'sand-transcript-speaker' }, 'You', []),
+      new El({ class: 'sand-transcript-body' }, "Where's", []),
+    ]),
+    new El({}, '', [
+      new El({ class: 'sand-transcript-speaker' }, 'Suzie', []),
+      new El({ class: 'sand-transcript-body' }, 'Sounds like that got cut off. Go ahead.', []),
+    ]),
+  ]),
+  new El({ tag: 'article', role: 'article', class: 'sand-transcript-row sand-virtual-transcript__row', 'aria-label': '', 'data-role': 'user' }, '', [
+    new El({ tag: 'time', class: 'sand-row-timestamp' }, '8:18 PM', []),
+    new El({ role: 'group', 'aria-label': 'Message actions for You message at 8:18:02 PM' }, 'Message actions for You message at 8:18:02 PM', []),
+    new El({ 'data-role': 'user', class: 'sand-fill-bubble-user' }, '', [
+      new El({ class: 'sand-transcript-speaker' }, 'You', []),
+      new El({ class: 'sand-transcript-body' }, 'Hello', []),
+    ]),
+    new El({}, '', [
+      new El({ class: 'sand-transcript-speaker' }, 'Suzie', []),
+      new El({ class: 'sand-transcript-body' }, 'Hey Safwat.', []),
+    ]),
+    new El({ 'data-role': 'user', class: 'sand-fill-bubble-user' }, 'Yes, please.', []),
+    new El({ 'data-role': 'assistant', class: 'sand-fill-bubble-agent' }, "I'm here. What can I do for you?", []),
+    new El({ role: 'group', 'aria-label': 'Voice chat feedback' }, 'Voice chat feedback', []),
+  ]),
+  new El({ tag: 'article', role: 'article', class: 'sand-transcript-row', 'aria-label': '' }, '', [
+    new El({ tag: 'time', class: 'sand-row-timestamp' }, '4:11 AM', []),
+    new El({ role: 'group', 'aria-label': 'Message actions for Suzie message at 4:11:08 AM' }, 'Message actions for Suzie message at 4:11:08 AM', []),
+    new El({ class: 'sand-transcript-body' }, 'SuzieYou got a scam WhatsApp from a friend', []),
+  ]),
   new El({ role: 'group', 'aria-label': 'Pinned Bots' }, '(empty)', []),
   new El({ role: 'group', 'aria-label': 'Message actions for Suzie message at 8:21:06 PM' }, 'not a turn', []),
 ]);
@@ -360,7 +407,6 @@ const root = new El({}, '', [
 ]);
 assert.deepStrictEqual(gsm2VoiceTurns(root), []);
 const turns = gsm2DesktopTurns(root);
-assert.strictEqual(turns.length, 4);
 assert.strictEqual(turns[0].speaker, 'caller');
 assert.strictEqual(turns[0].text, 'Need a ride. You should hurry.');
 assert.strictEqual(turns[0].timestamp, '8:20 PM');
@@ -373,6 +419,26 @@ assert.strictEqual(turns[2].timestamp, '8:22 PM');
 assert.strictEqual(turns[3].speaker, 'caller');
 assert.strictEqual(turns[3].text, 'Still here');
 assert.strictEqual(turns[3].timestamp, null);
+assert.deepStrictEqual(turns.slice(4, 10).map((turn) => [turn.speaker, turn.text]), [
+  ['caller', 'Hello.'],
+  ['caller', 'Hi.'],
+  ['assistant', 'Hey.'],
+  ['caller', "I'm here."],
+  ['caller', "Where's"],
+  ['assistant', 'Sounds like that got cut off. Go ahead.'],
+]);
+assert.strictEqual(turns[4].timestamp, '9:05 PM');
+assert.deepStrictEqual(turns.slice(10, 14).map((turn) => [turn.speaker, turn.text]), [
+  ['caller', 'Hello'],
+  ['assistant', 'Hey Safwat.'],
+  ['caller', 'Yes, please.'],
+  ['assistant', "I'm here. What can I do for you?"],
+]);
+assert.strictEqual(turns[10].timestamp, '8:18 PM');
+assert.strictEqual(turns[14].speaker, 'assistant');
+assert.strictEqual(turns[14].text, 'You got a scam WhatsApp from a friend');
+assert.strictEqual(turns[14].timestamp, '4:11 AM');
+assert.strictEqual(turns.length, 15);
 for (const turn of turns) {
   assert.ok(!turn.text.includes('Message actions'));
   assert.ok(!turn.text.includes('Your answer'));

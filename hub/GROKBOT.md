@@ -99,11 +99,15 @@ debugger socket is loopback and the page is exactly
 are `[role=article]` rows (`.sand-transcript-row` /
 `.sand-virtual-transcript__row`) inside
 `[role=log][aria-label="Conversation transcript"]`. Their `aria-label` is
-empty. The speaker is the row's name element, the short text `You` or the
-bot name, not a sentence in the message body. When a row has
-`Message actions for {name} message at {time}` chrome, that name picks the
-element. Action chrome, `Your answer`, `Voice chat feedback`, and
-timestamps stay out of the message text. The reader uses the chat already on screen and does not click a
+empty. A text row has one speaker, the name element `You` or the bot
+name. A voice-chat row is one article that holds several utterances.
+Each utterance with its own `data-role` (`user` or `assistant`),
+`sand-fill-bubble-user` / `sand-fill-bubble-agent` class, or `You` /
+bot-name label becomes its own turn. Text nodes inside an utterance are
+joined with spaces. A speaker name glued onto the following word
+(`SuzieYou`) is removed. `Message actions for {name} message at {time}`
+is chrome, and so are `Your answer`, `Voice chat feedback`, and
+timestamps. The reader uses the chat already on screen and does not click a
 sidebar bot. The list is virtualized, so only the mounted rows are saved;
 the reader does not scroll it.
 

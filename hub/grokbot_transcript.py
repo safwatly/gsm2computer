@@ -170,78 +170,156 @@ function gsm2DesktopPlain(el) {
   }
   return parts.join(" ").replace(/\s+/g, " ").trim();
 }
-function gsm2DesktopLooksLikeName(text) {
-  const value = String(text || "").replace(/\s+/g, " ").trim();
-  if (!value || value.length > 40) return false;
-  if (/[,.!?;:]/.test(value)) return false;
-  if (/\d/.test(value)) return false;
-  return value.split(" ").length <= 3;
+function gsm2DesktopParts(el) {
+  if (!el) return [];
+  if (el.childNodes && el.childNodes.length) {
+    const parts = [];
+    for (const node of Array.from(el.childNodes)) {
+      if (node.nodeType === 3) parts.push({ kind: "text", text: node.textContent || "" });
+      else if (node.nodeType === 1) parts.push({ kind: "element", el: node });
+    }
+    return parts;
+  }
+  const parts = [];
+  if (el.text) parts.push({ kind: "text", text: el.text });
+  const kids = el.children ? Array.from(el.children) : [];
+  for (const child of kids) parts.push({ kind: "element", el: child });
+  return parts;
 }
-function gsm2DesktopSmallest(el, text) {
-  let best = el;
-  let bestSize = el.querySelectorAll ? el.querySelectorAll("*").length : 0;
-  if (!el.querySelectorAll) return best;
-  for (const inner of Array.from(el.querySelectorAll("*"))) {
-    if (gsm2DesktopInChrome(inner)) continue;
-    if (gsm2DesktopPlain(inner) !== text) continue;
-    const size = inner.querySelectorAll("*").length;
-    if (size < bestSize) {
-      best = inner;
-      bestSize = size;
+function gsm2DesktopKnownNames(root) {
+  const names = new Set(["you", "your"]);
+  const nodes = root && root.querySelectorAll ? Array.from(root.querySelectorAll("[aria-label], *")) : [];
+  for (const node of nodes) {
+    const found = /^Message actions for (.+) message at\b/i.exec(String(node.getAttribute && node.getAttribute("aria-label") || ""));
+    if (found) names.add(found[1].replace(/\s+/g, " ").trim().toLowerCase());
+    const cls = String(node.getAttribute && node.getAttribute("class") || "");
+    if (/(?:^|\s)sand-chat-header__identity(?:\s|$)/.test(cls)) {
+      const text = gsm2DesktopPlain(node).replace(/\s+/g, " ").trim().toLowerCase();
+      if (text) names.add(text);
     }
   }
-  return best;
+  return names;
 }
-function gsm2DesktopSpeakerLabel(row, name) {
-  if (!row.querySelectorAll) return null;
-  const aliases = gsm2DesktopAliases(name);
-  if (aliases.size) {
-    let best = null;
-    let bestSize = Infinity;
-    for (const el of Array.from(row.querySelectorAll("*"))) {
-      if (gsm2DesktopInChrome(el)) continue;
-      const text = gsm2DesktopPlain(el);
-      if (!aliases.has(text.toLowerCase())) continue;
-      const size = el.querySelectorAll("*").length;
-      if (size < bestSize) {
-        best = el;
-        bestSize = size;
-      }
-    }
-    if (best) return best;
-  }
-  for (const el of Array.from(row.querySelectorAll("*"))) {
-    if (gsm2DesktopInChrome(el)) continue;
-    const text = gsm2DesktopPlain(el);
-    if (!gsm2DesktopLooksLikeName(text)) continue;
-    return gsm2DesktopSmallest(el, text);
-  }
+function gsm2DesktopExplicitRole(el) {
+  if (!el || !el.getAttribute || gsm2DesktopChrome(el)) return null;
+  const raw = String(
+    el.getAttribute("data-role") || el.getAttribute("data-speaker") || el.getAttribute("data-author") || el.getAttribute("data-from") || ""
+  ).replace(/\s+/g, " ").trim().toLowerCase();
+  if (raw === "user" || raw === "human" || raw === "caller" || raw === "you") return "caller";
+  if (raw === "assistant" || raw === "agent" || raw === "bot" || raw === "model" || raw === "grok") return "assistant";
+  const cls = String(el.getAttribute("class") || "");
+  if (/(?:^|\s)sand-fill-bubble-user(?:\s|$)/.test(cls)) return "caller";
+  if (/(?:^|\s)sand-fill-bubble-agent(?:\s|$)/.test(cls)) return "assistant";
   return null;
 }
-function gsm2DesktopStripChrome(node) {
-  if (!node || !node.querySelectorAll) return;
-  node.querySelectorAll(
-    '[aria-label^="Message actions"], [aria-label="Your answer"], [aria-label="Voice chat feedback"], .sand-row-timestamp, time, button'
-  ).forEach((el) => { if (el.remove) el.remove(); });
+function gsm2DesktopIsSpeakerMarker(el, names) {
+  if (!el || !el.getAttribute || gsm2DesktopChrome(el) || gsm2DesktopInChrome(el)) return false;
+  const text = gsm2DesktopPlain(el).replace(/\s+/g, " ").trim().toLowerCase();
+  return Boolean(text) && names.has(text);
 }
-function gsm2DesktopText(row, name) {
-  const clone = row.cloneNode(true);
-  gsm2DesktopStripChrome(clone);
-  const aliases = gsm2DesktopAliases(name);
-  if (aliases.size && clone.querySelectorAll) {
-    let best = null;
-    let bestSize = Infinity;
-    for (const el of Array.from(clone.querySelectorAll("*"))) {
-      if (!aliases.has(gsm2DesktopPlain(el).toLowerCase())) continue;
-      const size = el.querySelectorAll("*").length;
-      if (size < bestSize) {
-        best = el;
-        bestSize = size;
+function gsm2DesktopStripGlued(text, name) {
+  const value = String(text || "").replace(/\s+/g, " ").trim();
+  const raw = String(name || "").trim();
+  if (!raw || value.length < raw.length) return value;
+  if (value.slice(0, raw.length).toLowerCase() !== raw.toLowerCase()) return value;
+  const rest = value.slice(raw.length);
+  if (/^[A-Z]/.test(rest)) return rest.trim();
+  if (/^\s/.test(rest)) {
+    const after = rest.replace(/^\s+/, "");
+    if (/^you$/i.test(raw) && /^[a-z]/.test(after)) return value;
+    return after.trim();
+  }
+  return value;
+}
+function gsm2DesktopCollectText(el, names) {
+  const parts = [];
+  function visit(node) {
+    if (!node || gsm2DesktopChrome(node)) return;
+    if (node !== el && gsm2DesktopIsSpeakerMarker(node, names)) return;
+    const bits = gsm2DesktopParts(node);
+    const hasElement = bits.some((bit) => bit.kind === "element");
+    for (const bit of bits) {
+      if (bit.kind === "text") {
+        const raw = String(bit.text || "").replace(/\s+/g, " ").trim();
+        if (!raw) continue;
+        if (names.has(raw.toLowerCase()) && (hasElement || bits.length > 1)) continue;
+        parts.push(raw);
+      } else {
+        visit(bit.el);
       }
     }
-    if (best && best.remove) best.remove();
   }
-  return String(clone.innerText || clone.textContent || "").replace(/\s+/g, " ").trim();
+  visit(el);
+  return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+function gsm2DesktopExplicitUtterances(row) {
+  if (!row.querySelectorAll) return null;
+  const signaled = Array.from(row.querySelectorAll("*")).filter((el) => gsm2DesktopExplicitRole(el));
+  const inner = signaled.filter((el) => !signaled.some((other) => other !== el && el.contains && el.contains(other)));
+  if (!inner.length) return null;
+  const parent = inner[0].parentElement || inner[0].parent;
+  const sameParent = parent && inner.every((el) => (el.parentElement || el.parent) === parent);
+  if (sameParent) {
+    const kids = parent.children ? Array.from(parent.children) : [];
+    const bubbles = kids.filter((el) => !gsm2DesktopChrome(el) && !gsm2DesktopInChrome(el) && gsm2DesktopPlain(el));
+    if (bubbles.length >= 2 && bubbles.some((el) => gsm2DesktopExplicitRole(el) === "caller") && bubbles.some((el) => inner.includes(el))) {
+      return bubbles.map((el) => ({ el: el, role: gsm2DesktopExplicitRole(el) || "assistant" }));
+    }
+  }
+  if (inner.length >= 2) return inner.map((el) => ({ el: el, role: gsm2DesktopExplicitRole(el) }));
+  return null;
+}
+function gsm2DesktopSegments(row, names, fallbackName) {
+  const segments = [];
+  let current = null;
+  function start(role, name) {
+    current = { speaker: role, name: name, parts: [] };
+    segments.push(current);
+  }
+  function append(text) {
+    const value = String(text || "").replace(/\s+/g, " ").trim();
+    if (!value) return;
+    if (!current) {
+      const role = gsm2DesktopRole(fallbackName);
+      if (!role) return;
+      start(role, fallbackName);
+    }
+    current.parts.push(value);
+  }
+  function visit(el) {
+    if (!el || gsm2DesktopChrome(el)) return;
+    if (gsm2DesktopIsSpeakerMarker(el, names)) {
+      const name = gsm2DesktopPlain(el);
+      const role = gsm2DesktopRole(name);
+      if (role) start(role, name);
+      return;
+    }
+    const bits = gsm2DesktopParts(el);
+    const hasElement = bits.some((bit) => bit.kind === "element");
+    for (const bit of bits) {
+      if (bit.kind === "text") {
+        const raw = String(bit.text || "").replace(/\s+/g, " ").trim();
+        if (!raw) continue;
+        if (names.has(raw.toLowerCase()) && (hasElement || bits.length > 1)) {
+          const role = gsm2DesktopRole(raw);
+          if (role) start(role, raw);
+          continue;
+        }
+        append(raw);
+      } else {
+        visit(bit.el);
+      }
+    }
+  }
+  visit(row);
+  const turns = [];
+  for (const segment of segments) {
+    if (!segment.speaker) continue;
+    const text = gsm2DesktopStripGlued(segment.parts.join(" "), segment.name);
+    if (!text) continue;
+    turns.push({ speaker: segment.speaker, text: text });
+  }
+  return turns;
 }
 function gsm2DesktopStamp(row) {
   const timed = row.querySelector && row.querySelector(".sand-row-timestamp");
@@ -262,6 +340,7 @@ function gsm2DesktopTurns(root) {
   const doc = root || document;
   const log = doc.querySelector && doc.querySelector('[role="log"][aria-label="Conversation transcript"]');
   if (!log || !log.querySelectorAll) return [];
+  const names = gsm2DesktopKnownNames(doc);
   const rows = Array.from(log.querySelectorAll(
     'article.sand-transcript-row, article.sand-virtual-transcript__row, [role="article"].sand-transcript-row, [role="article"].sand-virtual-transcript__row'
   ));
@@ -270,14 +349,21 @@ function gsm2DesktopTurns(root) {
   for (const row of rows) {
     if (seen.has(row)) continue;
     seen.add(row);
-    const name = gsm2DesktopActionsName(row);
-    const label = gsm2DesktopSpeakerLabel(row, name);
-    const speakerName = label ? gsm2DesktopPlain(label) : name;
-    const speaker = gsm2DesktopRole(speakerName);
-    if (!speaker) continue;
-    const text = gsm2DesktopText(row, speakerName);
-    if (!text) continue;
-    turns.push({ speaker: speaker, text: text, timestamp: gsm2DesktopStamp(row) });
+    const stamp = gsm2DesktopStamp(row);
+    const explicit = gsm2DesktopExplicitUtterances(row);
+    if (explicit) {
+      for (const item of explicit) {
+        const botName = Array.from(names).find((name) => name !== "you" && name !== "your") || "";
+        const label = item.role === "caller" ? "You" : botName;
+        const text = gsm2DesktopStripGlued(gsm2DesktopCollectText(item.el, names), label);
+        if (!item.role || !text) continue;
+        turns.push({ speaker: item.role, text: text, timestamp: stamp });
+      }
+      continue;
+    }
+    for (const segment of gsm2DesktopSegments(row, names, gsm2DesktopActionsName(row))) {
+      turns.push({ speaker: segment.speaker, text: segment.text, timestamp: stamp });
+    }
   }
   return turns;
 }
