@@ -86,6 +86,7 @@ class DeviceProfileTest {
         assertFalse(p.mixer.mixerRestoreCmd.contains("Incall_Music"))
         assertEquals("", p.mixer.mixerIncallMusicCmd)
         assertEquals("", p.routing.incallMusicParam)
+        assertEquals(MediaRecorder.AudioSource.VOICE_CALL, p.routing.captureSource)
         assertTrue(p.mixer.mixerSetupCmd.contains("TX_DEC0 Volume"))
         assertTrue(p.mixer.mixerRestoreCmd.contains("RX_RX0 Digital Volume"))
         assertTrue(p.mixer.mixerRestoreCmd.contains("TX_DEC0 Volume"))

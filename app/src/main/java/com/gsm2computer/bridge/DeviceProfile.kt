@@ -610,10 +610,11 @@ data class DeviceProfile(
          *     kernel has no per-PCM status files. The other MMode slot is
          *     not written. The write goes through the Magisk Go helper
          *     (`tinymix-helper 351`); a readback cannot confirm it because
-         *     the kernel getter is NULL. Each AUDIO-FLOW sample still logs
-         *     the raw `Voice Tx Mute` and `Voice Rx Device Mute` reads,
-         *     including a getter error, and does not pass values. Voice
-         *     Rx/Tx Device Mute stay unwritten.
+         *     the kernel getter is NULL. Each AUDIO-FLOW sample reads
+         *     `Voice Tx Mute` and `Voice Rx Device Mute` through that
+         *     helper on the root shell, with no values. A null getter or
+         *     a read error is logged on the sample; it does not fail the
+         *     call. Voice Rx/Tx Device Mute stay unwritten.
          *   - The HAL owns Incall_Music. This profile does not write
          *     MM1/MM2/MM9 and does not cycle incall_music_enabled. Stale
          *     idle MM1/MM2 values are cleared once at service start.
@@ -623,7 +624,9 @@ data class DeviceProfile(
          *     the telephony track is playing and incall-music is up, then
          *     restores the previous value. `hal_owned` keeps the session
          *     tuple, forces the API mic unmuted, and restores the pre-call
-         *     value. `hal_owned_no_unmute` writes neither. TX_DEC, ADC, and
+         *     value. `hal_owned_no_unmute` writes neither.
+         *     `hal_owned_no_capture` matches `hal_owned` but does not open
+         *     the voice-call capture for the whole call. TX_DEC, ADC, and
          *     amp isolation stay on for every policy.
          */
         fun motoG84Holi() = DeviceProfile(

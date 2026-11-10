@@ -220,15 +220,21 @@ class CallOrchestrator(
     private fun startAudioPump(payloadType: Int, transport: MediaTransport) {
         forceAllowRecordAudio()
 
-        val guard = MicIsolationGuard(context, GsmCallManager.profile)
-        when (val iso = guard.verify { msg -> listener?.onStreamStats(msg) }) {
-            is MicIsolationGuard.MicIsolationResult.NotIsolated -> {
-                val err = "Mic not isolated (${"%.1f".format(iso.rmsDb)} dBFS)"
-                listener?.onError(err)
-                tearDown(err)
-                return
+        if (GsmCallManager.suppressesVoiceCapture()) {
+            val line = GsmCallManager.injectPolicy.captureDisabledLog()
+            Log.i(TAG, line)
+            listener?.onStreamStats(line)
+        } else {
+            val guard = MicIsolationGuard(context, GsmCallManager.profile)
+            when (val iso = guard.verify { msg -> listener?.onStreamStats(msg) }) {
+                is MicIsolationGuard.MicIsolationResult.NotIsolated -> {
+                    val err = "Mic not isolated (${"%.1f".format(iso.rmsDb)} dBFS)"
+                    listener?.onError(err)
+                    tearDown(err)
+                    return
+                }
+                MicIsolationGuard.MicIsolationResult.Isolated -> { }
             }
-            MicIsolationGuard.MicIsolationResult.Isolated -> { }
         }
 
         activeSession?.stop()
@@ -293,6 +299,7 @@ class CallOrchestrator(
             }
             activeGsmCall = null
         } finally {
+            GsmCallManager.releaseInjectPolicy()
             GsmCallManager.muteLocalEarpiece = false
             bridgeState = BridgeState.IDLE
             lastStateChangeTime = System.currentTimeMillis()
@@ -375,10 +382,12 @@ class CallOrchestrator(
 
     @Synchronized
     private fun forceReset(reason: String) {
+        if (GsmCallManager.isMotoProfile()) GsmCallManager.restoreBridgedAudio("force-reset")
         lastLink = activeClient?.currentLink() ?: lastLink
         try {
             activeSession?.stop()
         } catch (_: Exception) {}
+        GsmCallManager.releaseInjectPolicy()
         activeSession = null
         activeClient = null
         try {

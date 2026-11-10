@@ -38,12 +38,15 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        // versionCode 353: Moto raises STREAM_VOICE_CALL to max for the
-        // call and restores the saved index. Call-active Voice Tx Mute
-        // scheduling no longer overflows its debounce. api_mute reads
-        // dumpsys media.audio_flinger. AUDIO-FLOW logs the raw mute reads.
-        versionCode = 353
-        versionName = "0.2.14"
+        // versionCode 354 (after 331–353): Moto hal_owned_no_capture leaves
+        // voice-call capture closed for the whole call. AUDIO-FLOW mute
+        // reads use tinymix-helper 351 on the root shell and log a null
+        // kernel getter. Voice-call volume writes share audioLock with
+        // hangup restore, including forceReset. The inject-policy latch
+        // is released after the RTP session stops, so the next ACTIVE
+        // reads persist.gsm2computer.inject_policy again.
+        versionCode = 354
+        versionName = "0.2.15"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

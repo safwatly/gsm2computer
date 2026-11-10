@@ -14,6 +14,7 @@ import android.media.MediaRecorder
 import android.util.Log
 import com.gsm2computer.bridge.ApiMuteTiming
 import com.gsm2computer.bridge.DeviceProfile
+import com.gsm2computer.bridge.MotoActiveMixDump
 import com.gsm2computer.bridge.MotoMuteReadback
 import com.gsm2computer.bridge.diag.BridgeLog
 import com.gsm2computer.bridge.realtime.UplinkWire
@@ -122,6 +123,7 @@ class RtpSession(
     @Volatile var rawCaptureRms = 0; private set  // Before echo gate — 0 means source is silent
     @Volatile private var playbackWroteAtMs = 0L
     @Volatile private var apiMuteWaitStarted = false
+    private val mixDumpScheduled = AtomicBoolean(false)
     @Volatile var audioSourceName = "none"; private set
     @Volatile private var playbackUsageName = "MEDIA"
     @Volatile private var firstRxInfo = ""
@@ -238,6 +240,7 @@ class RtpSession(
         Thread({ timeoutLoop() }, "RTP-Timeout-$localPort").start()
 
         listener?.onRtpStarted()
+        scheduleMotoMixDump()
     }
 
     private fun notifyHubWire() {
@@ -268,59 +271,64 @@ class RtpSession(
         // Capture source comes from the device profile (VOICE_CALL by default,
         // VOICE_DOWNLINK on Pixel/Tensor).  The 8kHz/16kHz variants are
         // sample-rate negotiation, NOT a source fallback.
-        val configs = buildCaptureConfigs()
+        // hal_owned_no_capture (Moto only) does not open AudioRecord at all.
+        if (captureSuppressed()) {
+            audioSourceName = "disabled-by-policy"
+        } else {
+            val configs = buildCaptureConfigs()
 
-        // Single attempt here.  Cold-boot HAL init latency is handled by the
-        // bounded retry in captureInitAndLoop() — this method must not fall
-        // back to other sources.
-        reAssertAppOps()
-        // 500ms propagation delay.  On cold boot, system services are all
-        // starting simultaneously and AudioFlinger takes longer to see the
-        // appops change.
-        Thread.sleep(500)
+            // Single attempt here.  Cold-boot HAL init latency is handled by the
+            // bounded retry in captureInitAndLoop() — this method must not fall
+            // back to other sources.
+            reAssertAppOps()
+            // 500ms propagation delay.  On cold boot, system services are all
+            // starting simultaneously and AudioFlinger takes longer to see the
+            // appops change.
+            Thread.sleep(500)
 
-        var record: AudioRecord? = null
-        var usedRate = 8000
+            var record: AudioRecord? = null
+            var usedRate = 8000
 
-        for (cfg in configs) {
-            try {
-                val minBuf = AudioRecord.getMinBufferSize(
-                    cfg.rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-                )
-                if (minBuf <= 0) {
-                    Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate}: invalid minBuf=$minBuf")
-                    continue
+            for (cfg in configs) {
+                try {
+                    val minBuf = AudioRecord.getMinBufferSize(
+                        cfg.rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+                    )
+                    if (minBuf <= 0) {
+                        Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate}: invalid minBuf=$minBuf")
+                        continue
+                    }
+                    val bufSize = minBuf.coerceAtLeast(cfg.rate / 50 * 2 * 2) // 40ms (two RTP frames)
+                    val rec = AudioRecord(
+                        cfg.source, cfg.rate,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        bufSize
+                    )
+                    if (rec.state == AudioRecord.STATE_INITIALIZED) {
+                        record = rec
+                        usedRate = cfg.rate
+                        audioSourceName = cfg.name
+                        currentSourceId = cfg.source
+                        Log.i(TAG, "AudioRecord OK: ${cfg.name} @ ${cfg.rate}Hz (buf=$bufSize)")
+                        break
+                    } else {
+                        Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate}: state=${rec.state}")
+                        rec.release()
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate} failed: ${e.message}")
                 }
-                val bufSize = minBuf.coerceAtLeast(cfg.rate / 50 * 2 * 2) // 40ms (two RTP frames)
-                val rec = AudioRecord(
-                    cfg.source, cfg.rate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufSize
-                )
-                if (rec.state == AudioRecord.STATE_INITIALIZED) {
-                    record = rec
-                    usedRate = cfg.rate
-                    audioSourceName = cfg.name
-                    currentSourceId = cfg.source
-                    Log.i(TAG, "AudioRecord OK: ${cfg.name} @ ${cfg.rate}Hz (buf=$bufSize)")
-                    break
-                } else {
-                    Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate}: state=${rec.state}")
-                    rec.release()
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate} failed: ${e.message}")
             }
-        }
 
-        if (record != null) {
-            audioRecord = record
-            audioSessionId = record.audioSessionId
-            captureRate = usedRate
+            if (record != null) {
+                audioRecord = record
+                audioSessionId = record.audioSessionId
+                captureRate = usedRate
 
-            // Diagnostic: check critical permissions and ABOX state
-            logCaptureDiagnostics(record)
+                // Diagnostic: check critical permissions and ABOX state
+                logCaptureDiagnostics(record)
+            }
         }
 
         // Minimum buffer for lowest latency.  incall_music injects
@@ -382,6 +390,18 @@ class RtpSession(
      * the orchestrator tears it down.
      */
     private fun captureInitAndLoop() {
+        if (captureSuppressed()) {
+            logCaptureSuppressed()
+            while (running.get()) {
+                try {
+                    Thread.sleep(1_000)
+                } catch (_: InterruptedException) {
+                    return
+                }
+            }
+            return
+        }
+
         // Fast path: AudioRecord was already initialized in initAudio (warm boot)
         if (audioRecord != null) {
             if (captureLoop() || !running.get()) return
@@ -687,28 +707,7 @@ class RtpSession(
         recordInjectPolicy()
         // Re-assert Telephony Tx now the call is ACTIVE: policy only picks the
         // INCALL_MUSIC output (incall_music_uplink -> MultiMedia9) while in call.
-        if (profile.routing.playbackToTelephony) {
-            try {
-                val t = audioTrack
-                val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-                val dev = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                    ?.firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
-                if (t != null && dev != null) {
-                    // Do not call setPreferredDevice on a playing track. AudioFlinger
-                    // then logs "dead IAudioTrack, creating a new one from
-                    // setOutputDevice" and the replacement drops in-call-music.
-                    // A fresh track is armed while stopped; a later route change
-                    // rebuilds it on the playback thread.
-                    val cur = t.routedDevice?.type ?: -1
-                    captureTap?.putMeta("play_routed_at_start", cur)
-                    Log.i(TAG, "AudioTrack route at call start: type=$cur")
-                    applyPlaybackRoute(cur)
-                }
-                if (t != null) watchPlaybackRoute(t)
-            } catch (e: Exception) {
-                Log.w(TAG, "re-route to TYPE_TELEPHONY failed: ${e.message}")
-            }
-        }
+        armTelephonyPlaybackRoute()
 
         // Buffer: 20ms of PCM at the actual capture sample rate
         val samplesPerFrame = captureRate / 50  // 160 @ 8kHz, 320 @ 16kHz
@@ -1040,7 +1039,7 @@ class RtpSession(
                 val flowBase = "AUDIO-FLOW: [GSM -> SIP: REC=${rawCaptureRms} TRX=${if(txPacketCount > lastFlowTxCount) "OK" else "IDLE"}] " +
                                 "[SIP -> GSM: REC=${if(rxPacketCount > lastFlowRxCount) "OK" else "IDLE"} TRX=${playbackRms}]"
                 val flowStats = if (profile.name.startsWith("Moto g84")) {
-                    "$flowBase ${readMotoHardwareMutes()}"
+                    "$flowBase ${readMotoHardwareMutes()}${flowCaptureNote()}"
                 } else {
                     flowBase
                 }
@@ -1238,12 +1237,34 @@ class RtpSession(
      */
     private fun readMotoHardwareMutes(): String {
         return try {
+            val version = DeviceProfile.resolveCmd(MotoMuteReadback.versionScript())
+            if (version.isEmpty()) return MotoMuteReadback.missing()
+            val versionOut = RootShell.execForOutput(version, 2_500)
+            if (!MotoMuteReadback.helperAccepted(versionOut)) {
+                return MotoMuteReadback.helperMismatch(versionOut)
+            }
             val script = DeviceProfile.resolveCmd(MotoMuteReadback.script())
             if (script.isEmpty()) return MotoMuteReadback.missing()
             MotoMuteReadback.format(RootShell.execForOutput(script, 2_500))
         } catch (e: Exception) {
-            "txMute=[read-failed] rxDevMute=[read-failed] ${e.message ?: ""}".trim()
+            MotoMuteReadback.failed(e.message)
         }
+    }
+
+    private fun captureSuppressed(): Boolean = GsmCallManager.suppressesVoiceCapture()
+
+    private fun logCaptureSuppressed() {
+        val line = GsmCallManager.injectPolicy.captureDisabledLog()
+        Log.i(TAG, line)
+        BridgeLog.i(line)
+        listener?.onRtpStats(line)
+        audioSourceName = "disabled-by-policy"
+    }
+
+    private fun flowCaptureNote(): String {
+        val line = GsmCallManager.latchedCaptureNote()
+        if (line.isEmpty()) return ""
+        return " $line"
     }
 
     private fun readIncallDump(): String = try {
@@ -1251,6 +1272,48 @@ class RtpSession(
     } catch (e: Exception) {
         Log.w(TAG, "incall dump failed: ${e.message}")
         ""
+    }
+
+    /**
+     * Once, about 5s after the session starts (call is ACTIVE and incall
+     * music is up). Moto only. Read-only helper dump of VOC / Voice /
+     * MultiMedia9 / Incall controls.
+     */
+    private fun scheduleMotoMixDump() {
+        if (!profile.name.startsWith("Moto g84")) return
+        if (!mixDumpScheduled.compareAndSet(false, true)) return
+        Thread({
+            try {
+                Thread.sleep(MotoActiveMixDump.DELAY_MS)
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+            if (!running.get()) return@Thread
+            val lines = readMotoMixDump()
+            for (line in lines) Log.i(TAG, line)
+            listener?.onRtpStats("${MotoActiveMixDump.LOG_PREFIX}: lines=${lines.size}")
+        }, "moto-mix-dump").apply { isDaemon = true }.start()
+    }
+
+    private fun readMotoMixDump(): List<String> {
+        return try {
+            val version = DeviceProfile.resolveCmd(MotoMuteReadback.versionScript())
+            if (version.isEmpty()) {
+                return listOf("${MotoActiveMixDump.LOG_PREFIX}: tinymix-missing")
+            }
+            val versionOut = RootShell.execForOutput(version, 2_500)
+            if (!MotoMuteReadback.helperAccepted(versionOut)) {
+                return listOf(MotoActiveMixDump.helperMismatch(versionOut))
+            }
+            val cmd = DeviceProfile.resolveCmd(MotoActiveMixDump.listArgv())
+            if (cmd.isEmpty()) {
+                return listOf("${MotoActiveMixDump.LOG_PREFIX}: tinymix-missing")
+            }
+            val dump = RootShell.execForOutput(TinymixTrace.captureCommand(cmd), 8_000)
+            MotoActiveMixDump.logLines(dump)
+        } catch (e: Exception) {
+            listOf("${MotoActiveMixDump.LOG_PREFIX}: read-error ${e.message ?: ""}".trim())
+        }
     }
 
     /** One 20 ms silence write so incall_music sees an active STREAM_MUSIC output. */
@@ -1270,6 +1333,32 @@ class RtpSession(
             -1
         }
         Log.i(TAG, "playback primed $wrote bytes before incall_music routed=$routed")
+    }
+
+    /**
+     * Watch Telephony Tx and rebuild if the playing track leaves it.
+     * Do not call setPreferredDevice on a playing track. AudioFlinger then
+     * logs "dead IAudioTrack, creating a new one from setOutputDevice" and
+     * the replacement drops in-call-music. A fresh track is armed while
+     * stopped; a later route change rebuilds it on the playback thread.
+     */
+    private fun armTelephonyPlaybackRoute() {
+        if (!profile.routing.playbackToTelephony) return
+        try {
+            val t = audioTrack
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val dev = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                ?.firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
+            if (t != null && dev != null) {
+                val cur = t.routedDevice?.type ?: -1
+                captureTap?.putMeta("play_routed_at_start", cur)
+                Log.i(TAG, "AudioTrack route at call start: type=$cur")
+                applyPlaybackRoute(cur)
+            }
+            if (t != null) watchPlaybackRoute(t)
+        } catch (e: Exception) {
+            Log.w(TAG, "re-route to TYPE_TELEPHONY failed: ${e.message}")
+        }
     }
 
     private fun applyPlaybackRoute(routedType: Int) {
@@ -1494,6 +1583,9 @@ class RtpSession(
         // when pcminject3 and the AFE helper are both on the phone. Build 341's
         // RootPcmInjector was constructed nowhere, so playback does not start it.
         armPlaybackTrack(track)
+        // captureLoop never runs when voice-call capture is closed, so the
+        // telephony route listener has to be installed from playback.
+        if (GsmCallManager.latchedCaptureDisabled()) armTelephonyPlaybackRoute()
         val phased: PhasedInjector? = if (profile.name.startsWith("Moto g84") && PhasedInjector.available())
             PhasedInjector(context, { audioTrack ?: track }, playbackRate, { captureTap }, { enableIncallMusic() },
                 { b -> resamplePcm16(b, playbackRate, 48000) }) else null

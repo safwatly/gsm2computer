@@ -17,6 +17,7 @@ import com.gsm2computer.bridge.DeviceProfile
 import com.gsm2computer.bridge.GatewayApp
 import com.gsm2computer.bridge.HangupRestore
 import com.gsm2computer.bridge.InjectPolicy
+import com.gsm2computer.bridge.InjectPolicyLatch
 import com.gsm2computer.bridge.MicApiAction
 import com.gsm2computer.bridge.MicRestoreGate
 import com.gsm2computer.bridge.MotoIdleMixers
@@ -65,7 +66,7 @@ object GsmCallManager {
     @Volatile var injectPolicy: InjectPolicy = InjectPolicy.DEFAULT
         private set
 
-    @Volatile private var injectPolicyLatched = false
+    private val policyLatch = InjectPolicyLatch()
     private var voiceTxDecisionLogged = false
     private val audioLock = Any()
     private val micGate = MicRestoreGate()
@@ -492,9 +493,6 @@ object GsmCallManager {
         // MSM8930 it kills the incall_music injection path, preventing
         // the agent's audio from reaching the GSM caller.  Speaker
         // silencing is handled by muteVoiceRx() at the ALSA mixer level.
-        try {
-            am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
-        } catch (_: SecurityException) {}
         // Voice call volume: controls caller's voice on speaker.
         // MSM8930: minimum (1) — speaker silenced by muteVoiceRx via tinymix.
         // Exynos 9820: 80% — no muteVoiceRx, need loud speaker for mic capture.
@@ -504,12 +502,21 @@ object GsmCallManager {
         // 8, which left the telephony output's stream 0 at -inf. The saved
         // index is restored when the bridge closes. A late pass after that
         // must not write the minimum back over the restored index.
-        try {
-            val vcVol = voiceCallIndex(am)
-            if (vcVol != null) {
-                am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, vcVol, 0)
-            }
-        } catch (_: SecurityException) {}
+        //
+        // audioLock covers the open check and the write together. Hangup
+        // restore takes the same lock, so a late max write cannot land
+        // after the saved index has been put back.
+        synchronized(audioLock) {
+            try {
+                val vcVol = voiceCallIndex(am)
+                if (vcVol != null) {
+                    try {
+                        am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
+                    } catch (_: SecurityException) {}
+                    am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, vcVol, 0)
+                }
+            } catch (_: SecurityException) {}
+        }
         // Music stream controls incall_music injection level into
         // the modem uplink.  Lower value = quieter speaker + quieter
         // agent voice for the GSM caller.
@@ -567,7 +574,6 @@ object GsmCallManager {
                 true
             } else {
                 bridgeAudioOpen = false
-                injectPolicyLatched = false
                 voiceTxDecisionLogged = false
                 false
             }
@@ -609,34 +615,42 @@ object GsmCallManager {
      */
     fun restoreSavedVoiceVolume(am: AudioManager?, reason: String) {
         if (!isMotoProfile()) return
-        val prefs = voicePrefs()
-        if (prefs == null) {
-            Log.w(TAG, "voice volume restore skipped no context reason=$reason")
-            return
-        }
-        val stored = MotoVoiceVolume.restoreIndex(MotoVoiceVolume.read(prefs)) ?: return
-        if (am == null) {
-            Log.w(TAG, "voice volume restore kept prior=$stored reason=$reason")
-            return
-        }
-        try {
+        synchronized(audioLock) {
+            val prefs = voicePrefs()
+            if (prefs == null) {
+                Log.w(TAG, "voice volume restore skipped no context reason=$reason")
+                return
+            }
+            val stored = MotoVoiceVolume.restoreWrite(bridgeAudioOpen, MotoVoiceVolume.read(prefs))
+            if (stored == null) {
+                if (bridgeAudioOpen) {
+                    Log.i(TAG, "voice volume restore left in place bridge open reason=$reason")
+                }
+                return
+            }
+            if (am == null) {
+                Log.w(TAG, "voice volume restore kept prior=$stored reason=$reason")
+                return
+            }
             try {
-                am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
-            } catch (_: SecurityException) {}
-            am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, stored, 0)
-        } catch (e: SecurityException) {
-            Log.w(TAG, "voice volume restore kept prior=$stored reason=$reason err=${e.message}")
-            return
+                try {
+                    am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
+                } catch (_: SecurityException) {}
+                am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, stored, 0)
+            } catch (e: SecurityException) {
+                Log.w(TAG, "voice volume restore kept prior=$stored reason=$reason err=${e.message}")
+                return
+            }
+            if (!MotoVoiceVolume.clear(prefs)) {
+                Log.w(TAG, "voice volume restore wrote $stored but the saved index remains reason=$reason")
+            }
+            val after = try {
+                am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+            } catch (_: Exception) {
+                -1
+            }
+            appLog("voice volume restore set=$stored after=$after reason=$reason")
         }
-        if (!MotoVoiceVolume.clear(prefs)) {
-            Log.w(TAG, "voice volume restore wrote $stored but the saved index remains reason=$reason")
-        }
-        val after = try {
-            am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
-        } catch (_: Exception) {
-            -1
-        }
-        appLog("voice volume restore set=$stored after=$after reason=$reason")
     }
 
     /**
@@ -751,12 +765,47 @@ object GsmCallManager {
 
     fun isMotoProfile(): Boolean = profile.name.startsWith("Moto g84")
 
+    /**
+     * Moto diagnostic only. Other profiles keep their capture source.
+     * Latches the property so a session that starts after ACTIVE sees
+     * the same policy as the mixer setup.
+     */
+    fun suppressesVoiceCapture(): Boolean {
+        if (!isMotoProfile()) return false
+        latchMotoInjectPolicy()
+        return !injectPolicy.opensVoiceCapture
+    }
+
+    /**
+     * Already-latched policy for AUDIO-FLOW. Does not read the property
+     * and does not latch, so a sample after hangup cannot pin the next call.
+     */
+    fun latchedCaptureNote(): String {
+        if (!isMotoProfile()) return ""
+        return policyLatch.flowNote()
+    }
+
+    /** Already-latched capture decision. Does not read the property. */
+    fun latchedCaptureDisabled(): Boolean {
+        if (!isMotoProfile()) return false
+        return !policyLatch.peek().opensVoiceCapture
+    }
+
+    /**
+     * Drop the call's policy latch. Call this after the RTP session has
+     * stopped, including when hangup restore took the skip path.
+     */
+    fun releaseInjectPolicy() {
+        policyLatch.clear()
+    }
+
     /** One read per call. A later ACTIVE callback must not change the experiment. */
     private fun latchMotoInjectPolicy() {
-        if (!isMotoProfile() || injectPolicyLatched) return
-        injectPolicyLatched = true
+        if (!isMotoProfile() || policyLatch.latched) return
         val raw = InjectPolicy.rawProperty()
-        injectPolicy = InjectPolicy.parse(raw)
+        val result = policyLatch.latch(raw)
+        injectPolicy = result.policy
+        if (!result.fresh) return
         val shown = if (InjectPolicy.recognized(raw)) {
             raw.trim().ifEmpty { "(default)" }
         } else {
