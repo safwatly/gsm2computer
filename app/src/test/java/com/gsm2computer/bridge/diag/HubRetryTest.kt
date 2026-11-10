@@ -40,17 +40,34 @@ class HubRetryTest {
     }
 
     @Test
-    fun orchestratorHoldsRetriesWhileTheGsmCallIsOffHook() {
+    fun holdOnlyWhileTheTransportIsStillRetrying() {
+        assertTrue(HubRetry.holdLink(stillRetrying = true, callState = Call.STATE_ACTIVE))
+        assertTrue(HubRetry.holdLink(stillRetrying = true, callState = Call.STATE_DIALING))
+        assertFalse(HubRetry.holdLink(stillRetrying = false, callState = Call.STATE_ACTIVE))
+        assertFalse(HubRetry.holdLink(stillRetrying = false, callState = Call.STATE_DIALING))
+        assertFalse(HubRetry.holdLink(stillRetrying = true, callState = null))
+        assertFalse(HubRetry.holdLink(stillRetrying = true, callState = Call.STATE_DISCONNECTED))
+        assertFalse(HubRetry.holdLink(stillRetrying = true, callState = Call.STATE_DISCONNECTING))
+    }
+
+    @Test
+    fun giveUpTearsDownAndAnUnreadableCallStateDoesNotHold() {
         val src = File("src/main/java/com/gsm2computer/bridge/bridge/CallOrchestrator.kt").readText()
         val timeout = src.substringAfter("override fun onRtpTimeout").substringBefore("override fun onRtpStats")
-        assertTrue(timeout.contains("gsmStillOffHook()"))
-        assertTrue(timeout.indexOf("gsmStillOffHook()") < timeout.indexOf("tearDown("))
-        val guard = src.substringAfter("private fun gsmStillOffHook").substringBefore("private fun tearDown")
-        assertTrue(guard.contains("HubRetry.keepsRetrying"))
+        assertTrue(timeout.contains("HubRetry.holdLink"))
+        assertTrue(timeout.contains("isRetrying()"))
+        assertTrue(timeout.indexOf("holdLink") < timeout.indexOf("tearDown("))
+        val state = src.substringAfter("private fun gsmCallState").substringBefore("private fun tearDown")
+        assertTrue(state.contains("return null"))
+        assertFalse(state.contains("return true"))
         val client = File("src/main/java/com/gsm2computer/bridge/realtime/HubStreamClient.kt").readText()
+        val fail = client.substringAfter("private fun fail(").substringBefore("private fun trace")
+        assertTrue(fail.contains("retrying = false"))
+        assertTrue(fail.indexOf("retrying = false") < fail.indexOf("onError"))
+        val loop = client.substringAfter("private fun sessionLoop()").substringBefore("private fun openAndHold")
+        assertTrue(loop.contains("retrying = true"))
+        assertTrue(loop.indexOf("FATAL_PREFIX") < loop.indexOf("retrying = true"))
         assertTrue(client.contains("connectRacing"))
         assertTrue(client.contains("delayWhileOffHook"))
-        assertTrue(client.contains("activeRace?.seal()"))
-        assertTrue(client.contains("ATTEMPT_TIMEOUT_MS"))
     }
 }

@@ -26,4 +26,15 @@ object HubRetry {
         if (!offHook || grace.graceMs <= 0L) return null
         return grace.retryDelayMs(nowMs) ?: maxOf(grace.maxDelayMs, grace.initialDelayMs)
     }
+
+    /**
+     * Keep the GSM call up only while the hub transport is still going to dial.
+     * A deliberate close, [stop], or an exhausted retry reports [stillRetrying]
+     * false and the bridge tears down. A null [callState] is unreadable and
+     * counts as on-hook.
+     */
+    fun holdLink(stillRetrying: Boolean, callState: Int?): Boolean {
+        if (!stillRetrying || callState == null) return false
+        return keepsRetrying(callState)
+    }
 }

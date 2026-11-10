@@ -251,8 +251,8 @@ class CallOrchestrator(
                 listener?.onError("Audio: $error")
             }
             override fun onRtpTimeout(reason: String) {
-                if (gsmStillOffHook()) {
-                    Log.w(TAG, "hub link down while GSM off-hook; holding retries ($reason)")
+                if (HubRetry.holdLink(activeClient?.isRetrying() == true, gsmCallState())) {
+                    Log.w(TAG, "hub link down while the transport is still retrying ($reason)")
                     onHubLinkHold(true, reason)
                     return
                 }
@@ -269,15 +269,14 @@ class CallOrchestrator(
         activeSession = session
     }
 
-    private fun gsmStillOffHook(): Boolean {
-        val call = activeGsmCall ?: return false
-        val state = try {
+    private fun gsmCallState(): Int? {
+        val call = activeGsmCall ?: return null
+        return try {
             call.state
         } catch (e: Exception) {
-            Log.w(TAG, "gsm state unreadable; keeping hub retries: ${e.message}")
-            return true
+            Log.w(TAG, "gsm state unreadable; not treating the call as off-hook: ${e.message}")
+            null
         }
-        return HubRetry.keepsRetrying(state)
     }
 
     @Synchronized

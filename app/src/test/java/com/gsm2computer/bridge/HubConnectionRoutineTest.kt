@@ -212,27 +212,62 @@ class HubConnectionRoutineTest {
     }
 
     @Test
-    fun racingStopAbandonsTheOtherEndpoint() {
+    fun racing409ArrivesBefore101AndTheCallProceedsOnTheWinner() {
+        val loserDone = CountDownLatch(1)
         val routine = routine(listOf(public, tailscale)) { request ->
-            if (request.endpoint.url == public.url) {
+            if (request.endpoint.url == tailscale.url) {
+                loserDone.countDown()
                 DialResponse(DialStatus.STOP, 409, "call in progress")
             } else {
+                assertTrue(loserDone.await(2, TimeUnit.SECONDS))
                 val race = checkNotNull(request.race)
-                val start = System.currentTimeMillis()
-                while (!race.abandoned(request.endpoint.url) && System.currentTimeMillis() - start < 2_000) {
-                    Thread.sleep(10)
-                }
-                if (race.abandoned(request.endpoint.url)) {
-                    DialResponse(DialStatus.RETRYABLE, 0, "abandoned")
-                } else {
-                    DialResponse(DialStatus.OPENED, 101, "second socket")
-                }
+                assertFalse(race.abandoned(request.endpoint.url))
+                DialResponse(DialStatus.OPENED, 101, "")
             }
+        }
+        val result = routine.connectRacing(maxPasses = 3)
+        assertTrue(result.opened)
+        assertFalse(result.stopped)
+        assertFalse(result.cancelled)
+        assertEquals(public.url, result.url)
+        assertEquals(0, result.pass)
+        assertEquals(
+            "opened",
+            result.attempts.first { it.url == public.url }.outcome,
+        )
+        assertEquals(101, result.attempts.first { it.url == public.url }.httpStatus)
+    }
+
+    @Test
+    fun racingLaterDoesNotCancelTheLegStillWaitingFor101() {
+        val loserDone = CountDownLatch(1)
+        val routine = routine(listOf(public, tailscale)) { request ->
+            if (request.endpoint.url == tailscale.url) {
+                loserDone.countDown()
+                DialResponse(DialStatus.LATER, 409, "relink grace")
+            } else {
+                assertTrue(loserDone.await(2, TimeUnit.SECONDS))
+                assertFalse(checkNotNull(request.race).abandoned(request.endpoint.url))
+                DialResponse(DialStatus.OPENED, 101, "")
+            }
+        }
+        val result = routine.connectRacing(maxPasses = 3)
+        assertTrue(result.opened)
+        assertEquals(public.url, result.url)
+        assertEquals(0, result.pass)
+    }
+
+    @Test
+    fun racingStopWhenEveryLegFinishedEndsTheWalk() {
+        var dials = 0
+        val routine = routine(listOf(public, tailscale)) {
+            dials += 1
+            DialResponse(DialStatus.STOP, 409, "call in progress")
         }
         val result = routine.connectRacing(maxPasses = 3)
         assertTrue(result.stopped)
         assertFalse(result.opened)
-        assertTrue(result.attempts.none { it.outcome == "opened" })
+        assertEquals(2, dials)
     }
 
     @Test

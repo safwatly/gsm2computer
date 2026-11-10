@@ -126,8 +126,11 @@ class HubConnectionRoutine(
 
     /**
      * Dial every endpoint in a pass concurrently. The first [DialStatus.OPENED]
-     * wins and the others are abandoned. [DialStatus.STOP] still ends the walk
-     * when nothing has opened, so a busy hub is not given a second socket.
+     * wins. A [DialStatus.STOP] or [DialStatus.LATER] from one leg does not
+     * seal or cancel the others while any leg is still inside [dial]: the
+     * hub may already have admitted that leg and its 101 is only slow.
+     * The pass seals when every leg has finished without a 101. [DialStatus.STOP]
+     * then ends the walk, so a busy hub is not given another pass.
      */
     fun connectRacing(
         sessionId: String = "",
@@ -201,13 +204,7 @@ class HubConnectionRoutine(
                                 )
                                 if (opened.compareAndSet(null, win)) signal.countDown()
                             }
-                            DialStatus.STOP, DialStatus.LATER -> {
-                                if (race.winner() == null && opened.get() == null) {
-                                    terminal.compareAndSet(null, response.status)
-                                    race.seal()
-                                    signal.countDown()
-                                }
-                            }
+                            DialStatus.STOP, DialStatus.LATER -> preferTerminal(terminal, response.status)
                             DialStatus.RETRYABLE -> Unit
                         }
                     } finally {
@@ -232,7 +229,11 @@ class HubConnectionRoutine(
                 race.seal()
                 return cancelled(sessionId, attempts.toList(), secrets)
             }
-            if (terminal.get() == DialStatus.STOP) {
+            val pending = finished.get() < endpoints.size
+            // Every leg finished with no 101, or the wait bound expired.
+            // A single 409 never reaches this while a sibling is still in dial().
+            race.seal()
+            if (terminal.get() == DialStatus.STOP && !pending) {
                 val last = attempts.lastOrNull()
                 return ConnectResult(
                     opened = false,
@@ -314,10 +315,20 @@ data class DialRequest(
     val race: EndpointRace? = null,
 )
 
+/** [DialStatus.STOP] outranks [DialStatus.LATER]. A later 409 must not reopen the walk. */
+internal fun preferTerminal(terminal: AtomicReference<DialStatus?>, next: DialStatus) {
+    while (true) {
+        val current = terminal.get()
+        if (current == DialStatus.STOP || current == next) return
+        if (terminal.compareAndSet(current, next)) return
+    }
+}
+
 /**
  * One pass racing every entrance. [claim] is the only way an [onOpen] may
- * install the socket. [seal] abandons everyone who has not won, which is how
- * hangup and a busy-hub 409 cancel the sockets still in TCP.
+ * install the socket. [seal] abandons everyone who has not won. Hangup,
+ * the wait bound, and a pass that finished with no 101 seal the race.
+ * One leg's 409 does not.
  */
 class EndpointRace {
     private val winnerUrl = AtomicReference<String?>(null)

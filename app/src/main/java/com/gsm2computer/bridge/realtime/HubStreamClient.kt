@@ -83,6 +83,11 @@ class HubStreamClient(
     @Volatile private var activeRace: EndpointRace? = null
     @Volatile private var loggedGraceHold = false
 
+    /** True while a dropped link is waiting to dial again. Cleared on open, [fail], and [stop]. */
+    @Volatile private var retrying = false
+
+    fun isRetrying(): Boolean = retrying
+
     override fun currentLink(): HubLink = HubLink(linkEndpoint, linkEntrance, sessionId)
 
     // Model actually used for the WS connect — the one the token was minted for
@@ -137,6 +142,7 @@ class HubStreamClient(
                             "hub grace elapsed after ${linkGraceMs}ms; telephony still off-hook, continuing",
                         )
                     }
+                    retrying = true
                     val delay = baseDelay + ((grace.attempt * 173L) % 500L)
                     linkState = "hold"
                     sink?.onLinkHold(true, pending)
@@ -166,6 +172,8 @@ class HubStreamClient(
             }
         } catch (e: Exception) {
             if (!closed) fail("hub link loop failed: ${e.message}")
+        } finally {
+            retrying = false
         }
     }
 
@@ -206,6 +214,7 @@ class HubStreamClient(
                 openedAtMs = System.currentTimeMillis()
                 grace.markLinked()
                 loggedGraceHold = false
+                retrying = false
                 sink?.onLinkHold(false, "hub ws open")
                 trace(
                     "ws_open",
@@ -391,6 +400,7 @@ class HubStreamClient(
     }
 
     private fun fail(message: String) {
+        retrying = false
         if (closed) return
         linkState = "closed"
         Log.e(TAG, message)
@@ -550,6 +560,7 @@ class HubStreamClient(
         if (closed) return
         closed = true
         linkState = "closed"
+        retrying = false
         activeRace?.seal()
         trace("ws_closed", mapOf("code" to 1000, "reason" to "call ended", "local" to true))
         sessionThread?.interrupt()
