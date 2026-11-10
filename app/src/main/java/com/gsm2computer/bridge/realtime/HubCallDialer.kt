@@ -3,6 +3,7 @@ package com.gsm2computer.bridge.realtime
 import com.gsm2computer.bridge.DialRequest
 import com.gsm2computer.bridge.DialResponse
 import com.gsm2computer.bridge.DialStatus
+import com.gsm2computer.bridge.EndpointRace
 import com.gsm2computer.bridge.HubEndpoints
 import com.gsm2computer.bridge.classifyHubStatus
 import com.gsm2computer.bridge.scrubSecrets
@@ -14,7 +15,6 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -26,9 +26,27 @@ class HubCallDialer(
     private val hubOwned: Boolean,
     private val openAiTokenUrl: String,
     private val model: String,
-    private val handshakeTimeoutMs: Long = 4_000,
+    private val handshakeTimeoutMs: Long = ATTEMPT_TIMEOUT_MS,
 ) {
     @Volatile private var activeModel: String = model
+
+    /**
+     * Test seam: OkHttp thread, inside this leg's [onOpen], before the
+     * ownership decision. The leg has not touched [Live].
+     */
+    internal var beforeOwnSocket: ((LegOwnership) -> Unit)? = null
+
+    /**
+     * Test seam: dial thread, after the attempt budget, before [LegOwnership.lose].
+     * A 101 that wins the decision while this runs is the result [dial] returns.
+     */
+    internal var onAttemptTimeout: (() -> Unit)? = null
+
+    /**
+     * Test seam: OkHttp thread, after this leg has claimed the race and before
+     * [Live.onOpen]. Hangup here is the window where the socket is not yet `ws`.
+     */
+    internal var onClaimed: (() -> Unit)? = null
 
     fun mintedModel(): String = activeModel
 
@@ -40,8 +58,18 @@ class HubCallDialer(
 
     fun dial(request: DialRequest, live: Live): DialResponse {
         val secrets = listOf(request.endpoint.deviceToken)
+        val race = request.race
+        if (race != null && race.abandoned(request.endpoint.url)) {
+            return DialResponse(DialStatus.RETRYABLE, 0, "lost race")
+        }
+        val legId = race?.begin(request.endpoint.url)
+        val startedNs = System.nanoTime()
+        fun remainingMs(): Long {
+            val spent = (System.nanoTime() - startedNs) / 1_000_000L
+            return (handshakeTimeoutMs - spent).coerceAtLeast(1L)
+        }
         val minted = try {
-            mint(request)
+            mint(request, legId) { remainingMs() }
         } catch (failed: DialFailed) {
             return failed.response
         } catch (e: Exception) {
@@ -61,69 +89,127 @@ class HubCallDialer(
         for ((name, value) in HubEndpoints.hubHeaders(request.endpoint, request.sessionId)) {
             builder.header(name, value)
         }
-        val gate = HandshakeGate()
-        val failure = AtomicReference<DialResponse?>(null)
-        val latch = CountDownLatch(1)
-        val socket = http.newWebSocket(builder.build(), object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                if (!gate.onOpen()) {
-                    webSocket.cancel()
-                    return
-                }
-                latch.countDown()
-                live.onOpen(webSocket, request)
-            }
-
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                live.onMessage(webSocket, text)
-            }
-
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                if (!gate.opened()) {
-                    failure.set(
-                        failureResponse(
-                            response?.code ?: 0,
-                            t.message ?: "websocket failure",
-                            secrets,
-                            request.sessionId,
-                        ),
-                    )
-                    latch.countDown()
-                    return
-                }
-                live.onDead(
-                    webSocket,
-                    response?.code ?: -1,
-                    scrubSecrets(t.message ?: "websocket failure", secrets),
-                )
-            }
-
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                if (!gate.opened()) {
-                    failure.set(
-                        failureResponse(
-                            code,
-                            reason.ifBlank { "websocket closed" },
-                            secrets,
-                            request.sessionId,
-                        ),
-                    )
-                    latch.countDown()
-                    return
-                }
-                live.onDead(webSocket, code, scrubSecrets(reason, secrets))
-            }
-        })
-        if (!latch.await(handshakeTimeoutMs, TimeUnit.MILLISECONDS)) {
-            val status = timeoutDecision(gate) { socket.cancel() }
-            if (status == DialStatus.OPENED) return DialResponse(DialStatus.OPENED, 101, "")
-            return failure.get() ?: DialResponse(DialStatus.RETRYABLE, 0, "handshake timeout")
+        if (race != null && race.abandoned(request.endpoint.url)) {
+            return DialResponse(DialStatus.RETRYABLE, 0, "lost race")
         }
-        if (gate.opened()) return DialResponse(DialStatus.OPENED, 101, "")
-        return failure.get() ?: DialResponse(DialStatus.RETRYABLE, 0, "handshake ended")
+        val leg = Leg(request, live, secrets, legId)
+        if (legId != null) race.track(legId) { leg.socketRef.get()?.cancel() }
+        val socket = http.newWebSocket(builder.build(), leg)
+        leg.socketRef.compareAndSet(null, socket)
+        if (race != null && race.abandoned(request.endpoint.url)) {
+            socket.cancel()
+        }
+        return leg.await(remainingMs())
     }
 
-    private fun mint(request: DialRequest): String {
+    /**
+     * One entrance's socket. Nothing here is shared with a sibling leg.
+     * [Live] is called only after [LegOwnership.win] has claimed the race.
+     */
+    private inner class Leg(
+        private val request: DialRequest,
+        private val live: Live,
+        private val secrets: List<String>,
+        legId: Long?,
+    ) : WebSocketListener() {
+        val socketRef = AtomicReference<WebSocket?>(null)
+        private val ownership = LegOwnership(request.race, legId)
+        private val failure = AtomicReference<DialResponse?>(null)
+        private val latch = CountDownLatch(1)
+
+        fun await(timeoutMs: Long): DialResponse {
+            if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                onAttemptTimeout?.invoke()
+                if (!ownership.lose()) return DialResponse(DialStatus.OPENED, 101, "")
+                socketRef.get()?.cancel()
+                return failure.get() ?: DialResponse(DialStatus.RETRYABLE, 0, "handshake timeout")
+            }
+            if (ownership.hasWon()) return DialResponse(DialStatus.OPENED, 101, "")
+            return failure.get() ?: DialResponse(DialStatus.RETRYABLE, 0, "handshake ended")
+        }
+
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+            socketRef.compareAndSet(null, webSocket)
+            try {
+                beforeOwnSocket?.invoke(ownership)
+                val owned = ownership.win(
+                    install = { live.onOpen(webSocket, request) },
+                    onClaimed = onClaimed,
+                )
+                if (!owned) {
+                    note(DialResponse(DialStatus.RETRYABLE, 0, lostDetail()))
+                    webSocket.cancel()
+                }
+            } finally {
+                latch.countDown()
+            }
+        }
+
+        override fun onMessage(webSocket: WebSocket, text: String) {
+            if (!ownership.hasWon()) return
+            live.onMessage(webSocket, text)
+        }
+
+        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            if (!ownership.hasWon()) {
+                val responseCode = response?.code ?: 0
+                val failed = failureResponse(
+                    responseCode,
+                    t.message ?: "websocket failure",
+                    secrets,
+                    request.sessionId,
+                )
+                // A failed upgrade can still carry an HTTP 2xx. That is not a win.
+                note(
+                    if (failed.status == DialStatus.OPENED) {
+                        failed.copy(status = DialStatus.RETRYABLE)
+                    } else {
+                        failed
+                    },
+                )
+                return
+            }
+            live.onDead(
+                webSocket,
+                response?.code ?: -1,
+                scrubSecrets(t.message ?: "websocket failure", secrets),
+            )
+        }
+
+        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            try {
+                webSocket.close(code, reason.ifBlank { "closed" })
+            } catch (_: Exception) {
+            }
+        }
+
+        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            if (!ownership.hasWon()) {
+                note(
+                    failureResponse(
+                        code,
+                        reason.ifBlank { "websocket closed" },
+                        secrets,
+                        request.sessionId,
+                    ),
+                )
+                return
+            }
+            live.onDead(webSocket, code, scrubSecrets(reason, secrets))
+        }
+
+        private fun lostDetail(): String {
+            val winner = request.race?.winner()
+            return if (winner != null && winner != request.endpoint.url) "lost race" else "handshake timeout"
+        }
+
+        private fun note(response: DialResponse) {
+            failure.compareAndSet(null, response)
+            latch.countDown()
+        }
+    }
+
+    private fun mint(request: DialRequest, legId: Long?, remainingMs: () -> Long): String {
         val secrets = listOf(request.endpoint.deviceToken)
         val url = if (hubOwned) {
             HubEndpoints.tokenUrl(HubEndpoints.httpOrigin(request.endpoint.url), "")
@@ -138,7 +224,8 @@ class HubCallDialer(
             builder.header(name, value)
         }
         val call = http.newCall(builder.build())
-        call.timeout().timeout(10, TimeUnit.SECONDS)
+        if (legId != null) request.race?.track(legId) { call.cancel() }
+        call.timeout().timeout(remainingMs(), TimeUnit.MILLISECONDS)
         call.execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) {
@@ -186,31 +273,52 @@ class HubCallDialer(
 }
 
 /**
- * One handshake. [onOpen] and [abandon] cannot both win.
- * The loser of [onOpen] must not install the socket. The loser of [abandon]
- * means the socket is already open: [timeoutDecision] returns OPENED and
- * does not cancel it.
+ * One leg's handshake and [EndpointRace.claim], as one decision.
+ * [win] publishes the win under the lock, then installs the socket before it
+ * returns. [lose] is the attempt budget. The two cannot disagree: a timeout
+ * that returns after [win] observes the win, and a [win] that arrives after
+ * [lose] does not install.
+ *
+ * Sibling [EndpointRace.cancelLosers] and [install] run after the lock is
+ * released. The win flag is already visible, so the attempt budget cannot
+ * report a timeout for a leg that is about to install, and a sibling
+ * `onFailure` does not need this leg's lock.
  */
-internal class HandshakeGate {
-    private val state = AtomicInteger(PENDING)
+internal class LegOwnership(
+    private val race: EndpointRace?,
+    private val leg: Long?,
+) {
+    private val lock = Any()
+    private var won = false
+    private var lost = false
 
-    fun onOpen(): Boolean = state.compareAndSet(PENDING, OPENED)
+    fun hasWon(): Boolean = synchronized(lock) { won }
 
-    fun abandon(): Boolean = state.compareAndSet(PENDING, FAILED)
+    fun win(install: () -> Unit, onClaimed: (() -> Unit)? = null): Boolean {
+        synchronized(lock) {
+            if (lost) return false
+            if (won) return true
+            if (race != null && (leg == null || !race.claim(leg))) {
+                lost = true
+                return false
+            }
+            won = true
+        }
+        race?.cancelLosers()
+        onClaimed?.invoke()
+        install()
+        return true
+    }
 
-    fun opened(): Boolean = state.get() == OPENED
-
-    private companion object {
-        const val PENDING = 0
-        const val OPENED = 1
-        const val FAILED = 2
+    /** True when this caller lost and should cancel. False when [win] already installed. */
+    fun lose(): Boolean {
+        synchronized(lock) {
+            if (won) return false
+            lost = true
+            return true
+        }
     }
 }
 
-/** Timeout outcome. [cancel] runs only when this attempt is the one that failed. */
-internal fun timeoutDecision(gate: HandshakeGate, cancel: () -> Unit): DialStatus {
-    if (gate.opened()) return DialStatus.OPENED
-    if (!gate.abandon()) return DialStatus.OPENED
-    cancel()
-    return DialStatus.RETRYABLE
-}
+/** One attempt covers the token POST and the websocket upgrade together. */
+internal const val ATTEMPT_TIMEOUT_MS = 6_000L

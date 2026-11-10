@@ -1,8 +1,7 @@
 package com.gsm2computer.bridge
 
-import com.gsm2computer.bridge.realtime.HandshakeGate
 import com.gsm2computer.bridge.realtime.HubCallDialer
-import com.gsm2computer.bridge.realtime.timeoutDecision
+import com.gsm2computer.bridge.realtime.LegOwnership
 import okhttp3.OkHttpClient
 import okhttp3.Response
 import okhttp3.WebSocket
@@ -11,12 +10,14 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class HubCallDialerTest {
 
@@ -109,30 +110,35 @@ class HubCallDialerTest {
     }
 
     @Test
-    fun timeoutCancelsOnlyWhenAbandonWins() {
-        val won = HandshakeGate()
-        assertTrue(won.onOpen())
-        var cancelled = false
-        assertEquals(DialStatus.OPENED, timeoutDecision(won) { cancelled = true })
-        assertFalse(cancelled)
+    fun timeoutAndOpenAreOneDecision() {
+        val won = LegOwnership(null, null)
+        assertTrue(won.win(install = {}))
+        assertFalse(won.lose())
+        assertTrue(won.hasWon())
 
-        val lost = HandshakeGate()
-        var cancels = 0
-        assertEquals(DialStatus.RETRYABLE, timeoutDecision(lost) { cancels += 1 })
-        assertEquals(1, cancels)
+        val lost = LegOwnership(null, null)
+        assertTrue(lost.lose())
+        var installed = false
+        assertFalse(lost.win(install = { installed = true }))
+        assertFalse(installed)
+        assertFalse(lost.hasWon())
     }
 
     @Test
-    fun abandonAfterOpenKeepsTheSocketAndALateOpenIsIgnored() {
-        val gate = HandshakeGate()
-        assertTrue(gate.onOpen())
-        assertFalse(gate.abandon())
-        assertTrue(gate.opened())
-
-        val failed = HandshakeGate()
-        assertTrue(failed.abandon())
-        assertFalse(failed.onOpen())
-        assertFalse(failed.opened())
+    fun winAndLoseCannotDisagree() {
+        repeat(200) {
+            val race = EndpointRace()
+            val ownership = LegOwnership(race, race.begin("ws://leg"))
+            val installed = AtomicBoolean(false)
+            val open = Thread { ownership.win(install = { installed.set(true) }) }
+            val budget = Thread { ownership.lose() }
+            open.start()
+            budget.start()
+            open.join()
+            budget.join()
+            assertEquals(installed.get(), ownership.hasWon())
+            if (ownership.hasWon()) assertFalse(ownership.lose())
+        }
     }
 
     @Test
@@ -186,7 +192,147 @@ class HubCallDialerTest {
         }
     }
 
-    private fun dialer(): HubCallDialer = HubCallDialer(
+    @Test
+    fun timeoutWinsTheGateBeforeOnOpenAndDoesNotCancelTheSibling() {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setBody("""{"value":"hub-token","model":"hub"}"""))
+            server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {}))
+            val siblingCancelled = AtomicBoolean(false)
+            val race = EndpointRace()
+            race.track("ws://100.113.222.47:8787") { siblingCancelled.set(true) }
+            val installed = AtomicBoolean(false)
+            val dialer = HubCallDialer(
+                http = OkHttpClient.Builder()
+                    .connectTimeout(2, TimeUnit.SECONDS)
+                    .readTimeout(2, TimeUnit.SECONDS)
+                    .build(),
+                hubOwned = true,
+                openAiTokenUrl = "",
+                model = "hub",
+                handshakeTimeoutMs = 3_000,
+            )
+            dialer.beforeOwnSocket = { ownership ->
+                val lost = AtomicBoolean(false)
+                val abandoned = CountDownLatch(1)
+                Thread {
+                    lost.set(ownership.lose())
+                    abandoned.countDown()
+                }.apply { isDaemon = true }.start()
+                assertTrue(abandoned.await(2, TimeUnit.SECONDS))
+                assertTrue(lost.get())
+            }
+            val response = dialer.dial(
+                DialRequest(HubEndpoint(server.url("/").toString(), secret), "hub-session", race),
+                object : HubCallDialer.Live {
+                    override fun onOpen(webSocket: WebSocket, request: DialRequest) {
+                        installed.set(true)
+                    }
+                    override fun onMessage(webSocket: WebSocket, text: String) = Unit
+                    override fun onDead(webSocket: WebSocket, code: Int, detail: String) = Unit
+                },
+            )
+            assertEquals(DialStatus.RETRYABLE, response.status)
+            assertEquals("handshake timeout", response.detail)
+            assertFalse(installed.get())
+            assertFalse(siblingCancelled.get())
+            assertNull(race.winner())
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun parallelEntrancesTakeTheFirstOpenInsideOneAttemptBudget() {
+        val slow = MockWebServer()
+        val fast = MockWebServer()
+        slow.start()
+        fast.start()
+        try {
+            val token = MockResponse().setBody("""{"value":"hub-token","model":"hub"}""")
+            slow.enqueue(token)
+            slow.enqueue(
+                MockResponse()
+                    .setHeadersDelay(2, TimeUnit.SECONDS)
+                    .withWebSocketUpgrade(object : WebSocketListener() {}),
+            )
+            fast.enqueue(MockResponse().setBody("""{"value":"hub-token","model":"hub"}"""))
+            fast.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {}))
+            val installed = AtomicInteger(0)
+            val dialer = dialer(handshakeTimeoutMs = 1_500)
+            val routine = HubConnectionRoutine(
+                listOf(
+                    HubEndpoint(slow.url("/").toString(), secret),
+                    HubEndpoint(fast.url("/").toString(), secret),
+                ),
+            ) { request ->
+                dialer.dial(request, object : HubCallDialer.Live {
+                    override fun onOpen(webSocket: WebSocket, request: DialRequest) {
+                        installed.incrementAndGet()
+                    }
+                    override fun onMessage(webSocket: WebSocket, text: String) = Unit
+                    override fun onDead(webSocket: WebSocket, code: Int, detail: String) = Unit
+                })
+            }
+            val started = System.currentTimeMillis()
+            val result = routine.connectRacing()
+            val elapsed = System.currentTimeMillis() - started
+            assertTrue(result.opened)
+            assertTrue(result.url.startsWith(fast.url("/").toString().substringBefore("/")))
+            assertEquals(fast.url("/").toString(), result.url)
+            assertEquals(1, installed.get())
+            assertTrue("elapsed=$elapsed", elapsed < 1_200)
+            Thread.sleep(500)
+            assertEquals(1, installed.get())
+        } finally {
+            slow.shutdown()
+            fast.shutdown()
+        }
+    }
+
+    @Test
+    fun aFailedUpgradeWithHttp200IsNotOpened() {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setBody("""{"value":"hub-token","model":"hub"}"""))
+            server.enqueue(MockResponse().setResponseCode(200).setBody("not a socket"))
+            val response = dialer().dial(
+                DialRequest(HubEndpoint(server.url("/").toString(), secret), "hub-session"),
+                quietLive(),
+            )
+            assertEquals(DialStatus.RETRYABLE, response.status)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun cancelCallbacksAreKeyedByLeg() {
+        val race = EndpointRace()
+        val first = race.begin("ws://same")
+        val firstToken = AtomicBoolean(false)
+        val firstSocket = AtomicBoolean(false)
+        race.track(first) { firstToken.set(true) }
+        race.track(first) { firstSocket.set(true) }
+        val second = race.begin("ws://same")
+        val secondToken = AtomicBoolean(false)
+        val secondSocket = AtomicBoolean(false)
+        race.track(second) { secondToken.set(true) }
+        race.track(second) { secondSocket.set(true) }
+        assertTrue(race.claim(second))
+        race.cancelLosers()
+        assertTrue(firstToken.get())
+        assertTrue(firstSocket.get())
+        assertFalse(secondToken.get())
+        assertFalse(secondSocket.get())
+        race.cancelAll()
+        assertTrue(secondToken.get())
+        assertTrue(secondSocket.get())
+    }
+
+    private fun dialer(handshakeTimeoutMs: Long = 3_000): HubCallDialer = HubCallDialer(
         http = OkHttpClient.Builder()
             .connectTimeout(2, TimeUnit.SECONDS)
             .readTimeout(2, TimeUnit.SECONDS)
@@ -194,7 +340,7 @@ class HubCallDialerTest {
         hubOwned = true,
         openAiTokenUrl = "",
         model = "hub",
-        handshakeTimeoutMs = 3_000,
+        handshakeTimeoutMs = handshakeTimeoutMs,
     )
 
     private fun quietLive(): HubCallDialer.Live = object : HubCallDialer.Live {

@@ -1,20 +1,33 @@
 package com.gsm2computer.bridge
 
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+
 /**
  * One walk over an ordered list of hub endpoints.
  *
- * The first connect and a mid-call reconnect both call [connect]. A retryable
- * failure tries the next endpoint in the same pass. [DialStatus.LATER] ends
- * the pass and the next pass starts after [Backoff] — that is how a 409 is
- * retried while the hub may be opening the relink grace window, without
- * opening a second socket in the same pass. [DialStatus.STOP] ends the walk
- * so a busy hub is not dialed again. Nothing in this class treats one
- * entrance differently from another: the dial closure sees [DialRequest] only.
+ * The first connect and a mid-call reconnect both call [connect] or
+ * [connectRacing]. A retryable failure tries the next endpoint in the same
+ * pass. [DialStatus.LATER] ends the pass and the next pass starts after
+ * [Backoff] — that is how a 409 is retried while the hub may be opening the
+ * relink grace window, without opening a second socket in the same pass.
+ * [DialStatus.STOP] ends the walk so a busy hub is not dialed again. Nothing
+ * in this class treats one entrance differently from another: the dial
+ * closure sees [DialRequest] only.
+ *
+ * [connectRacing] starts every endpoint in the pass at once and keeps the
+ * first [DialStatus.OPENED]. A hung public socket cannot spend the whole
+ * attempt budget before the Tailscale socket is tried.
  */
 class HubConnectionRoutine(
     private val endpoints: List<HubEndpoint>,
     private val backoff: Backoff = Backoff(),
     private val sleep: (Long) -> Unit = { delay -> Thread.sleep(delay) },
+    private val onAttempt: (AttemptRecord) -> Unit = { _ -> },
+    private val onRace: (EndpointRace) -> Unit = { _ -> },
     private val dial: (DialRequest) -> DialResponse,
 ) {
     fun connect(
@@ -53,7 +66,7 @@ class HubConnectionRoutine(
                 }
                 val detail = scrubSecrets(response.detail, secrets)
                 lastDetail = detail
-                attempts += AttemptRecord(
+                val record = AttemptRecord(
                     pass = pass,
                     index = index,
                     url = endpoint.url,
@@ -62,6 +75,8 @@ class HubConnectionRoutine(
                     httpStatus = response.httpStatus,
                     detail = detail,
                 )
+                attempts += record
+                notifyAttempt(record)
                 when (response.status) {
                     DialStatus.OPENED -> return ConnectResult(
                         opened = true,
@@ -108,6 +123,174 @@ class HubConnectionRoutine(
         )
     }
 
+    /**
+     * Dial every endpoint in a pass concurrently. The first [DialStatus.OPENED]
+     * wins. A [DialStatus.STOP] or [DialStatus.LATER] from one leg does not
+     * seal or cancel the others while any leg is still inside [dial]: the
+     * hub may already have admitted that leg and its 101 is only slow.
+     * The pass seals when every leg has finished without a 101. [DialStatus.STOP]
+     * then ends the walk, so a busy hub is not given another pass.
+     */
+    fun connectRacing(
+        sessionId: String = "",
+        maxPasses: Int = 1,
+        proceed: () -> Boolean = { true },
+    ): ConnectResult {
+        val secrets = endpoints.map { it.deviceToken }
+        if (endpoints.isEmpty() || maxPasses < 1) {
+            return ConnectResult(
+                opened = false,
+                cancelled = false,
+                stopped = true,
+                pass = 0,
+                index = -1,
+                url = "",
+                sessionId = sessionId,
+                attempts = emptyList(),
+                detail = scrubSecrets("no endpoints", secrets),
+            )
+        }
+        val attempts = Collections.synchronizedList(mutableListOf<AttemptRecord>())
+        var lastDetail = ""
+        for (pass in 0 until maxPasses) {
+            if (!proceed()) return cancelled(sessionId, copyAttempts(attempts), secrets)
+            val race = EndpointRace()
+            notifyRace(race)
+            val opened = AtomicReference<ConnectResult?>(null)
+            val terminal = AtomicReference<DialStatus?>(null)
+            val signal = CountDownLatch(1)
+            val finished = AtomicInteger(0)
+            val threads = endpoints.mapIndexed { index, endpoint ->
+                Thread({
+                    try {
+                        if (!proceed() || race.abandoned(endpoint.url)) {
+                            race.seal()
+                            return@Thread
+                        }
+                        val response = try {
+                            dial(DialRequest(endpoint, sessionId, race))
+                        } catch (e: Exception) {
+                            DialResponse(
+                                DialStatus.RETRYABLE,
+                                0,
+                                e.message ?: e.javaClass.simpleName,
+                            )
+                        }
+                        val detail = scrubSecrets(response.detail, secrets)
+                        val record = AttemptRecord(
+                            pass = pass,
+                            index = index,
+                            url = endpoint.url,
+                            sessionId = sessionId,
+                            outcome = response.status.name.lowercase(),
+                            httpStatus = response.httpStatus,
+                            detail = detail,
+                        )
+                        attempts.add(record)
+                        notifyAttempt(record)
+                        when (response.status) {
+                            DialStatus.OPENED -> {
+                                val win = ConnectResult(
+                                    opened = true,
+                                    cancelled = false,
+                                    stopped = false,
+                                    pass = pass,
+                                    index = index,
+                                    url = endpoint.url,
+                                    sessionId = sessionId,
+                                    attempts = copyAttempts(attempts),
+                                    detail = detail,
+                                )
+                                if (opened.compareAndSet(null, win)) signal.countDown()
+                            }
+                            DialStatus.STOP, DialStatus.LATER -> preferTerminal(terminal, response.status)
+                            DialStatus.RETRYABLE -> Unit
+                        }
+                    } finally {
+                        if (finished.incrementAndGet() == endpoints.size) signal.countDown()
+                    }
+                }, "hub-dial-$index").also { it.isDaemon = true }
+            }
+            threads.forEach { it.start() }
+            while (opened.get() == null && finished.get() < endpoints.size) {
+                if (!proceed()) {
+                    race.seal()
+                    break
+                }
+                signal.await(50, TimeUnit.MILLISECONDS)
+            }
+            while (opened.get() == null && race.winner() != null && finished.get() < endpoints.size) {
+                if (!proceed()) {
+                    race.seal()
+                    break
+                }
+                signal.await(20, TimeUnit.MILLISECONDS)
+            }
+            opened.get()?.let { return it.copy(attempts = copyAttempts(attempts)) }
+            if (!proceed()) {
+                race.seal()
+                return cancelled(sessionId, copyAttempts(attempts), secrets)
+            }
+            // Seal only after every leg has left dial(). A leg still pending
+            // may be the 101 the hub already admitted.
+            if (finished.get() == endpoints.size) {
+                race.seal()
+            }
+            if (terminal.get() == DialStatus.STOP && finished.get() == endpoints.size) {
+                val last = lastAttempt(attempts)
+                return ConnectResult(
+                    opened = false,
+                    cancelled = false,
+                    stopped = true,
+                    pass = pass,
+                    index = last?.index ?: -1,
+                    url = last?.url.orEmpty(),
+                    sessionId = sessionId,
+                    attempts = copyAttempts(attempts),
+                    detail = last?.detail ?: lastDetail,
+                )
+            }
+            lastDetail = lastAttempt(attempts)?.detail ?: lastDetail
+            if (pass < maxPasses - 1) {
+                if (!proceed()) return cancelled(sessionId, copyAttempts(attempts), secrets)
+                val delay = backoff.delayAfterPass(pass)
+                if (delay > 0) sleep(delay)
+            }
+        }
+        return ConnectResult(
+            opened = false,
+            cancelled = false,
+            stopped = false,
+            pass = (maxPasses - 1).coerceAtLeast(0),
+            index = endpoints.lastIndex,
+            url = "",
+            sessionId = sessionId,
+            attempts = copyAttempts(attempts),
+            detail = lastDetail,
+        )
+    }
+
+    /** [Collections.synchronizedList] does not lock its iterator. Copy under the list lock. */
+    private fun copyAttempts(attempts: MutableList<AttemptRecord>): List<AttemptRecord> =
+        synchronized(attempts) { ArrayList(attempts) }
+
+    private fun lastAttempt(attempts: MutableList<AttemptRecord>): AttemptRecord? =
+        synchronized(attempts) { attempts.lastOrNull() }
+
+    private fun notifyAttempt(record: AttemptRecord) {
+        try {
+            onAttempt(record)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun notifyRace(race: EndpointRace) {
+        try {
+            onRace(race)
+        } catch (_: Exception) {
+        }
+    }
+
     private fun cancelled(
         sessionId: String,
         attempts: List<AttemptRecord>,
@@ -139,7 +322,118 @@ data class HubEndpoint(
 data class DialRequest(
     val endpoint: HubEndpoint,
     val sessionId: String,
+    val race: EndpointRace? = null,
 )
+
+/** [DialStatus.STOP] outranks [DialStatus.LATER]. A later 409 must not reopen the walk. */
+internal fun preferTerminal(terminal: AtomicReference<DialStatus?>, next: DialStatus) {
+    while (true) {
+        val current = terminal.get()
+        if (current == DialStatus.STOP || current == next) return
+        if (terminal.compareAndSet(current, next)) return
+    }
+}
+
+/**
+ * One pass racing every entrance. [claim] is the only way an [onOpen] may
+ * install the socket. [seal] abandons every leg that has not won. [cancelAll]
+ * also abandons the winner, which is what hangup needs while that socket is
+ * not yet installed. One leg's 409 does not seal, and neither does the clock
+ * while a sibling is still inside dial().
+ *
+ * Cancel callbacks are keyed by the leg from [begin], not by URL. A token
+ * mint and its websocket are two callbacks on one leg, and a second attempt
+ * at the same URL is a different leg.
+ */
+class EndpointRace {
+    private val lock = Any()
+    private var nextLeg = 1L
+    private var winnerLeg: Long? = null
+    private var winnerUrl: String? = null
+    private var sealed = false
+    private val urls = HashMap<Long, String>()
+    private val cancels = ArrayList<Reg>()
+
+    private class Reg(val leg: Long, val cancel: () -> Unit)
+
+    fun winner(): String? = synchronized(lock) { winnerUrl }
+
+    /** One dial attempt. The token POST and the websocket share this id. */
+    fun begin(url: String): Long = synchronized(lock) {
+        val id = nextLeg++
+        urls[id] = url
+        id
+    }
+
+    fun claim(leg: Long): Boolean = synchronized(lock) {
+        if (sealed || winnerLeg != null) return false
+        val url = urls[leg] ?: return false
+        winnerLeg = leg
+        winnerUrl = url
+        true
+    }
+
+    /** Cancel every leg except the one [claim] recorded. */
+    fun cancelLosers() {
+        val drop = synchronized(lock) { pending(winnerLeg) }
+        drop.forEach { invoke(it) }
+    }
+
+    fun seal() {
+        val drop = synchronized(lock) {
+            sealed = true
+            pending(winnerLeg)
+        }
+        drop.forEach { invoke(it) }
+    }
+
+    /** Hangup. Includes the winner, which [seal] leaves alone. */
+    fun cancelAll() {
+        val drop = synchronized(lock) {
+            sealed = true
+            cancels.map { it.cancel }
+        }
+        drop.forEach { invoke(it) }
+    }
+
+    fun abandoned(url: String): Boolean = synchronized(lock) { abandonedLocked(url) }
+
+    fun track(leg: Long, cancel: () -> Unit) {
+        val runNow = synchronized(lock) {
+            if (urls[leg] == null) return
+            cancels.add(Reg(leg, cancel))
+            val winner = winnerLeg
+            when {
+                winner == null -> sealed
+                winner == leg -> false
+                else -> true
+            }
+        }
+        if (runNow) invoke(cancel)
+    }
+
+    /** A registration that is its own leg. Tests use this for a sibling URL. */
+    fun track(url: String, cancel: () -> Unit) {
+        track(begin(url), cancel)
+    }
+
+    private fun abandonedLocked(url: String): Boolean {
+        if (winnerUrl == url) return false
+        if (sealed) return true
+        val winner = winnerUrl ?: return false
+        return winner != url
+    }
+
+    private fun pending(keep: Long?): List<() -> Unit> =
+        cancels.filter { it.leg != keep }.map { it.cancel }
+
+    private fun invoke(cancel: () -> Unit) {
+        try {
+            cancel()
+        } catch (_: Exception) {
+        }
+    }
+}
 
 enum class DialStatus {
     OPENED,

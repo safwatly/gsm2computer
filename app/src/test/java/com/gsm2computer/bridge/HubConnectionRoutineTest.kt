@@ -4,6 +4,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class HubConnectionRoutineTest {
 
@@ -175,6 +178,115 @@ class HubConnectionRoutineTest {
         assertEquals(listOf(public.url), seen)
         assertTrue(result.cancelled)
         assertFalse(result.opened)
+    }
+
+    @Test
+    fun racingTakesTheFirstOpenWithoutWaitingForTheSlowEndpoint() {
+        val entered = CountDownLatch(2)
+        val fastGo = CountDownLatch(1)
+        val slowRelease = CountDownLatch(1)
+        val routine = routine(listOf(public, tailscale)) { request ->
+            entered.countDown()
+            if (request.endpoint.url == tailscale.url) {
+                fastGo.await(2, TimeUnit.SECONDS)
+                DialResponse(DialStatus.OPENED, 101, "")
+            } else {
+                slowRelease.await(2, TimeUnit.SECONDS)
+                DialResponse(DialStatus.RETRYABLE, 0, "slow")
+            }
+        }
+        val resultRef = AtomicReference<ConnectResult>()
+        val done = CountDownLatch(1)
+        Thread {
+            resultRef.set(routine.connectRacing())
+            done.countDown()
+        }.start()
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        fastGo.countDown()
+        assertTrue(done.await(2, TimeUnit.SECONDS))
+        val result = resultRef.get()
+        assertTrue(result.opened)
+        assertEquals(tailscale.url, result.url)
+        assertEquals(1L, slowRelease.count)
+        slowRelease.countDown()
+    }
+
+    @Test
+    fun racing409ArrivesBefore101AndTheCallProceedsOnTheWinner() {
+        val loserDone = CountDownLatch(1)
+        val routine = routine(listOf(public, tailscale)) { request ->
+            if (request.endpoint.url == tailscale.url) {
+                loserDone.countDown()
+                DialResponse(DialStatus.STOP, 409, "call in progress")
+            } else {
+                assertTrue(loserDone.await(2, TimeUnit.SECONDS))
+                val race = checkNotNull(request.race)
+                assertFalse(race.abandoned(request.endpoint.url))
+                DialResponse(DialStatus.OPENED, 101, "")
+            }
+        }
+        val result = routine.connectRacing(maxPasses = 3)
+        assertTrue(result.opened)
+        assertFalse(result.stopped)
+        assertFalse(result.cancelled)
+        assertEquals(public.url, result.url)
+        assertEquals(0, result.pass)
+        assertEquals(
+            "opened",
+            result.attempts.first { it.url == public.url }.outcome,
+        )
+        assertEquals(101, result.attempts.first { it.url == public.url }.httpStatus)
+    }
+
+    @Test
+    fun racingLaterDoesNotCancelTheLegStillWaitingFor101() {
+        val loserDone = CountDownLatch(1)
+        val routine = routine(listOf(public, tailscale)) { request ->
+            if (request.endpoint.url == tailscale.url) {
+                loserDone.countDown()
+                DialResponse(DialStatus.LATER, 409, "relink grace")
+            } else {
+                assertTrue(loserDone.await(2, TimeUnit.SECONDS))
+                assertFalse(checkNotNull(request.race).abandoned(request.endpoint.url))
+                DialResponse(DialStatus.OPENED, 101, "")
+            }
+        }
+        val result = routine.connectRacing(maxPasses = 3)
+        assertTrue(result.opened)
+        assertEquals(public.url, result.url)
+        assertEquals(0, result.pass)
+    }
+
+    @Test
+    fun racingStopWhenEveryLegFinishedEndsTheWalk() {
+        var dials = 0
+        val routine = routine(listOf(public, tailscale)) {
+            dials += 1
+            DialResponse(DialStatus.STOP, 409, "call in progress")
+        }
+        val result = routine.connectRacing(maxPasses = 3)
+        assertTrue(result.stopped)
+        assertFalse(result.opened)
+        assertEquals(2, dials)
+    }
+
+    @Test
+    fun racingProceedFalseCancelsBeforeAnOpen() {
+        val release = CountDownLatch(1)
+        val routine = routine(listOf(public, tailscale)) {
+            release.await(2, TimeUnit.SECONDS)
+            DialResponse(DialStatus.OPENED, 101, "")
+        }
+        val resultRef = AtomicReference<ConnectResult>()
+        val done = CountDownLatch(1)
+        Thread {
+            resultRef.set(routine.connectRacing { false })
+            done.countDown()
+        }.start()
+        assertTrue(done.await(2, TimeUnit.SECONDS))
+        assertTrue(resultRef.get().cancelled)
+        assertFalse(resultRef.get().opened)
+        release.countDown()
     }
 
     @Test

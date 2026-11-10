@@ -56,7 +56,39 @@ object HubEndpoints {
     /** Detail for a 401 when this entrance was dialed with no device token. */
     fun missingTokenRejection(url: String, httpStatus: Int, tokenBlank: Boolean): String? {
         if (httpStatus != 401 || !tokenBlank) return null
-        return "device token unset; $url rejected the call, trying the next endpoint"
+        return "device token unset; ${entranceKind(url)} rejected the call, trying the next endpoint"
+    }
+
+    /**
+     * `public` or `tailscale`. Logs use this instead of the entrance host.
+     * Cleartext `ws`/`http` and Tailscale's 100.64/10 range are tailscale.
+     */
+    fun entranceKind(value: String): String {
+        val trimmed = value.trim()
+        val host = trimmed
+            .substringAfter("://")
+            .substringBefore("/")
+            .substringBefore("?")
+            .substringBefore(":")
+            .lowercase()
+        if (host.endsWith(".ts.net") || tailscaleIp(host)) return "tailscale"
+        if (trimmed.startsWith("ws://") || trimmed.startsWith("http://")) return "tailscale"
+        return "public"
+    }
+
+    /** Drop hub URLs, hostnames, and IPs from a dial or reconnect detail. */
+    fun redactHubHosts(text: String): String {
+        val urls = URL_IN_TEXT.replace(text) { entranceKind(it.value) }
+        val ips = IPV4_IN_TEXT.replace(urls) { entranceKind(it.value) }
+        return DNS_IN_TEXT.replace(ips) { entranceKind(it.value) }
+    }
+
+    private fun tailscaleIp(host: String): Boolean {
+        val parts = host.split('.')
+        if (parts.size != 4) return false
+        val first = parts[0].toIntOrNull() ?: return false
+        val second = parts[1].toIntOrNull() ?: return false
+        return first == 100 && second in 64..127
     }
 
     /** `ws`/`wss` back to the HTTP origin used for `/token`, `/sms`, and `/calls`. */
@@ -206,4 +238,11 @@ object HubEndpoints {
         httpUrl.startsWith("ws://") || httpUrl.startsWith("wss://") -> httpUrl
         else -> httpUrl
     }
+
+    private val URL_IN_TEXT = Regex("""[a-z][a-z0-9+.-]*://[^\s'"<>]+""", RegexOption.IGNORE_CASE)
+    private val IPV4_IN_TEXT = Regex("""(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?""")
+    private val DNS_IN_TEXT = Regex(
+        """(?<![/@\w-])(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?""",
+        RegexOption.IGNORE_CASE,
+    )
 }
