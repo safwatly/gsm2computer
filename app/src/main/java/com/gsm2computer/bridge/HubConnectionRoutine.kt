@@ -154,7 +154,7 @@ class HubConnectionRoutine(
         val attempts = Collections.synchronizedList(mutableListOf<AttemptRecord>())
         var lastDetail = ""
         for (pass in 0 until maxPasses) {
-            if (!proceed()) return cancelled(sessionId, attempts.toList(), secrets)
+            if (!proceed()) return cancelled(sessionId, copyAttempts(attempts), secrets)
             val race = EndpointRace()
             notifyRace(race)
             val opened = AtomicReference<ConnectResult?>(null)
@@ -199,7 +199,7 @@ class HubConnectionRoutine(
                                     index = index,
                                     url = endpoint.url,
                                     sessionId = sessionId,
-                                    attempts = attempts.toList(),
+                                    attempts = copyAttempts(attempts),
                                     detail = detail,
                                 )
                                 if (opened.compareAndSet(null, win)) signal.countDown()
@@ -227,10 +227,10 @@ class HubConnectionRoutine(
                 }
                 signal.await(20, TimeUnit.MILLISECONDS)
             }
-            opened.get()?.let { return it.copy(attempts = attempts.toList()) }
+            opened.get()?.let { return it.copy(attempts = copyAttempts(attempts)) }
             if (!proceed()) {
                 race.seal()
-                return cancelled(sessionId, attempts.toList(), secrets)
+                return cancelled(sessionId, copyAttempts(attempts), secrets)
             }
             // Seal only after every leg has left dial(). A leg still pending
             // may be the 101 the hub already admitted.
@@ -238,7 +238,7 @@ class HubConnectionRoutine(
                 race.seal()
             }
             if (terminal.get() == DialStatus.STOP && finished.get() == endpoints.size) {
-                val last = attempts.lastOrNull()
+                val last = lastAttempt(attempts)
                 return ConnectResult(
                     opened = false,
                     cancelled = false,
@@ -247,13 +247,13 @@ class HubConnectionRoutine(
                     index = last?.index ?: -1,
                     url = last?.url.orEmpty(),
                     sessionId = sessionId,
-                    attempts = attempts.toList(),
+                    attempts = copyAttempts(attempts),
                     detail = last?.detail ?: lastDetail,
                 )
             }
-            lastDetail = attempts.lastOrNull()?.detail ?: lastDetail
+            lastDetail = lastAttempt(attempts)?.detail ?: lastDetail
             if (pass < maxPasses - 1) {
-                if (!proceed()) return cancelled(sessionId, attempts.toList(), secrets)
+                if (!proceed()) return cancelled(sessionId, copyAttempts(attempts), secrets)
                 val delay = backoff.delayAfterPass(pass)
                 if (delay > 0) sleep(delay)
             }
@@ -266,10 +266,17 @@ class HubConnectionRoutine(
             index = endpoints.lastIndex,
             url = "",
             sessionId = sessionId,
-            attempts = attempts.toList(),
+            attempts = copyAttempts(attempts),
             detail = lastDetail,
         )
     }
+
+    /** [Collections.synchronizedList] does not lock its iterator. Copy under the list lock. */
+    private fun copyAttempts(attempts: MutableList<AttemptRecord>): List<AttemptRecord> =
+        synchronized(attempts) { ArrayList(attempts) }
+
+    private fun lastAttempt(attempts: MutableList<AttemptRecord>): AttemptRecord? =
+        synchronized(attempts) { attempts.lastOrNull() }
 
     private fun notifyAttempt(record: AttemptRecord) {
         try {
@@ -350,12 +357,6 @@ class EndpointRace {
         }
         drop.forEach { invoke(it) }
         return true
-    }
-
-    fun release(url: String) {
-        synchronized(lock) {
-            if (winnerUrl == url && !sealed) winnerUrl = null
-        }
     }
 
     fun seal() {

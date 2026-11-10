@@ -103,6 +103,15 @@ class HubStreamClient(
     private var summaryDropped = 0L
     @Volatile private var openedAtMs = 0L
 
+    /** Test seam. Production stays on [ATTEMPT_TIMEOUT_MS]. */
+    @Volatile internal var attemptTimeoutMs: Long = ATTEMPT_TIMEOUT_MS
+
+    /** Test seam. OkHttp thread, before this leg decides. Shared by every leg of one connect. */
+    @Volatile internal var beforeLegDecision: ((LegOwnership) -> Unit)? = null
+
+    /** Test seam. Dial thread, when this leg's budget expires, before the decision. */
+    @Volatile internal var onAttemptTimeout: (() -> Unit)? = null
+
     override fun start(sink: MediaTransport.Sink) {
         this.sink = sink
         linkState = "connecting"
@@ -188,7 +197,6 @@ class HubStreamClient(
             listOf(HubEndpoint(webSocketUrl))
         }.filter { it.url.isNotBlank() }
 
-        val opened = AtomicBoolean(false)
         val cleanClose = AtomicBoolean(false)
         val finished = AtomicBoolean(false)
         val failure = AtomicReference<String?>(null)
@@ -204,7 +212,6 @@ class HubStreamClient(
 
         val live = object : HubCallDialer.Live {
             override fun onOpen(webSocket: WebSocket, request: DialRequest) {
-                opened.set(true)
                 reconnectArmed.set(false)
                 ws = webSocket
                 socketRef.set(webSocket)
@@ -240,7 +247,10 @@ class HubStreamClient(
             }
 
             override fun onDead(webSocket: WebSocket, code: Int, detail: String) {
-                if (webSocket !== ws && opened.get()) return
+                // A sibling leg has its own listener. Only the socket onOpen installed
+                // can end the session. A loser that arrives before ws is set must not
+                // count the latch down or hang up the call.
+                if (webSocket !== ws) return
                 if (closed) {
                     finish(null, false)
                     return
@@ -268,8 +278,10 @@ class HubStreamClient(
             hubOwned = hubOwnedSession,
             openAiTokenUrl = tokenUrl,
             model = connectModel,
-            handshakeTimeoutMs = ATTEMPT_TIMEOUT_MS,
+            handshakeTimeoutMs = attemptTimeoutMs,
         )
+        dialer.beforeOwnSocket = beforeLegDecision
+        dialer.onAttemptTimeout = onAttemptTimeout
         val routine = HubConnectionRoutine(
             targets,
             onAttempt = { attempt ->
@@ -292,6 +304,11 @@ class HubStreamClient(
         BridgeLog.i("connect ${result.summary()}")
         if (!result.opened) {
             if (closed || result.cancelled) return null
+            if (result.stopped) {
+                val detail = result.detail.ifBlank { "hub stopped the dial" }
+                trace("ws_failure", mapOf("code" to 409, "message" to detail))
+                return "$FATAL_PREFIX$detail"
+            }
             trace("ws_failure", mapOf("code" to -1, "message" to result.detail))
             return result.detail.ifBlank { "hub connect failed" }
         }
@@ -545,15 +562,32 @@ class HubStreamClient(
 
     private fun sendClientAudio(socket: WebSocket?) {
         if (socket == null) return
-        val input = JSONObject().put("format", inputFormat).put("rate", inputRate)
-        val output = JSONObject().put("format", outputFormat).put("rate", outputRate)
-        val msg = JSONObject()
-            .put("type", "client.audio")
-            .put("input", input)
-            .put("output", output)
-            .toString()
+        // Plain text so a throw from the SDK's org.json stub cannot drop the socket.
+        val msg = buildString {
+            append("""{"type":"client.audio","input":{"format":""")
+            append(jsonString(inputFormat))
+            append(""","rate":""")
+            append(inputRate)
+            append("""},"output":{"format":""")
+            append(jsonString(outputFormat))
+            append(""","rate":""")
+            append(outputRate)
+            append("}}")
+        }
         socket.send(msg)
         Log.i(TAG, "client.audio in=$inputFormat/$inputRate out=$outputFormat/$outputRate")
+    }
+
+    private fun jsonString(value: String): String = buildString {
+        append('"')
+        for (ch in value) {
+            when (ch) {
+                '\\' -> append("\\\\")
+                '"' -> append("\\\"")
+                else -> append(ch)
+            }
+        }
+        append('"')
     }
 
     override fun stop() {

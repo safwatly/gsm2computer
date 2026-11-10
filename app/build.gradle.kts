@@ -111,6 +111,10 @@ android {
     lint {
         baseline = file("lint-baseline.xml")
     }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {

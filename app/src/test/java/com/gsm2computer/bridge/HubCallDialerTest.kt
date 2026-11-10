@@ -1,8 +1,7 @@
 package com.gsm2computer.bridge
 
-import com.gsm2computer.bridge.realtime.HandshakeGate
 import com.gsm2computer.bridge.realtime.HubCallDialer
-import com.gsm2computer.bridge.realtime.timeoutDecision
+import com.gsm2computer.bridge.realtime.LegOwnership
 import okhttp3.OkHttpClient
 import okhttp3.Response
 import okhttp3.WebSocket
@@ -19,7 +18,6 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicReference
 
 class HubCallDialerTest {
 
@@ -112,30 +110,34 @@ class HubCallDialerTest {
     }
 
     @Test
-    fun timeoutCancelsOnlyWhenAbandonWins() {
-        val won = HandshakeGate()
-        assertTrue(won.onOpen())
-        var cancelled = false
-        assertEquals(DialStatus.OPENED, timeoutDecision(won) { cancelled = true })
-        assertFalse(cancelled)
+    fun timeoutAndOpenAreOneDecision() {
+        val won = LegOwnership(null, "ws://winner")
+        assertTrue(won.win {})
+        assertFalse(won.lose())
+        assertTrue(won.hasWon())
 
-        val lost = HandshakeGate()
-        var cancels = 0
-        assertEquals(DialStatus.RETRYABLE, timeoutDecision(lost) { cancels += 1 })
-        assertEquals(1, cancels)
+        val lost = LegOwnership(null, "ws://loser")
+        assertTrue(lost.lose())
+        var installed = false
+        assertFalse(lost.win { installed = true })
+        assertFalse(installed)
+        assertFalse(lost.hasWon())
     }
 
     @Test
-    fun abandonAfterOpenKeepsTheSocketAndALateOpenIsIgnored() {
-        val gate = HandshakeGate()
-        assertTrue(gate.onOpen())
-        assertFalse(gate.abandon())
-        assertTrue(gate.opened())
-
-        val failed = HandshakeGate()
-        assertTrue(failed.abandon())
-        assertFalse(failed.onOpen())
-        assertFalse(failed.opened())
+    fun winAndLoseCannotDisagree() {
+        repeat(200) {
+            val ownership = LegOwnership(EndpointRace(), "ws://leg")
+            val installed = AtomicBoolean(false)
+            val open = Thread { ownership.win { installed.set(true) } }
+            val budget = Thread { ownership.lose() }
+            open.start()
+            budget.start()
+            open.join()
+            budget.join()
+            assertEquals(installed.get(), ownership.hasWon())
+            if (ownership.hasWon()) assertFalse(ownership.lose())
+        }
     }
 
     @Test
@@ -210,15 +212,15 @@ class HubCallDialerTest {
                 model = "hub",
                 handshakeTimeoutMs = 3_000,
             )
-            dialer.beforeOwnSocket = { gate ->
-                val status = AtomicReference<DialStatus?>(null)
+            dialer.beforeOwnSocket = { ownership ->
+                val lost = AtomicBoolean(false)
                 val abandoned = CountDownLatch(1)
                 Thread {
-                    status.set(timeoutDecision(gate) { })
+                    lost.set(ownership.lose())
                     abandoned.countDown()
                 }.apply { isDaemon = true }.start()
                 assertTrue(abandoned.await(2, TimeUnit.SECONDS))
-                assertEquals(DialStatus.RETRYABLE, status.get())
+                assertTrue(lost.get())
             }
             val response = dialer.dial(
                 DialRequest(HubEndpoint(server.url("/").toString(), secret), "hub-session", race),
