@@ -14,24 +14,37 @@ import org.junit.Test
 class MotoInjectGuardTest {
 
     @Test
-    fun `disconnected restores the prior mic and later hangup edges do not write again`() {
+    fun `mic restore keeps the prior until the write returns`() {
         val gate = MicRestoreGate()
         gate.open(true)
+        assertEquals(true, gate.pending())
+        assertFalse(gate.write(canWrite = false) { error("no audio manager") })
+        assertEquals(true, gate.pending())
+        try {
+            gate.write(canWrite = true) { throw IllegalStateException("setter failed") }
+            error("setter throw should escape")
+        } catch (_: IllegalStateException) {
+        }
+        assertEquals(true, gate.pending())
+        val written = ArrayList<Boolean>()
+        assertTrue(gate.write(canWrite = true) { written.add(it) })
+        assertEquals(listOf(true), written)
+        assertNull(gate.pending())
+        assertTrue(gate.write(canWrite = false) { error("nothing pending") })
+    }
+
+    @Test
+    fun `moto hangup edges still run after the live pointer is cleared`() {
         val call = Any()
         var active: Any? = call
-        val writes = ArrayList<Boolean?>()
         val reasons = ArrayList<String>()
         fun restore(reason: String) {
             reasons.add(reason)
-            writes.add(gate.restore())
         }
         active = HangupRestore.disconnected(active, call, ::restore)
         assertNull(active)
         HangupRestore.removed(active, call, ::restore)
-        restore("teardown")
-        restore("destroy")
-        assertEquals(listOf("disconnected", "removed", "teardown", "destroy"), reasons)
-        assertEquals(listOf(true, null, null, null), writes)
+        assertEquals(listOf("disconnected", "removed"), reasons)
     }
 
     @Test
@@ -43,17 +56,39 @@ class MotoInjectGuardTest {
     }
 
     @Test
-    fun `hangup source calls restore on disconnect removal teardown and destroy`() {
+    fun `new hangup restores are gated to the moto profile`() {
         val gsm = File("src/main/java/com/gsm2computer/bridge/gsm/GsmCallManager.kt").readText()
         val orchestrator = File("src/main/java/com/gsm2computer/bridge/bridge/CallOrchestrator.kt").readText()
         val service = File("src/main/java/com/gsm2computer/bridge/service/GatewayService.kt").readText()
+        val session = File("src/main/java/com/gsm2computer/bridge/rtp/RtpSession.kt").readText()
         val disconnected = gsm.substringAfter("STATE_DISCONNECTED ->").substringBefore("if (!waiting)")
-        assertTrue(disconnected.contains("restoreBridgedAudio"))
+        val motoDisconnect = disconnected.substringAfter("if (isMotoProfile())").substringBefore("} else {")
+        val otherDisconnect = disconnected.substringAfter("} else {")
+        assertTrue(motoDisconnect.contains("restoreBridgedAudio"))
+        assertFalse(otherDisconnect.contains("restore"))
         val removed = gsm.substringAfter("fun onCallRemoved").substringBefore("fun onCallStateChanged")
-        assertTrue(removed.contains("restoreBridgedAudio"))
-        assertTrue(orchestrator.contains("restoreBridgedAudio(\"teardown\")"))
+        val otherRemoved = removed.substringAfter("if (!isMotoProfile())").substringBefore("val live")
+        assertTrue(otherRemoved.contains("isLiveGsmCall"))
+        assertTrue(otherRemoved.contains("restoreAudio()"))
+        assertFalse(otherRemoved.contains("restoreBridgedAudio"))
+        assertTrue(removed.contains("HangupRestore.removed"))
+        val bridged = gsm.substringAfter("fun restoreBridgedAudio").substringBefore("fun trackedCallStates")
+        assertTrue(bridged.contains("if (!isMotoProfile()) return"))
+        val mixerTry = bridged.substringAfter("try {").substringBefore("} catch")
+        assertTrue(mixerTry.contains("batchMixerRestore()"))
+        assertFalse(mixerTry.contains("restoreMotoMicrophone"))
+        val mixerCatch = bridged.indexOf("Failed to restore mixer")
+        val micCall = bridged.lastIndexOf("restoreMotoMicrophone(reason)")
+        assertTrue(mixerCatch in 0 until micCall)
+        val teardown = orchestrator.substringAfter("fun tearDown").substringBefore("val party")
+        assertTrue(teardown.contains("if (GsmCallManager.isMotoProfile())"))
+        assertTrue(teardown.contains("restoreBridgedAudio(\"teardown\")"))
         val destroy = service.substringAfter("fun onDestroy()").substringBefore("fun createNotificationChannel")
+        assertTrue(destroy.contains("if (GsmCallManager.isMotoProfile())"))
         assertTrue(destroy.contains("restoreBridgedAudio(\"destroy\")"))
+        assertFalse(session.contains("api_mute\", \"reverted\""))
+        assertFalse(session.contains("inject_policy_effective"))
+        assertFalse(gsm.contains("revertApiMute"))
     }
 
     @Test
@@ -92,67 +127,63 @@ class MotoInjectGuardTest {
     }
 
     @Test
-    fun `api mute waits for a playing telephony track and a capture window`() {
-        val active = "Output\nStandby: no\nINCALL_MUSIC\nTELEPHONY_TX\n"
-        val standby = "Output\nStandby: yes\nINCALL_MUSIC\nTELEPHONY_TX\n"
-        assertNull(
-            ApiMuteTiming.decide(false, true, active, 1_000L, 5_000L, observedForMs = 2_000L),
-        )
-        assertNull(
-            ApiMuteTiming.decide(true, false, active, 1_000L, 5_000L, observedForMs = 2_000L),
-        )
-        assertNull(
-            ApiMuteTiming.decide(true, true, active, 1_000L, 1_200L, observedForMs = 200L),
-        )
-        assertEquals(
-            ApiMuteTiming.AUDIOFLINGER,
-            ApiMuteTiming.decide(true, true, active, 0L, 3_000L, observedForMs = 2_000L),
-        )
-        assertEquals(
-            ApiMuteTiming.WRITE_DELAY,
-            ApiMuteTiming.decide(true, true, standby, 1_000L, 3_000L, observedForMs = 2_000L),
-        )
-        assertNull(
-            ApiMuteTiming.decide(true, true, standby, 1_000L, 1_200L, observedForMs = 2_000L),
-        )
-        assertFalse(ApiMuteTiming.audioFlingerIncallMusicActive("INCALL_MUSIC only"))
+    fun `api mute reads only the incall-music output thread`() {
+        val active = """
+            Output thread 0x1, name AudioOut_15:
+              Standby: no
+              Output devices: TELEPHONY_TX
+              flags (INCALL_MUSIC)
+        """.trimIndent()
+        val split = """
+            Output thread 0x1, name AudioOut_15:
+              Standby: no
+              Output devices: speaker
+            Output thread 0x2, name AudioOut_D:
+              Standby: yes
+              Output devices: TELEPHONY_TX
+              flags (INCALL_MUSIC)
+        """.trimIndent()
+        val musicOnly = """
+            Output thread 0x1, name AudioOut_15:
+              Standby: no
+              flags (INCALL_MUSIC)
+        """.trimIndent()
+        assertNull(ApiMuteTiming.decide(false, true, active, 1_000L, 5_000L))
+        assertNull(ApiMuteTiming.decide(true, false, active, 1_000L, 5_000L))
+        assertEquals(ApiMuteTiming.AUDIOFLINGER, ApiMuteTiming.decide(true, true, active, 0L, 3_000L))
+        assertEquals(ApiMuteTiming.AUDIOFLINGER, ApiMuteTiming.decide(true, true, musicOnly, 1_000L, 1_200L))
+        assertFalse(ApiMuteTiming.audioFlingerIncallMusicActive(split))
+        assertEquals(ApiMuteTiming.WRITE_DELAY, ApiMuteTiming.decide(true, true, split, 1_000L, 1_400L))
+        assertNull(ApiMuteTiming.decide(true, true, split, 1_000L, 1_399L))
+        assertFalse(ApiMuteTiming.audioFlingerIncallMusicActive("INCALL_MUSIC\nTELEPHONY_TX\nStandby: no\n"))
+        assertEquals("api_mute fallback: no usecase signal", ApiMuteTiming.FALLBACK_LOG)
+        val gsm = File("src/main/java/com/gsm2computer/bridge/gsm/GsmCallManager.kt").readText()
+        assertTrue(gsm.contains("appLog(ApiMuteTiming.FALLBACK_LOG)"))
+        assertTrue(ApiMuteTiming.DUMP_CMD.contains("Output thread"))
+        assertFalse(ApiMuteTiming.DUMP_CMD.contains("grep"))
     }
 
     @Test
-    fun `capture guard reverts when rms collapses and keeps a normal level`() {
-        assertTrue(ApiMuteCaptureGuard.collapsed(List(50) { 1_000 }, List(50) { 0 }))
-        assertTrue(ApiMuteCaptureGuard.collapsed(List(50) { 1_000 }, List(50) { 50 }))
-        assertFalse(ApiMuteCaptureGuard.collapsed(List(50) { 1_000 }, List(50) { 100 }))
-        assertFalse(ApiMuteCaptureGuard.collapsed(List(50) { 1_000 }, List(50) { 200 }))
-        assertFalse(ApiMuteCaptureGuard.collapsed(List(50) { 0 }, List(50) { 0 }))
-        assertEquals("api_mute reverted: capture collapsed", ApiMuteCaptureGuard.REVERT_LOG)
-
+    fun `capture windows log a speech pause and do not revert`() {
         val guard = ApiMuteCaptureGuard()
+        val lines = ArrayList<String>()
         var now = 0L
-        repeat(100) {
-            val step = guard.onFrame(1_000, now, muted = false)
-            assertFalse(step.revert)
-            now += 20
-        }
-        var reverted = false
         repeat(101) {
-            val step = guard.onFrame(0, now, muted = true)
-            if (step.revert) reverted = true
+            guard.onFrame(1_000, now, muted = false)?.let { lines.add(it) }
             now += 20
         }
-        assertTrue(reverted)
-        val kept = ApiMuteCaptureGuard()
-        now = 0L
-        repeat(100) {
-            kept.onFrame(1_000, now, muted = false)
-            now += 20
-        }
-        var keptRevert = false
+        assertEquals("api_mute capture pre=1000 post=", lines.last())
         repeat(101) {
-            if (kept.onFrame(800, now, muted = true).revert) keptRevert = true
+            guard.onFrame(0, now, muted = true)?.let { lines.add(it) }
             now += 20
         }
-        assertFalse(keptRevert)
+        assertTrue(lines.any { it == "api_mute capture pre=1000 post=0" })
+        repeat(100) {
+            guard.onFrame(900, now, muted = true)?.let { lines.add(it) }
+            now += 20
+        }
+        assertTrue(lines.any { it.startsWith("api_mute capture pre=1000 post=0,") })
+        assertTrue(lines.none { it.contains("revert") })
     }
 
     private fun startup(states: List<Int>, telephony: Int, mode: Int): Boolean =

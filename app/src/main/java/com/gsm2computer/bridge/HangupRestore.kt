@@ -1,10 +1,9 @@
 package com.gsm2computer.bridge
 
 /**
- * Hangup edges that must restore the bridged mic. The first one that runs
- * does the work. Later edges still call in, and the gate makes that a no-op.
+ * Hangup edges that must restore the bridged mic on the Moto profile.
  * [onCallRemoved] sees a null live call after DISCONNECTED, so it cannot
- * require the live pointer.
+ * require the live pointer. Other profiles keep the pre-352 onCallRemoved path.
  */
 internal object HangupRestore {
     fun <T> disconnected(active: T?, call: T, restore: (String) -> Unit): T? {
@@ -21,8 +20,8 @@ internal object HangupRestore {
 }
 
 /**
- * One saved mic value per bridged call. [restore] returns it once.
- * A second call returns null so a repeated hangup edge does not write again.
+ * One saved mic value per bridged call. The value stays available until
+ * [commit], which runs only after AudioManager accepts the write.
  */
 internal class MicRestoreGate {
     var open: Boolean = false
@@ -35,11 +34,22 @@ internal class MicRestoreGate {
         prior = currentMute
     }
 
-    fun restore(): Boolean? {
-        if (!open) return null
+    fun pending(): Boolean? = if (open) prior else null
+
+    /**
+     * Writes [pending] when [canWrite] is true. A throw from [setter] leaves
+     * the value in place for the next hangup edge.
+     */
+    fun write(canWrite: Boolean, setter: (Boolean) -> Unit): Boolean {
+        val value = pending() ?: return true
+        if (!canWrite) return false
+        setter(value)
+        commit()
+        return true
+    }
+
+    fun commit() {
         open = false
-        val value = prior
         prior = null
-        return value
     }
 }

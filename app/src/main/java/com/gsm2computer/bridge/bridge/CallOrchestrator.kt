@@ -260,7 +260,7 @@ class CallOrchestrator(
     @Synchronized
     private fun tearDown(reason: String) {
         if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) return
-        GsmCallManager.restoreBridgedAudio("teardown")
+        if (GsmCallManager.isMotoProfile()) GsmCallManager.restoreBridgedAudio("teardown")
         val party = if (reason.startsWith("GSM call")) partyFromCause(activeGsmCall) else "local"
         Log.i(TAG, "Tearing down: $reason end=$party cause=$traceDisconnect")
         callTrace?.event(

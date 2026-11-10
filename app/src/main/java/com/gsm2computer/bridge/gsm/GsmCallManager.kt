@@ -10,8 +10,8 @@ import android.telecom.CallAudioState
 import android.telecom.InCallService
 import android.util.Log
 import com.gsm2computer.bridge.ApiMuteCaptureGuard
+import com.gsm2computer.bridge.ApiMuteTiming
 import com.gsm2computer.bridge.DeviceProfile
-import com.gsm2computer.bridge.GuardStep
 import com.gsm2computer.bridge.HangupRestore
 import com.gsm2computer.bridge.InjectPolicy
 import com.gsm2computer.bridge.MicApiAction
@@ -67,7 +67,6 @@ object GsmCallManager {
     private val micGate = MicRestoreGate()
     @Volatile private var bridgeAudioOpen = false
     @Volatile private var apiMuteApplied = false
-    @Volatile private var apiMuteReverted = false
     @Volatile private var captureGuard = ApiMuteCaptureGuard()
 
     /**
@@ -148,6 +147,18 @@ object GsmCallManager {
     }
 
     fun onCallRemoved(call: Call) {
+        if (!isMotoProfile()) {
+            if (!isLiveGsmCall(activeCall, call)) {
+                Log.i(TAG, "Non-live GSM call removed; live call unchanged")
+                return
+            }
+            Log.i(TAG, "GSM call removed")
+            activeCall = null
+            activeCallState = Call.STATE_DISCONNECTED
+            restoreAudio()
+            listener?.onGsmCallEnded(call)
+            return
+        }
         val live = activeCall
         if (live != null && live !== call) {
             Log.i(TAG, "Non-live GSM call removed; live call unchanged")
@@ -194,8 +205,13 @@ object GsmCallManager {
                     return
                 }
                 Log.i(TAG, "GSM call disconnected")
-                activeCall = HangupRestore.disconnected(activeCall, call) { restoreBridgedAudio(it) }
-                listener?.onGsmCallEnded(call)
+                if (isMotoProfile()) {
+                    activeCall = HangupRestore.disconnected(activeCall, call) { restoreBridgedAudio(it) }
+                    listener?.onGsmCallEnded(call)
+                } else {
+                    listener?.onGsmCallEnded(call)
+                    activeCall = null
+                }
             }
         }
         if (!waiting) {
@@ -387,7 +403,7 @@ object GsmCallManager {
     /** Configure audio for GSM↔SIP bridge using the active device profile. */
     private fun configureAudioBridge() {
         if (listener == null) return // Standalone mode: let Android handle audio routing natively
-        markBridgeOpen()
+        if (isMotoProfile()) markBridgeOpen()
 
         // Voice session is already up at ACTIVE. Do not wait for the playback
         // track or for a PCM status file. A waiting leg never reaches here.
@@ -506,48 +522,21 @@ object GsmCallManager {
         appLog("Vol: voice=$actualVoice(m=$muted), music=$actualMusic/$maxMusic(target=$musicVol)")
     }
 
-    /**
-     * Restore mixer and mic state. Safe to call from DISCONNECTED, call
-     * removal, tearDown, and service destroy: the first call does the work.
-     */
-    fun restoreBridgedAudio(reason: String) {
+    /** Pre-352 hangup path. Pixel and the other profiles still use only this. */
+    private fun restoreAudio() {
         muteLocalEarpiece = false
-        synchronized(audioLock) {
-            if (!bridgeAudioOpen) {
-                Log.i(TAG, "audio restore skipped reason=$reason")
-                return
-            }
-            bridgeAudioOpen = false
-            apiMuteReverted = true
-        }
-        Log.i(TAG, "audio restore reason=$reason")
-
+        if (listener == null) return
         try {
             mixerSetupCompletedAtMs = 0
-            // Single su call to restore all mixer controls
             batchMixerRestore()
-
             inCallService?.let { service ->
                 service.setAudioRoute(CallAudioState.ROUTE_EARPIECE)
-
                 val audioManager = service.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-                if (audioManager == null && isMotoProfile()) {
-                    val pending = synchronized(audioLock) { micGate.restore() }
-                    Log.w(TAG, "micMute restore missed audio manager prior=$pending reason=$reason")
-                }
                 audioManager?.let { am ->
-                    if (isMotoProfile()) {
-                        restoreMotoMicrophone(am)
-                    } else {
-                        am.isMicrophoneMute = false
-                    }
-                    // Clear incall_music HAL parameter for clean state on next call.
-                    // Moto leaves this empty so the HAL's route is not torn down here.
+                    am.isMicrophoneMute = false
                     if (profile.routing.incallMusicParam.isNotEmpty()) {
                         am.setParameters("${profile.routing.incallMusicParam}=false")
                     }
-
-                    // Unmute voice call stream and restore volume for normal phone use
                     try {
                         am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
                     } catch (_: SecurityException) {}
@@ -555,19 +544,58 @@ object GsmCallManager {
                         val maxVc = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
                         am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, (maxVc * 2 / 3).coerceAtLeast(1), 0)
                     } catch (_: SecurityException) {}
-                    val incall = if (profile.routing.incallMusicParam.isEmpty()) "untouched" else "false"
-                    Log.i(TAG, "Audio restored: earpiece, VoiceRx unmuted, echoRef=SLIM_RX, incall_music=$incall")
+                    Log.i(TAG, "Audio restored: earpiece, VoiceRx unmuted, echoRef=SLIM_RX, incall_music=false")
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to restore audio: ${e.message}")
-        } finally {
-            synchronized(audioLock) {
-                if (micGate.open) micGate.restore()
+        }
+    }
+
+    /**
+     * Moto hangup restore. Mixer failure still attempts the mic write.
+     * The saved mic value stays until that write returns, so a missing
+     * AudioManager can be retried by the next hangup edge.
+     */
+    fun restoreBridgedAudio(reason: String) {
+        if (!isMotoProfile()) return
+        muteLocalEarpiece = false
+        synchronized(audioLock) {
+            if (!bridgeAudioOpen && !micGate.open) {
+                Log.i(TAG, "audio restore skipped reason=$reason")
+                return
             }
+            bridgeAudioOpen = false
             injectPolicyLatched = false
             voiceTxDecisionLogged = false
         }
+        Log.i(TAG, "audio restore reason=$reason")
+        try {
+            mixerSetupCompletedAtMs = 0
+            batchMixerRestore()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore mixer: ${e.message}")
+        }
+        try {
+            inCallService?.setAudioRoute(CallAudioState.ROUTE_EARPIECE)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore route: ${e.message}")
+        }
+        try {
+            currentAudioManager()?.let { am ->
+                try {
+                    am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
+                } catch (_: SecurityException) {}
+                try {
+                    val maxVc = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+                    am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, (maxVc * 2 / 3).coerceAtLeast(1), 0)
+                } catch (_: SecurityException) {}
+                Log.i(TAG, "Audio restored: earpiece, VoiceRx unmuted, echoRef=SLIM_RX, incall_music=untouched")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore volumes: ${e.message}")
+        }
+        restoreMotoMicrophone(reason)
     }
 
     /** Call objects this process already knows about. Empty before InCallService binds. */
@@ -582,13 +610,13 @@ object GsmCallManager {
     }
 
     fun wantsDeferredApiMute(): Boolean {
-        if (!bridgeAudioOpen || apiMuteApplied || apiMuteReverted) return false
+        if (!bridgeAudioOpen || apiMuteApplied) return false
         return isMotoProfile() && injectPolicy.micApi == MicApiAction.FORCE_TRUE
     }
 
     fun applyDeferredApiMute(reason: String) {
         val applied = synchronized(audioLock) {
-            if (!bridgeAudioOpen || apiMuteApplied || apiMuteReverted) return
+            if (!bridgeAudioOpen || apiMuteApplied) return
             if (!isMotoProfile() || injectPolicy.micApi != MicApiAction.FORCE_TRUE) return
             val am = currentAudioManager() ?: return
             val before = am.isMicrophoneMute
@@ -600,53 +628,33 @@ object GsmCallManager {
             )
             true
         }
-        if (applied) logMutePath()
+        if (!applied) return
+        if (reason == ApiMuteTiming.WRITE_DELAY) appLog(ApiMuteTiming.FALLBACK_LOG)
+        logMutePath()
     }
 
-    /**
-     * Feeds one capture frame into the API-mute guard. Returns true when the
-     * mute was reverted because capture collapsed.
-     */
-    fun observeCaptureRms(rms: Int, nowMs: Long): Boolean {
-        if (!isMotoProfile() || injectPolicy.micApi != MicApiAction.FORCE_TRUE || apiMuteReverted) {
-            return false
-        }
-        val step: GuardStep = captureGuard.onFrame(rms, nowMs, apiMuteApplied)
-        step.logLine?.let { appLog(it) }
-        if (!step.revert || apiMuteReverted || !bridgeAudioOpen) return false
-        revertApiMute()
-        return true
+    /** Logs 2 s capture windows around the API mute. Never changes the mute. */
+    fun observeCaptureRms(rms: Int, nowMs: Long) {
+        if (!isMotoProfile() || injectPolicy.micApi != MicApiAction.FORCE_TRUE) return
+        val line = captureGuard.onFrame(rms, nowMs, apiMuteApplied) ?: return
+        appLog(line)
     }
 
     private fun markBridgeOpen() {
         synchronized(audioLock) {
             if (bridgeAudioOpen) return
+            if (micGate.open) {
+                Log.w(TAG, "dropping unrestored mic prior at new bridge")
+                micGate.commit()
+            }
             bridgeAudioOpen = true
             apiMuteApplied = false
-            apiMuteReverted = false
             captureGuard = ApiMuteCaptureGuard()
         }
     }
 
     private fun currentAudioManager(): AudioManager? =
         inCallService?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-
-    private fun revertApiMute() {
-        val am = synchronized(audioLock) {
-            if (apiMuteReverted || !bridgeAudioOpen) return
-            apiMuteReverted = true
-            currentAudioManager()
-        }
-        val before = am?.isMicrophoneMute
-        if (am != null) am.isMicrophoneMute = false
-        val after = am?.isMicrophoneMute
-        Log.w(TAG, ApiMuteCaptureGuard.REVERT_LOG)
-        appLog(
-            "micMute before=$before action=set-false after=$after " +
-                "policy=${InjectPolicy.HAL_OWNED_NO_UNMUTE.wire} reason=capture-collapsed",
-        )
-        logCallback?.invoke(ApiMuteCaptureGuard.REVERT_LOG)
-    }
 
     private fun logMutePath() {
         val cmd = DeviceProfile.resolveCmd(MotoIdleMixers.MUTE_PATH_CMD)
@@ -658,7 +666,7 @@ object GsmCallManager {
         appLog("mute path ${lines.joinToString(" | ")}")
     }
 
-    private fun isMotoProfile(): Boolean = profile.name.startsWith("Moto g84")
+    fun isMotoProfile(): Boolean = profile.name.startsWith("Moto g84")
 
     /** One read per call. A later ACTIVE callback must not change the experiment. */
     private fun latchMotoInjectPolicy() {
@@ -702,18 +710,24 @@ object GsmCallManager {
         appLog("micMute before=$before action=$action after=$after policy=${injectPolicy.wire}")
     }
 
-    private fun restoreMotoMicrophone(am: AudioManager) {
-        val prior = synchronized(audioLock) { micGate.restore() }
-        val before = am.isMicrophoneMute
-        if (prior == null) {
-            appLog("micMute restore skipped prior=unset before=$before policy=${injectPolicy.wire}")
-            return
+    private fun restoreMotoMicrophone(reason: String) {
+        val am = currentAudioManager()
+        val wrote = try {
+            micGate.write(am != null) { prior ->
+                val before = am!!.isMicrophoneMute
+                am.isMicrophoneMute = prior
+                appLog(
+                    "micMute restore before=$before set=$prior after=${am.isMicrophoneMute} " +
+                        "policy=${injectPolicy.wire}",
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "micMute restore write failed: ${e.message}")
+            false
         }
-        am.isMicrophoneMute = prior
-        appLog(
-            "micMute restore before=$before set=$prior after=${am.isMicrophoneMute} " +
-                "policy=${injectPolicy.wire}",
-        )
+        if (!wrote) {
+            Log.w(TAG, "micMute restore kept prior=${micGate.pending()} reason=$reason")
+        }
     }
 
     /**

@@ -369,7 +369,7 @@ class GatewayService : Service() {
     }
 
     override fun onDestroy() {
-        GsmCallManager.restoreBridgedAudio("destroy")
+        if (GsmCallManager.isMotoProfile()) GsmCallManager.restoreBridgedAudio("destroy")
         stopGateway()
         super.onDestroy()
     }
