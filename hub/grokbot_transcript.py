@@ -110,6 +110,8 @@ function gsm2DesktopChrome(el) {
   const label = String(el.getAttribute("aria-label") || "");
   if (/^Message actions\b/i.test(label)) return true;
   if (label === "Your answer" || label === "Voice chat feedback") return true;
+  if (el.getAttribute("data-voice-call-summary") !== null) return true;
+  if (el.getAttribute("data-voice-call-duration") !== null) return true;
   const cls = String(el.getAttribute("class") || "");
   if (/(?:^|\s)sand-row-timestamp(?:\s|$)/.test(cls)) return true;
   const tag = String(el.tagName || el.localName || "").toLowerCase();
@@ -131,17 +133,6 @@ function gsm2DesktopActionsName(row) {
     if (found) return found[1].replace(/\s+/g, " ").trim();
   }
   return "";
-}
-function gsm2DesktopAliases(name) {
-  const raw = String(name || "").replace(/\s+/g, " ").trim().toLowerCase();
-  const aliases = new Set();
-  if (raw === "you" || raw === "your") {
-    aliases.add("you");
-    aliases.add("your");
-  } else if (raw) {
-    aliases.add(raw);
-  }
-  return aliases;
 }
 function gsm2DesktopRole(name) {
   const text = String(name || "").replace(/\s+/g, " ").trim().toLowerCase();
@@ -199,6 +190,17 @@ function gsm2DesktopKnownNames(root) {
     }
   }
   return names;
+}
+function gsm2DesktopHasAttr(el, name) {
+  return !!(el && el.getAttribute && el.getAttribute(name) !== null);
+}
+function gsm2DesktopInsideVoice(el) {
+  let cur = el;
+  while (cur) {
+    if (gsm2DesktopHasAttr(cur, "data-voice-call-transcript")) return true;
+    cur = cur.parentElement || cur.parent || null;
+  }
+  return false;
 }
 function gsm2DesktopExplicitRole(el) {
   if (!el || !el.getAttribute || gsm2DesktopChrome(el)) return null;
@@ -261,6 +263,11 @@ function gsm2DesktopExplicitUtterances(row) {
   const sameParent = parent && inner.every((el) => (el.parentElement || el.parent) === parent);
   if (sameParent) {
     const kids = parent.children ? Array.from(parent.children) : [];
+    const voice = gsm2DesktopInsideVoice(parent);
+    if (voice) {
+      const cards = kids.filter((el) => gsm2DesktopExplicitRole(el));
+      return cards.length ? cards.map((el) => ({ el: el, role: gsm2DesktopExplicitRole(el) })) : null;
+    }
     const bubbles = kids.filter((el) => !gsm2DesktopChrome(el) && !gsm2DesktopInChrome(el) && gsm2DesktopPlain(el));
     if (bubbles.length >= 2 && bubbles.some((el) => gsm2DesktopExplicitRole(el) === "caller") && bubbles.some((el) => inner.includes(el))) {
       return bubbles.map((el) => ({ el: el, role: gsm2DesktopExplicitRole(el) || "assistant" }));
