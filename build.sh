@@ -318,33 +318,31 @@ build_tinymix() {
 
     local TINYMIX_SRC="$SCRIPT_DIR/tools/tinymix"
     local TINYMIX_BIN="$SCRIPT_DIR/magisk/tinymix"
+    local TINYMIX_SYS="$SCRIPT_DIR/magisk/system/bin/tinymix"
 
-    # If a pre-built binary already exists in magisk/, use it
-    if [ -f "$TINYMIX_BIN" ]; then
-        local ARCH=$(file "$TINYMIX_BIN" 2>/dev/null)
-        if echo "$ARCH" | grep -q "ARM aarch64"; then
-            echo "Using existing tinymix binary: $TINYMIX_BIN"
-            return 0
-        fi
+    # Always compile tools/tinymix. A prebuilt in magisk/ used to be reused,
+    # which is how the phone kept the helper that broadcasts only args[1].
+    if ! command -v go &>/dev/null; then
+        echo "ERROR: Go is required to build tinymix from tools/tinymix."
+        echo "       Refusing to pack a prebuilt helper."
+        return 1
     fi
-
-    # Try to build with Go (cross-compiles to ARM64 easily)
-    if command -v go &>/dev/null; then
-        if [ -d "$TINYMIX_SRC" ] && [ -f "$TINYMIX_SRC/main.go" ]; then
-            echo "Building tinymix with Go..."
-            (cd "$TINYMIX_SRC" && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
-                go build -ldflags='-s -w' -o "$TINYMIX_BIN" .)
-            if [ -f "$TINYMIX_BIN" ]; then
-                chmod 755 "$TINYMIX_BIN"
-                echo "tinymix built: $TINYMIX_BIN ($(du -h "$TINYMIX_BIN" | cut -f1))"
-                return 0
-            fi
-        fi
+    if [ ! -f "$TINYMIX_SRC/main.go" ]; then
+        echo "ERROR: missing $TINYMIX_SRC/main.go"
+        return 1
     fi
-
-    echo "WARNING: Could not build tinymix. ABOX mixer controls may not work."
-    echo "         Install Go or place a pre-built ARM64 tinymix at: $TINYMIX_BIN"
-    return 1
+    echo "Building tinymix from $TINYMIX_SRC ..."
+    if ! (cd "$TINYMIX_SRC" && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+        go build -ldflags='-s -w' -o "$TINYMIX_BIN" .); then
+        echo "ERROR: tinymix build failed"
+        return 1
+    fi
+    chmod 755 "$TINYMIX_BIN"
+    mkdir -p "$(dirname "$TINYMIX_SYS")"
+    cp "$TINYMIX_BIN" "$TINYMIX_SYS"
+    chmod 755 "$TINYMIX_SYS"
+    echo "tinymix built: $TINYMIX_BIN ($(du -h "$TINYMIX_BIN" | cut -f1))"
+    return 0
 }
 
 build_magisk() {

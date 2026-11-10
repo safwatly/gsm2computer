@@ -126,6 +126,8 @@ if [ -f "$MODDIR/tinymix" ]; then
             chmod 755 /data/local/tmp/tinymix
             chown root:root /data/local/tmp/tinymix
             log -t "$TAG" "tinymix: installed ARM64 binary to /data/local/tmp/tinymix"
+            VER=$(/data/local/tmp/tinymix --version 2>&1 | head -n 1)
+            log -t "$TAG" "tinymix: version ${VER}"
             ;;
         *)
             log -t "$TAG" "tinymix: skipped (device ABI=$DEVICE_ABI, bundled binary is ARM64)"
