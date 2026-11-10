@@ -275,7 +275,38 @@ class MotoInjectGuardTest {
         assertTrue(reset.contains("if (GsmCallManager.isMotoProfile())"))
         assertTrue(reset.contains("restoreBridgedAudio(\"force-reset\")"))
         assertTrue(reset.indexOf("restoreBridgedAudio") < reset.indexOf("activeSession?.stop()"))
+        assertTrue(reset.indexOf("activeSession?.stop()") < reset.indexOf("releaseInjectPolicy()"))
         assertFalse(reset.contains("restoreAudio()"))
+    }
+
+    @Test
+    fun `late audio flow sample does not relatch and teardown clears after stop`() {
+        val gsm = File("src/main/java/com/gsm2computer/bridge/gsm/GsmCallManager.kt").readText()
+        val session = File("src/main/java/com/gsm2computer/bridge/rtp/RtpSession.kt").readText()
+        val orchestrator = File("src/main/java/com/gsm2computer/bridge/bridge/CallOrchestrator.kt").readText()
+        val restore = gsm.substringAfter("fun restoreBridgedAudio").substringBefore("fun restoreSavedVoiceVolume")
+        assertFalse(restore.contains("policyLatch"))
+        assertFalse(restore.contains("injectPolicyLatched"))
+        val note = gsm.substringAfter("fun latchedCaptureNote").substringBefore("private fun latchMotoInjectPolicy")
+        assertTrue(note.contains("policyLatch.flowNote()"))
+        assertFalse(note.contains("rawProperty"))
+        val flow = session.substringAfter("private fun flowCaptureNote").substringBefore("private fun readIncallDump")
+        assertTrue(flow.contains("latchedCaptureNote()"))
+        assertFalse(flow.contains("captureSuppressed"))
+        assertFalse(flow.contains("suppressesVoiceCapture"))
+        assertFalse(flow.contains("latchMotoInjectPolicy"))
+        val teardown = orchestrator.substringAfter("private fun tearDown").substringBefore("private fun onHubLinkHold")
+        val stop = teardown.indexOf("activeSession?.stop()")
+        val release = teardown.indexOf("releaseInjectPolicy()")
+        assertTrue(stop in 0 until release)
+        val play = session.substringAfter("private fun playbackLoop").substringBefore("fun liveTrack")
+        assertTrue(play.contains("latchedCaptureDisabled()"))
+        assertTrue(play.contains("armTelephonyPlaybackRoute()"))
+        val route = session.substringAfter("private fun armTelephonyPlaybackRoute")
+            .substringBefore("private fun applyPlaybackRoute")
+        assertTrue(route.contains("watchPlaybackRoute(t)"))
+        val capt = session.substringAfter("recordInjectPolicy()").substringBefore("val samplesPerFrame")
+        assertTrue(capt.contains("armTelephonyPlaybackRoute()"))
     }
 
     @Test

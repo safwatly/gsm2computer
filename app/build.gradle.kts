@@ -42,7 +42,9 @@ android {
         // voice-call capture closed for the whole call. AUDIO-FLOW mute
         // reads use tinymix-helper 351 on the root shell and log a null
         // kernel getter. Voice-call volume writes share audioLock with
-        // hangup restore, including forceReset.
+        // hangup restore, including forceReset. The inject-policy latch
+        // is released after the RTP session stops, so the next ACTIVE
+        // reads persist.gsm2computer.inject_policy again.
         versionCode = 354
         versionName = "0.2.15"
 

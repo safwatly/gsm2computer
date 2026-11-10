@@ -299,6 +299,7 @@ class CallOrchestrator(
             }
             activeGsmCall = null
         } finally {
+            GsmCallManager.releaseInjectPolicy()
             GsmCallManager.muteLocalEarpiece = false
             bridgeState = BridgeState.IDLE
             lastStateChangeTime = System.currentTimeMillis()
@@ -386,6 +387,7 @@ class CallOrchestrator(
         try {
             activeSession?.stop()
         } catch (_: Exception) {}
+        GsmCallManager.releaseInjectPolicy()
         activeSession = null
         activeClient = null
         try {

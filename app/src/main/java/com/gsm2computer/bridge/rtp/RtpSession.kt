@@ -707,28 +707,7 @@ class RtpSession(
         recordInjectPolicy()
         // Re-assert Telephony Tx now the call is ACTIVE: policy only picks the
         // INCALL_MUSIC output (incall_music_uplink -> MultiMedia9) while in call.
-        if (profile.routing.playbackToTelephony) {
-            try {
-                val t = audioTrack
-                val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-                val dev = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                    ?.firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
-                if (t != null && dev != null) {
-                    // Do not call setPreferredDevice on a playing track. AudioFlinger
-                    // then logs "dead IAudioTrack, creating a new one from
-                    // setOutputDevice" and the replacement drops in-call-music.
-                    // A fresh track is armed while stopped; a later route change
-                    // rebuilds it on the playback thread.
-                    val cur = t.routedDevice?.type ?: -1
-                    captureTap?.putMeta("play_routed_at_start", cur)
-                    Log.i(TAG, "AudioTrack route at call start: type=$cur")
-                    applyPlaybackRoute(cur)
-                }
-                if (t != null) watchPlaybackRoute(t)
-            } catch (e: Exception) {
-                Log.w(TAG, "re-route to TYPE_TELEPHONY failed: ${e.message}")
-            }
-        }
+        armTelephonyPlaybackRoute()
 
         // Buffer: 20ms of PCM at the actual capture sample rate
         val samplesPerFrame = captureRate / 50  // 160 @ 8kHz, 320 @ 16kHz
@@ -1283,8 +1262,9 @@ class RtpSession(
     }
 
     private fun flowCaptureNote(): String {
-        if (!captureSuppressed()) return ""
-        return " ${GsmCallManager.injectPolicy.captureDisabledLog()}"
+        val line = GsmCallManager.latchedCaptureNote()
+        if (line.isEmpty()) return ""
+        return " $line"
     }
 
     private fun readIncallDump(): String = try {
@@ -1353,6 +1333,32 @@ class RtpSession(
             -1
         }
         Log.i(TAG, "playback primed $wrote bytes before incall_music routed=$routed")
+    }
+
+    /**
+     * Watch Telephony Tx and rebuild if the playing track leaves it.
+     * Do not call setPreferredDevice on a playing track. AudioFlinger then
+     * logs "dead IAudioTrack, creating a new one from setOutputDevice" and
+     * the replacement drops in-call-music. A fresh track is armed while
+     * stopped; a later route change rebuilds it on the playback thread.
+     */
+    private fun armTelephonyPlaybackRoute() {
+        if (!profile.routing.playbackToTelephony) return
+        try {
+            val t = audioTrack
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val dev = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                ?.firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
+            if (t != null && dev != null) {
+                val cur = t.routedDevice?.type ?: -1
+                captureTap?.putMeta("play_routed_at_start", cur)
+                Log.i(TAG, "AudioTrack route at call start: type=$cur")
+                applyPlaybackRoute(cur)
+            }
+            if (t != null) watchPlaybackRoute(t)
+        } catch (e: Exception) {
+            Log.w(TAG, "re-route to TYPE_TELEPHONY failed: ${e.message}")
+        }
     }
 
     private fun applyPlaybackRoute(routedType: Int) {
@@ -1577,6 +1583,9 @@ class RtpSession(
         // when pcminject3 and the AFE helper are both on the phone. Build 341's
         // RootPcmInjector was constructed nowhere, so playback does not start it.
         armPlaybackTrack(track)
+        // captureLoop never runs when voice-call capture is closed, so the
+        // telephony route listener has to be installed from playback.
+        if (GsmCallManager.latchedCaptureDisabled()) armTelephonyPlaybackRoute()
         val phased: PhasedInjector? = if (profile.name.startsWith("Moto g84") && PhasedInjector.available())
             PhasedInjector(context, { audioTrack ?: track }, playbackRate, { captureTap }, { enableIncallMusic() },
                 { b -> resamplePcm16(b, playbackRate, 48000) }) else null

@@ -17,6 +17,7 @@ import com.gsm2computer.bridge.DeviceProfile
 import com.gsm2computer.bridge.GatewayApp
 import com.gsm2computer.bridge.HangupRestore
 import com.gsm2computer.bridge.InjectPolicy
+import com.gsm2computer.bridge.InjectPolicyLatch
 import com.gsm2computer.bridge.MicApiAction
 import com.gsm2computer.bridge.MicRestoreGate
 import com.gsm2computer.bridge.MotoIdleMixers
@@ -65,7 +66,7 @@ object GsmCallManager {
     @Volatile var injectPolicy: InjectPolicy = InjectPolicy.DEFAULT
         private set
 
-    @Volatile private var injectPolicyLatched = false
+    private val policyLatch = InjectPolicyLatch()
     private var voiceTxDecisionLogged = false
     private val audioLock = Any()
     private val micGate = MicRestoreGate()
@@ -573,7 +574,6 @@ object GsmCallManager {
                 true
             } else {
                 bridgeAudioOpen = false
-                injectPolicyLatched = false
                 voiceTxDecisionLogged = false
                 false
             }
@@ -776,12 +776,36 @@ object GsmCallManager {
         return !injectPolicy.opensVoiceCapture
     }
 
+    /**
+     * Already-latched policy for AUDIO-FLOW. Does not read the property
+     * and does not latch, so a sample after hangup cannot pin the next call.
+     */
+    fun latchedCaptureNote(): String {
+        if (!isMotoProfile()) return ""
+        return policyLatch.flowNote()
+    }
+
+    /** Already-latched capture decision. Does not read the property. */
+    fun latchedCaptureDisabled(): Boolean {
+        if (!isMotoProfile()) return false
+        return !policyLatch.peek().opensVoiceCapture
+    }
+
+    /**
+     * Drop the call's policy latch. Call this after the RTP session has
+     * stopped, including when hangup restore took the skip path.
+     */
+    fun releaseInjectPolicy() {
+        policyLatch.clear()
+    }
+
     /** One read per call. A later ACTIVE callback must not change the experiment. */
     private fun latchMotoInjectPolicy() {
-        if (!isMotoProfile() || injectPolicyLatched) return
-        injectPolicyLatched = true
+        if (!isMotoProfile() || policyLatch.latched) return
         val raw = InjectPolicy.rawProperty()
-        injectPolicy = InjectPolicy.parse(raw)
+        val result = policyLatch.latch(raw)
+        injectPolicy = result.policy
+        if (!result.fresh) return
         val shown = if (InjectPolicy.recognized(raw)) {
             raw.trim().ifEmpty { "(default)" }
         } else {
