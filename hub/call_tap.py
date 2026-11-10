@@ -27,7 +27,8 @@ Grok Bot calls may also contain transcript.json. Read it with
 ``jq -r '.turns[] | [.speaker, (.timestamp // "-"), .text] | @tsv' <call-dir>/transcript.json``.
 
 Directories are pruned to GSM2COMPUTER_CALL_RECORD_KEEP (default 20), oldest
-name first, including the downlink and the transcript.
+name first, including nested folders, the downlink, and the transcript. A prune
+error is logged and does not block the next call.
 
 Disable with GSM2COMPUTER_CALL_RECORD=0.
 """
@@ -38,6 +39,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 import wave
 from datetime import datetime, timezone
@@ -397,7 +399,10 @@ class CallTap:
                 )
             )
         record_dir.mkdir(parents=True, exist_ok=True)
-        _prune(record_dir, KEEP_CALLS)
+        try:
+            _prune(record_dir, KEEP_CALLS)
+        except Exception as exc:
+            LOG.error("call tap prune failed: %s", exc)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         if e2e:
             kind = "e2e-test"
@@ -803,10 +808,29 @@ class CallTap:
 
 
 def _prune(root: Path, keep: int) -> None:
-    dirs = [p for p in root.iterdir() if p.is_dir()]
-    dirs.sort(key=lambda p: p.name, reverse=True)
-    for old in dirs[keep:]:
-        for child in old.iterdir():
-            child.unlink()
-        old.rmdir()
-        LOG.info("call tap pruned %s", old)
+    """Delete call folders past ``keep``. Direct children only; symlinks stay."""
+    try:
+        root_real = root.resolve()
+        dirs = [child for child in root.iterdir() if _is_prunable_call_dir(root, root_real, child)]
+        dirs.sort(key=lambda p: p.name, reverse=True)
+        for old in dirs[keep:]:
+            if not _is_prunable_call_dir(root, root_real, old):
+                LOG.error("call tap prune refused %s", old)
+                continue
+            try:
+                shutil.rmtree(old)
+            except Exception as exc:
+                LOG.error("call tap prune failed: %s", exc)
+                continue
+            LOG.info("call tap pruned %s", old)
+    except Exception as exc:
+        LOG.error("call tap prune failed: %s", exc)
+
+
+def _is_prunable_call_dir(root: Path, root_real: Path, child: Path) -> bool:
+    if child.parent != root or child.is_symlink() or not child.is_dir():
+        return False
+    try:
+        return child.resolve().is_relative_to(root_real)
+    except OSError:
+        return False
