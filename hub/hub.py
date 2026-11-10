@@ -656,6 +656,27 @@ def _env_flag(name: str, default: bool) -> bool:
     return str(raw).strip().lower() not in ("0", "false", "no", "off")
 
 
+# A device call waits this long for an in-flight Talk URL heal to finish or
+# abort, then is admitted anyway. The heal must not 503 the socket.
+HEAL_ADMISSION_WAIT_S = 0.75
+
+
+async def _wait_for_page_heal() -> None:
+    if get_talk_ui is None:
+        return
+    ui = get_talk_ui()
+    if ui is None or not getattr(ui, "page_heal_in_progress", False):
+        return
+    deadline = time.monotonic() + HEAL_ADMISSION_WAIT_S
+    while getattr(ui, "page_heal_in_progress", False) and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+    if getattr(ui, "page_heal_in_progress", False):
+        LOG.info(
+            "admitting device call; Talk page heal still in flight after %.2fs",
+            HEAL_ADMISSION_WAIT_S,
+        )
+
+
 def talk_status_for_health() -> dict[str, Any]:
     """Cached Talk status for GET /health. Does not probe CDP or navigate."""
     if get_talk_ui is None:
@@ -2378,7 +2399,10 @@ async def handle_websocket(
             await writer.drain()
             return
 
-        # A Talk-page heal must not 503 this socket. The call wins.
+        # A Talk-page heal must not 503 this socket. Wait out a navigate that
+        # is already in flight, then admit. The heal aborts if this claim
+        # lands while Page.navigate is still awaiting.
+        await _wait_for_page_heal()
         session_id = "hub-" + uuid.uuid4().hex[:16]
         entrance = request_entrance()
         if not live_call.claim(path, entrance=entrance.name):

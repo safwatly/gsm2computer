@@ -55,7 +55,7 @@ class HandshakeTests(unittest.IsolatedAsyncioTestCase):
             hub.live_call.release()
         hub.active_bridge = None
 
-    async def test_page_heal_does_not_503_or_block_the_handshake(self) -> None:
+    async def test_page_heal_does_not_503_and_the_wait_is_bounded(self) -> None:
         ui = OpenClawTalkUI()
         ui.page_heal_in_progress = True
         called = {"n": 0}
@@ -81,7 +81,8 @@ class HandshakeTests(unittest.IsolatedAsyncioTestCase):
         body = bytes(writer.buf)
         self.assertNotIn(b"503", body)
         self.assertIn(b"409", body)
-        self.assertLess(elapsed, 0.3)
+        self.assertGreater(elapsed, hub.HEAL_ADMISSION_WAIT_S - 0.15)
+        self.assertLess(elapsed, hub.HEAL_ADMISSION_WAIT_S + 0.6)
         self.assertEqual(0, called["n"])
         text = "\n".join(logs.output)
         self.assertIn("device ws handshake attempt", text)

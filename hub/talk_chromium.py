@@ -991,6 +991,15 @@ async def pin_phone_uplink_volume() -> None:
             LOG.info("pinned %s volume %s to 100%%", kind, target)
 
 
+async def _swallow_task(task: asyncio.Task) -> None:
+    try:
+        await task
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        LOG.debug("talk page navigate ended after cancel", exc_info=True)
+
+
 class OpenClawTalkUI:
     """Start/stop Control UI Talk in a dedicated Chromium via CDP."""
 
@@ -1467,11 +1476,43 @@ class OpenClawTalkUI:
                 return "already corrected"
             # Arm cooldown only when we actually attempt navigation (incl. CDP failures).
             self._page_heal_after = time.monotonic() + 120.0
+            if not self._idle_for_page_heal():
+                return "blocked: call claimed before navigate"
             LOG.warning("Talk page URL heal: navigating to /chat/main (idle; cooldown 120s)")
-            await session.call("Page.navigate", {"url": chat_main_url()})
-            return "navigation requested"
+            return await self._navigate_unless_call_claims(session)
         finally:
             self.page_heal_in_progress = False
+
+    async def _navigate_unless_call_claims(self, session: CdpSession) -> str:
+        """Send Page.navigate, and stop it if a call claims while it is in flight.
+
+        The idle re-check above can pass and a device websocket can still be
+        admitted before this CDP call returns. Admission does not 503, so this
+        is what keeps that call off a document that is navigating.
+        """
+        navigate = asyncio.create_task(
+            session.call("Page.navigate", {"url": chat_main_url()}),
+            name="talk-page-heal-navigate",
+        )
+        try:
+            while True:
+                if not self._idle_for_page_heal():
+                    navigate.cancel()
+                    await _swallow_task(navigate)
+                    try:
+                        await session.call("Page.stopLoading")
+                    except Exception as exc:
+                        LOG.warning("Talk page stopLoading after a claimed call failed: %s", exc)
+                    LOG.warning("Talk page URL heal aborted: call claimed during navigate")
+                    return "aborted: call claimed during navigate"
+                if navigate.done():
+                    navigate.result()
+                    return "navigation requested"
+                await asyncio.wait({navigate}, timeout=0.05)
+        finally:
+            if not navigate.done():
+                navigate.cancel()
+                await _swallow_task(navigate)
 
     async def ensure_browser(self) -> None:
         if await cdp_ready() and browser_pid() is not None:

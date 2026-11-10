@@ -63,6 +63,27 @@ class HealTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("blocked", await self.ui._heal_page_url(self.session, page))
         self.session.call.assert_not_awaited()
 
+    async def test_call_claims_during_navigate_aborts_the_load(self):
+        started = asyncio.Event()
+
+        async def call(method, params=None, timeout_s=5.0):
+            if method == "Page.navigate":
+                started.set()
+                self.ui.idle_check = lambda: False
+                await asyncio.sleep(5)
+                raise AssertionError("navigate kept running after the call claimed")
+            if method == "Page.stopLoading":
+                return {}
+            raise AssertionError(method)
+
+        self.session.call.side_effect = call
+        result = await asyncio.wait_for(self.ui._heal_page_url(self.session, BAD), timeout=2)
+        self.assertTrue(started.is_set())
+        self.assertEqual(result, "aborted: call claimed during navigate")
+        self.assertFalse(self.ui.page_heal_in_progress)
+        methods = [c.args[0] for c in self.session.call.await_args_list]
+        self.assertEqual(["Page.navigate", "Page.stopLoading"], methods)
+
     async def test_call_arrives_during_probe(self):
         async def evaluate(*args):
             self.ui.idle_check = lambda: False
