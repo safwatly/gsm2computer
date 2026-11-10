@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 from urllib.request import Request, urlopen
 
 LOG = logging.getLogger("gsm2computer-hub.grokbot")
@@ -105,10 +105,286 @@ function gsm2VoiceSessions(root) {
   }
   return sessions;
 }
+function gsm2DesktopChrome(el) {
+  if (!el || !el.getAttribute) return false;
+  const label = String(el.getAttribute("aria-label") || "");
+  if (/^Message actions\b/i.test(label)) return true;
+  if (label === "Your answer" || label === "Voice chat feedback") return true;
+  const cls = String(el.getAttribute("class") || "");
+  if (/(?:^|\s)sand-row-timestamp(?:\s|$)/.test(cls)) return true;
+  const tag = String(el.tagName || el.localName || "").toLowerCase();
+  if (tag === "time" || tag === "button") return true;
+  return false;
+}
+function gsm2DesktopInChrome(el) {
+  let cur = el;
+  while (cur) {
+    if (gsm2DesktopChrome(cur)) return true;
+    cur = cur.parentElement || cur.parent || null;
+  }
+  return false;
+}
+function gsm2DesktopActionsName(row) {
+  const nodes = row.querySelectorAll ? Array.from(row.querySelectorAll("[aria-label]")) : [];
+  for (const node of nodes) {
+    const found = /^Message actions for (.+) message at\b/i.exec(String(node.getAttribute("aria-label") || ""));
+    if (found) return found[1].replace(/\s+/g, " ").trim();
+  }
+  return "";
+}
+function gsm2DesktopAliases(name) {
+  const raw = String(name || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const aliases = new Set();
+  if (raw === "you" || raw === "your") {
+    aliases.add("you");
+    aliases.add("your");
+  } else if (raw) {
+    aliases.add(raw);
+  }
+  return aliases;
+}
+function gsm2DesktopRole(name) {
+  const text = String(name || "").replace(/\s+/g, " ").trim().toLowerCase();
+  if (text === "you" || text === "your") return "caller";
+  if (text) return "assistant";
+  return null;
+}
+function gsm2DesktopOwnText(el) {
+  if (el.childNodes) {
+    return Array.from(el.childNodes)
+      .filter((node) => node.nodeType === 3)
+      .map((node) => node.textContent || "")
+      .join(" ");
+  }
+  return el.text || "";
+}
+function gsm2DesktopPlain(el) {
+  if (!el || gsm2DesktopChrome(el)) return "";
+  const parts = [];
+  const own = String(gsm2DesktopOwnText(el) || "").replace(/\s+/g, " ").trim();
+  if (own) parts.push(own);
+  const kids = el.children ? Array.from(el.children) : [];
+  for (const child of kids) {
+    const text = gsm2DesktopPlain(child);
+    if (text) parts.push(text);
+  }
+  return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+function gsm2DesktopParts(el) {
+  if (!el) return [];
+  if (el.childNodes && el.childNodes.length) {
+    const parts = [];
+    for (const node of Array.from(el.childNodes)) {
+      if (node.nodeType === 3) parts.push({ kind: "text", text: node.textContent || "" });
+      else if (node.nodeType === 1) parts.push({ kind: "element", el: node });
+    }
+    return parts;
+  }
+  const parts = [];
+  if (el.text) parts.push({ kind: "text", text: el.text });
+  const kids = el.children ? Array.from(el.children) : [];
+  for (const child of kids) parts.push({ kind: "element", el: child });
+  return parts;
+}
+function gsm2DesktopKnownNames(root) {
+  const names = new Set(["you", "your"]);
+  const nodes = root && root.querySelectorAll ? Array.from(root.querySelectorAll("[aria-label], *")) : [];
+  for (const node of nodes) {
+    const found = /^Message actions for (.+) message at\b/i.exec(String(node.getAttribute && node.getAttribute("aria-label") || ""));
+    if (found) names.add(found[1].replace(/\s+/g, " ").trim().toLowerCase());
+    const cls = String(node.getAttribute && node.getAttribute("class") || "");
+    if (/(?:^|\s)sand-chat-header__identity(?:\s|$)/.test(cls)) {
+      const text = gsm2DesktopPlain(node).replace(/\s+/g, " ").trim().toLowerCase();
+      if (text) names.add(text);
+    }
+  }
+  return names;
+}
+function gsm2DesktopExplicitRole(el) {
+  if (!el || !el.getAttribute || gsm2DesktopChrome(el)) return null;
+  const raw = String(
+    el.getAttribute("data-role") || el.getAttribute("data-speaker") || el.getAttribute("data-author") || el.getAttribute("data-from") || ""
+  ).replace(/\s+/g, " ").trim().toLowerCase();
+  if (raw === "user" || raw === "human" || raw === "caller" || raw === "you") return "caller";
+  if (raw === "assistant" || raw === "agent" || raw === "bot" || raw === "model" || raw === "grok") return "assistant";
+  const cls = String(el.getAttribute("class") || "");
+  if (/(?:^|\s)sand-fill-bubble-user(?:\s|$)/.test(cls)) return "caller";
+  if (/(?:^|\s)sand-fill-bubble-agent(?:\s|$)/.test(cls)) return "assistant";
+  return null;
+}
+function gsm2DesktopIsSpeakerMarker(el, names) {
+  if (!el || !el.getAttribute || gsm2DesktopChrome(el) || gsm2DesktopInChrome(el)) return false;
+  const text = gsm2DesktopPlain(el).replace(/\s+/g, " ").trim().toLowerCase();
+  return Boolean(text) && names.has(text);
+}
+function gsm2DesktopStripGlued(text, name) {
+  const value = String(text || "").replace(/\s+/g, " ").trim();
+  const raw = String(name || "").trim();
+  if (!raw || value.length < raw.length) return value;
+  if (value.slice(0, raw.length).toLowerCase() !== raw.toLowerCase()) return value;
+  const rest = value.slice(raw.length);
+  if (/^[A-Z]/.test(rest)) return rest.trim();
+  if (/^\s/.test(rest)) {
+    const after = rest.replace(/^\s+/, "");
+    if (/^you$/i.test(raw) && /^[a-z]/.test(after)) return value;
+    return after.trim();
+  }
+  return value;
+}
+function gsm2DesktopCollectText(el, names) {
+  const parts = [];
+  function visit(node) {
+    if (!node || gsm2DesktopChrome(node)) return;
+    if (node !== el && gsm2DesktopIsSpeakerMarker(node, names)) return;
+    const bits = gsm2DesktopParts(node);
+    const hasElement = bits.some((bit) => bit.kind === "element");
+    for (const bit of bits) {
+      if (bit.kind === "text") {
+        const raw = String(bit.text || "").replace(/\s+/g, " ").trim();
+        if (!raw) continue;
+        if (names.has(raw.toLowerCase()) && (hasElement || bits.length > 1)) continue;
+        parts.push(raw);
+      } else {
+        visit(bit.el);
+      }
+    }
+  }
+  visit(el);
+  return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+function gsm2DesktopExplicitUtterances(row) {
+  if (!row.querySelectorAll) return null;
+  const signaled = Array.from(row.querySelectorAll("*")).filter((el) => gsm2DesktopExplicitRole(el));
+  const inner = signaled.filter((el) => !signaled.some((other) => other !== el && el.contains && el.contains(other)));
+  if (!inner.length) return null;
+  const parent = inner[0].parentElement || inner[0].parent;
+  const sameParent = parent && inner.every((el) => (el.parentElement || el.parent) === parent);
+  if (sameParent) {
+    const kids = parent.children ? Array.from(parent.children) : [];
+    const bubbles = kids.filter((el) => !gsm2DesktopChrome(el) && !gsm2DesktopInChrome(el) && gsm2DesktopPlain(el));
+    if (bubbles.length >= 2 && bubbles.some((el) => gsm2DesktopExplicitRole(el) === "caller") && bubbles.some((el) => inner.includes(el))) {
+      return bubbles.map((el) => ({ el: el, role: gsm2DesktopExplicitRole(el) || "assistant" }));
+    }
+  }
+  if (inner.length >= 2) return inner.map((el) => ({ el: el, role: gsm2DesktopExplicitRole(el) }));
+  return null;
+}
+function gsm2DesktopSegments(row, names, fallbackName) {
+  const segments = [];
+  let current = null;
+  function start(role, name) {
+    current = { speaker: role, name: name, parts: [] };
+    segments.push(current);
+  }
+  function append(text) {
+    const value = String(text || "").replace(/\s+/g, " ").trim();
+    if (!value) return;
+    if (!current) {
+      const role = gsm2DesktopRole(fallbackName);
+      if (!role) return;
+      start(role, fallbackName);
+    }
+    current.parts.push(value);
+  }
+  function visit(el) {
+    if (!el || gsm2DesktopChrome(el)) return;
+    if (gsm2DesktopIsSpeakerMarker(el, names)) {
+      const name = gsm2DesktopPlain(el);
+      const role = gsm2DesktopRole(name);
+      if (role) start(role, name);
+      return;
+    }
+    const bits = gsm2DesktopParts(el);
+    const hasElement = bits.some((bit) => bit.kind === "element");
+    for (const bit of bits) {
+      if (bit.kind === "text") {
+        const raw = String(bit.text || "").replace(/\s+/g, " ").trim();
+        if (!raw) continue;
+        if (names.has(raw.toLowerCase()) && (hasElement || bits.length > 1)) {
+          const role = gsm2DesktopRole(raw);
+          if (role) start(role, raw);
+          continue;
+        }
+        append(raw);
+      } else {
+        visit(bit.el);
+      }
+    }
+  }
+  visit(row);
+  const turns = [];
+  for (const segment of segments) {
+    if (!segment.speaker) continue;
+    const text = gsm2DesktopStripGlued(segment.parts.join(" "), segment.name);
+    if (!text) continue;
+    turns.push({ speaker: segment.speaker, text: text });
+  }
+  return turns;
+}
+function gsm2DesktopStamp(row) {
+  const timed = row.querySelector && row.querySelector(".sand-row-timestamp");
+  if (timed) {
+    const text = String(timed.textContent || timed.innerText || "").replace(/\s+/g, " ").trim();
+    if (text) return text;
+  }
+  const stamp = gsm2Stamp(row);
+  if (stamp) return stamp;
+  const nodes = row.querySelectorAll ? Array.from(row.querySelectorAll("[aria-label]")) : [];
+  for (const node of nodes) {
+    const found = /^Message actions for .+ message at (.+)$/i.exec(String(node.getAttribute("aria-label") || ""));
+    if (found) return found[1].trim();
+  }
+  return null;
+}
+function gsm2DesktopTurns(root) {
+  const doc = root || document;
+  const log = doc.querySelector && doc.querySelector('[role="log"][aria-label="Conversation transcript"]');
+  if (!log || !log.querySelectorAll) return [];
+  const names = gsm2DesktopKnownNames(doc);
+  const rows = Array.from(log.querySelectorAll(
+    'article.sand-transcript-row, article.sand-virtual-transcript__row, [role="article"].sand-transcript-row, [role="article"].sand-virtual-transcript__row'
+  ));
+  const turns = [];
+  const seen = new Set();
+  for (const row of rows) {
+    if (seen.has(row)) continue;
+    seen.add(row);
+    const stamp = gsm2DesktopStamp(row);
+    const explicit = gsm2DesktopExplicitUtterances(row);
+    if (explicit) {
+      for (const item of explicit) {
+        const botName = Array.from(names).find((name) => name !== "you" && name !== "your") || "";
+        const label = item.role === "caller" ? "You" : botName;
+        const text = gsm2DesktopStripGlued(gsm2DesktopCollectText(item.el, names), label);
+        if (!item.role || !text) continue;
+        turns.push({ speaker: item.role, text: text, timestamp: stamp });
+      }
+      continue;
+    }
+    for (const segment of gsm2DesktopSegments(row, names, gsm2DesktopActionsName(row))) {
+      turns.push({ speaker: segment.speaker, text: segment.text, timestamp: stamp });
+    }
+  }
+  return turns;
+}
 """
 
 _READ_EXPR = VOICE_DOM_JS + "\ngsm2VoiceTurns(document)"
+_DESKTOP_READ_EXPR = VOICE_DOM_JS + "\ngsm2DesktopTurns(document)"
 _SESSIONS_EXPR = VOICE_DOM_JS + "\ngsm2VoiceSessions(document)"
+# Grok Bot desktop shell. Not a grok.com host. The chat DOM is different.
+_DESKTOP_RENDERER_SUFFIX = "/resources/app.asar/dist/renderer/index.html"
+
+
+def _is_desktop_renderer_url(url: str) -> bool:
+    """True only for the Electron renderer page, not any other file:// URL."""
+    parts = urlsplit(url or "")
+    if parts.scheme != "file":
+        return False
+    path = unquote(parts.path or "").replace("\\", "/")
+    if path and not path.startswith("/"):
+        path = "/" + path
+    return path.endswith(_DESKTOP_RENDERER_SUFFIX)
 
 
 def _is_grok_url(url: str) -> bool:
@@ -498,7 +774,8 @@ def _grok_page(targets: Any) -> Optional[dict[str, Any]]:
         return None
     pages = [t for t in targets if isinstance(t, dict) and t.get("type") == "page"]
     for page in pages:
-        if not _is_grok_url(str(page.get("url") or "")):
+        page_url = str(page.get("url") or "")
+        if not (_is_grok_url(page_url) or _is_desktop_renderer_url(page_url)):
             continue
         ws_url = str(page.get("webSocketDebuggerUrl") or "")
         if not _loopback_ws(ws_url):
@@ -611,9 +888,9 @@ async def read_voice_turns(
         raise RuntimeError("CDP URL is not a loopback HTTP endpoint")
     list_url = base if base.endswith("/json/list") else base + "/json/list"
 
-    async def _turns_from(ws: Any, nid: list[int]) -> list[dict[str, Any]]:
+    async def _turns_from(ws: Any, nid: list[int], expression: str = _READ_EXPR) -> list[dict[str, Any]]:
         _raise_if_abort(abort)
-        turns = _loads_list(await _cdp_eval(ws, nid, _READ_EXPR))
+        turns = _loads_list(await _cdp_eval(ws, nid, expression))
         return [t for t in turns if isinstance(t, dict)]
 
     async def _once() -> Any:
@@ -628,6 +905,9 @@ async def read_voice_turns(
         nid = [0]
         async with websockets.connect(ws_url, open_timeout=4, max_size=4_000_000) as ws:
             _raise_if_abort(abort)
+            # The desktop shell has no /c/ voice links. The open Suzie chat is the transcript.
+            if _is_desktop_renderer_url(str(page.get("url") or "")):
+                return await _turns_from(ws, nid, _DESKTOP_READ_EXPR)
             sessions = await _cdp_eval(ws, nid, _SESSIONS_EXPR)
             choice = select_voice_session(sessions, started_at, ended_at)
             if choice.get("status") != "chosen":
