@@ -602,9 +602,11 @@ data class DeviceProfile(
          *   - Capture caller-only via VOICE_DOWNLINK (incall-rec-downlink =
          *     MultiMedia9 Mixer VOC_REC_DL), so injected audio cannot echo back.
          *   - `Voice Tx Mute` is a 3-value control (mute, VSID, ramp). The
-         *     one-value `0` write hits session 0. [VoiceTxUnmute] writes the
-         *     live session after it is RUNNING. Voice Rx/Tx Device Mute stay
-         *     untouched.
+         *     one-value `0` write hits session 0. [VoiceTxMuteJob] writes
+         *     VoiceMMode1 `0x11C05000` unless a HAL log, property, or a pcm
+         *     id names exactly one MMode frontend. There is no RUNNING gate:
+         *     this kernel has no per-PCM status files. The other MMode slot
+         *     is not written. Voice Rx/Tx Device Mute stay untouched.
          *   - Follow-up, not this build: stop the manual Incall_Music
          *     MM1/MM2/MM9 toggles and the PhasedInjector raw resets, and let
          *     the HAL own incall_music_uplink.

@@ -38,10 +38,12 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        // versionCode 349: diagnostic. Moto Voice Tx Mute is mute/VSID/ramp after
-        // the voice PCM is RUNNING. The inject marker defaults on. 348 stays held.
-        versionCode = 349
-        versionName = "0.2.10"
+        // versionCode 350: Moto Voice Tx Mute is mute/VSID/ramp on call ACTIVE
+        // and again when the playback track routes. No /proc status RUNNING
+        // gate. Default VSID is VoiceMMode1 0x11C05000. The inject marker
+        // defaults on. 348 stays held.
+        versionCode = 350
+        versionName = "0.2.11"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
