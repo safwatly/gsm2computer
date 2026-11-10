@@ -8,6 +8,7 @@ import com.gsm2computer.bridge.DialStatus
 import com.gsm2computer.bridge.EndpointRace
 import com.gsm2computer.bridge.HubConnectionRoutine
 import com.gsm2computer.bridge.HubEndpoint
+import com.gsm2computer.bridge.HubEndpoints
 import com.gsm2computer.bridge.HubLink
 import com.gsm2computer.bridge.diag.BridgeLog
 import com.gsm2computer.bridge.diag.HubLinkGrace
@@ -157,9 +158,9 @@ class HubStreamClient(
                     )
                     if (baseDelay == null) {
                         val why = if (!stillOffHook) {
-                            "hub link down and the call is not off-hook: $pending"
+                            "hub link down and the call is not off-hook: ${safeLog(pending)}"
                         } else {
-                            "hub link grace expired after ${linkGraceMs}ms: $pending"
+                            "hub link grace expired after ${linkGraceMs}ms: ${safeLog(pending)}"
                         }
                         fail(why)
                         return
@@ -172,20 +173,21 @@ class HubStreamClient(
                     }
                     retrying = true
                     val delay = baseDelay + ((grace.attempt * 173L) % 500L)
+                    val reason = safeLog(pending)
                     linkState = "hold"
-                    sink?.onLinkHold(true, pending)
+                    sink?.onLinkHold(true, reason)
                     trace(
                         "reconnect",
                         mapOf(
                             "attempt" to grace.attempt,
                             "delay_ms" to delay,
-                            "message" to pending,
+                            "message" to reason,
                             "session_id" to sessionId,
                         ),
                     )
                     BridgeLog.w(
                         "reconnect attempt=${grace.attempt} delayMs=$delay " +
-                            "reason=${pending.take(160)}",
+                            "reason=${reason.take(160)}",
                     )
                     if (delay > 0 && !sleepMs(delay)) return
                     if (closed) return
@@ -254,18 +256,19 @@ class HubStreamClient(
                 loggedGraceHold = false
                 retrying = false
                 sink?.onLinkHold(false, "hub ws open")
+                val entrance = HubEndpoints.entranceKind(request.endpoint.url)
                 trace(
                     "ws_open",
-                    mapOf("session_id" to sessionId, "endpoint" to request.endpoint.url),
+                    mapOf("session_id" to sessionId, "entrance" to entrance),
                 )
                 BridgeLog.i(
-                    "ws open endpoint=${request.endpoint.url} session=${sessionId.ifBlank { "-" }}",
+                    "ws open entrance=$entrance session=${sessionId.ifBlank { "-" }}",
                 )
                 val openAi = request.endpoint.url.startsWith("wss://api.openai.com")
                 if (hubOwnedSession && !openAi) {
                     Log.i(TAG, "WS OPEN — hub owns session (skip session.update / greeting)")
                     sendClientAudio(webSocket)
-                    sink?.onStatus("Hub WS connected ${request.endpoint.url}")
+                    sink?.onStatus("Hub WS connected $entrance")
                 } else {
                     Log.i(TAG, "WS OPEN — sending session.update")
                     sink?.onStatus("OpenAI WS connected ($voice)")
@@ -286,20 +289,21 @@ class HubStreamClient(
                     finish(null, false)
                     return
                 }
+                val safeDetail = safeLog(detail)
                 if (code == 1000) {
-                    BridgeLog.i("ws closed code=$code reason=${detail.take(120)}")
-                    trace("ws_closed", mapOf("code" to code, "reason" to detail, "local" to false))
-                    finish("$FATAL_PREFIX Hub WS closed ($code $detail)", true)
+                    BridgeLog.i("ws closed code=$code reason=${safeDetail.take(120)}")
+                    trace("ws_closed", mapOf("code" to code, "reason" to safeDetail, "local" to false))
+                    finish("$FATAL_PREFIX Hub WS closed ($code $safeDetail)", true)
                 } else if (code <= 0) {
-                    val msg = "Hub WS failure (code=$code): $detail"
+                    val msg = "Hub WS failure (code=$code): $safeDetail"
                     Log.e(TAG, msg)
-                    BridgeLog.e("ws failure code=$code msg=${detail.take(160)}")
-                    trace("ws_failure", mapOf("code" to code, "message" to detail))
+                    BridgeLog.e("ws failure code=$code msg=${safeDetail.take(160)}")
+                    trace("ws_failure", mapOf("code" to code, "message" to safeDetail))
                     finish(msg, false)
                 } else {
-                    BridgeLog.i("ws closed code=$code reason=${detail.take(120)}")
-                    trace("ws_closed", mapOf("code" to code, "reason" to detail, "local" to false))
-                    finish("Hub WS closed ($code $detail)", false)
+                    BridgeLog.i("ws closed code=$code reason=${safeDetail.take(120)}")
+                    trace("ws_closed", mapOf("code" to code, "reason" to safeDetail, "local" to false))
+                    finish("Hub WS closed ($code $safeDetail)", false)
                 }
             }
         }
@@ -320,7 +324,7 @@ class HubStreamClient(
                 BridgeLog.i(
                     "hub dial pass=${attempt.pass} index=${attempt.index} " +
                         "outcome=${attempt.outcome} http=${attempt.httpStatus} " +
-                        "detail=${attempt.detail.take(120)}",
+                        "detail=${safeLog(attempt.detail).take(120)}",
                 )
             },
             onRace = { activeRace = it },
@@ -459,14 +463,17 @@ class HubStreamClient(
     }
 
     private fun fail(message: String) {
+        val safe = safeLog(message)
         retrying = false
         if (closed) return
         linkState = "closed"
-        Log.e(TAG, message)
-        BridgeLog.e("ws give up: ${message.take(160)}")
-        trace("ws_give_up", mapOf("message" to message, "session_id" to sessionId))
-        sink?.onError(message)
+        Log.e(TAG, safe)
+        BridgeLog.e("ws give up: ${safe.take(160)}")
+        trace("ws_give_up", mapOf("message" to safe, "session_id" to sessionId))
+        sink?.onError(safe)
     }
+
+    private fun safeLog(text: String): String = HubEndpoints.redactHubHosts(text)
 
     private fun trace(kind: String, fields: Map<String, Any?>) {
         try {

@@ -46,6 +46,9 @@ class CallOrchestrator(
 
     @Volatile var listener: OrchestratorListener? = null
 
+    /** Production reads [Call.getState]. Tests replace this with a throwing read. */
+    internal var readGsmState: (Call?) -> Int = { call -> call?.state ?: -1 }
+
     interface OrchestratorListener {
         fun onStateChanged(state: BridgeState, info: String)
         fun onError(error: String)
@@ -166,9 +169,12 @@ class CallOrchestrator(
         if (call !== activeGsmCall) {
             return
         }
-        noteTelecom(call)
-        if (state == Call.STATE_DISCONNECTED && bridgeState != BridgeState.IDLE) {
-            tearDown("GSM call disconnected")
+        try {
+            noteTelecom(call, state)
+        } finally {
+            if (state == Call.STATE_DISCONNECTED && bridgeState != BridgeState.IDLE) {
+                tearDown("GSM call disconnected")
+            }
         }
     }
 
@@ -177,9 +183,12 @@ class CallOrchestrator(
             Log.i(TAG, "Waiting/rejected GSM call ended; live call unchanged")
             return
         }
-        noteTelecom(call)
-        if (bridgeState != BridgeState.IDLE) {
-            tearDown("GSM call ended")
+        try {
+            noteTelecom(call)
+        } finally {
+            if (bridgeState != BridgeState.IDLE) {
+                tearDown("GSM call ended")
+            }
         }
     }
 
@@ -191,7 +200,7 @@ class CallOrchestrator(
         HubEndpoints.missingDeviceTokenWarning(cfg.endpoints)?.let { Log.w(TAG, it) }
         Log.i(
             TAG,
-            "Opening hub stream (endpoints=${endpoints.joinToString { it.url }} " +
+            "Opening hub stream (entrances=${endpoints.joinToString { HubEndpoints.entranceKind(it.url) }} " +
                 "model=${cfg.streamModel} voice=${cfg.streamVoice} hubOwned=${cfg.hubOwnedSession})",
         )
         bridgeState = BridgeState.CONNECTING
@@ -283,7 +292,24 @@ class CallOrchestrator(
     @Synchronized
     private fun tearDown(reason: String) {
         if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) return
-        if (GsmCallManager.isMotoProfile()) GsmCallManager.restoreBridgedAudio("teardown")
+        val client = activeClient
+        try {
+            tearDownBody(reason)
+        } finally {
+            try {
+                client?.stop()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping hub socket: ${e.message}")
+            }
+        }
+    }
+
+    private fun tearDownBody(reason: String) {
+        try {
+            if (GsmCallManager.isMotoProfile()) GsmCallManager.restoreBridgedAudio("teardown")
+        } catch (e: Exception) {
+            Log.w(TAG, "profile unreadable during teardown: ${e.message}")
+        }
         val party = if (reason.startsWith("GSM call")) partyFromCause(activeGsmCall) else "local"
         Log.i(TAG, "Tearing down: $reason end=$party cause=$traceDisconnect")
         callTrace?.event(
@@ -377,9 +403,29 @@ class CallOrchestrator(
         }
     }
 
-    private fun noteTelecom(call: Call?) {
-        traceTelecomState = telecomLabel(call?.state ?: -1)
-        traceDisconnect = disconnectLabel(call)
+    private fun noteTelecom(call: Call?, state: Int? = null) {
+        val resolved = if (state != null) {
+            state
+        } else {
+            try {
+                readGsmState(call)
+            } catch (e: Exception) {
+                Log.w(TAG, "gsm state unreadable: ${e.message}")
+                -1
+            }
+        }
+        traceTelecomState = try {
+            telecomLabel(resolved)
+        } catch (e: Exception) {
+            Log.w(TAG, "gsm state unreadable: ${e.message}")
+            "unreadable"
+        }
+        traceDisconnect = try {
+            disconnectLabel(call)
+        } catch (e: Exception) {
+            Log.w(TAG, "disconnect cause unreadable: ${e.message}")
+            ""
+        }
     }
 
     private fun partyFromCause(call: Call?): String {

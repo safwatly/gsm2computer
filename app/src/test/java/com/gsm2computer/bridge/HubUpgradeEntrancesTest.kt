@@ -86,12 +86,32 @@ class HubUpgradeEntrancesTest {
     fun missingTokenOnThePublicEntranceIsRetryable() {
         val detail = HubEndpoints.missingTokenRejection(PUBLIC, 401, tokenBlank = true)
         assertEquals(
-            "device token unset; $PUBLIC rejected the call, trying the next endpoint",
+            "device token unset; public rejected the call, trying the next endpoint",
             detail,
         )
+        assertFalse(detail!!.contains("ta3leam"))
+        assertFalse(detail.contains("100.113"))
         assertEquals(DialStatus.RETRYABLE, classifyHubStatus(401, ""))
         assertNull(HubEndpoints.missingTokenRejection(PUBLIC, 401, tokenBlank = false))
         assertNull(HubEndpoints.missingTokenRejection(TAILSCALE, 500, tokenBlank = true))
+    }
+
+    @Test
+    fun logsNameTheEntranceAndDropTheHost() {
+        assertEquals("public", HubEndpoints.entranceKind(PUBLIC))
+        assertEquals("tailscale", HubEndpoints.entranceKind(TAILSCALE))
+        val okHttp = "failed to connect to gsm.ta3leam.com/1.2.3.4:443 from /100.113.222.47 (port 8787)"
+        val redacted = HubEndpoints.redactHubHosts(okHttp)
+        assertFalse(redacted.contains("ta3leam"))
+        assertFalse(redacted.contains("100.113"))
+        assertFalse(redacted.contains("1.2.3.4"))
+        assertTrue(redacted.contains("public"))
+        assertTrue(redacted.contains("tailscale"))
+        val startup = "Opening hub stream (entrances=${
+            listOf(PUBLIC, TAILSCALE).joinToString { HubEndpoints.entranceKind(it) }
+        })"
+        assertFalse(startup.contains("ta3leam"))
+        assertFalse(startup.contains("100.113"))
     }
 
     @Test
@@ -118,6 +138,8 @@ class HubUpgradeEntrancesTest {
         assertEquals(TAILSCALE, result.url)
         assertTrue(result.attempts[0].detail.contains("device token unset"))
         assertTrue(result.attempts[0].detail.contains("trying the next endpoint"))
+        assertFalse(result.attempts[0].detail.contains("ta3leam"))
+        assertFalse(result.attempts[0].detail.contains("100.113"))
         assertFalse(result.summary().contains(token))
     }
 
