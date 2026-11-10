@@ -721,6 +721,11 @@ class CdpSession:
             self._pending.pop(req_id, None)
             await self.close()
             raise TalkUiError(f"CDP {method} timed out after {timeout_s:.1f}s") from None
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException. The Exception handler below
+            # does not run, and a leaked id would complete into a dead waiter.
+            self._pending.pop(req_id, None)
+            raise
         except Exception:
             self._pending.pop(req_id, None)
             raise
@@ -991,6 +996,37 @@ async def pin_phone_uplink_volume() -> None:
             LOG.info("pinned %s volume %s to 100%%", kind, target)
 
 
+async def _swallow_task(task: asyncio.Task) -> None:
+    """Wait out a child without adopting its cancellation.
+
+    On Python 3.12, ``await`` of a cancelled child can leave this task
+    cancelling, so the next await raises CancelledError too. ``asyncio.wait``
+    plus ``Task.result`` does not. A cancel that belongs to this task is
+    re-raised.
+    """
+    current = asyncio.current_task()
+    cancelling = current.cancelling() if current is not None else 0
+    if not task.done():
+        await asyncio.wait({task})
+    if current is not None and current.cancelling() > cancelling:
+        raise asyncio.CancelledError
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        LOG.debug("talk page navigate ended after cancel", exc_info=True)
+
+
+def _clear_task_cancel() -> None:
+    """Drop this task's cancel count so a following await can run."""
+    current = asyncio.current_task()
+    if current is None:
+        return
+    while current.cancelling():
+        current.uncancel()
+
+
 class OpenClawTalkUI:
     """Start/stop Control UI Talk in a dedicated Chromium via CDP."""
 
@@ -1004,6 +1040,9 @@ class OpenClawTalkUI:
         self.last_state: dict[str, Any] = {}
         self.idle_check = None  # synchronous hub call-slot guard; unknown blocks healing
         self.page_heal_in_progress = False
+        # Sockets that have announced themselves and not yet claimed the slot.
+        # Claim is what flips idle_check, and it runs after the heal wait.
+        self.pending_admissions = 0
         self._page_heal_after = 0.0
         self._health_cache: dict[str, Any] = {}
         self._health_checked_at: Optional[float] = None
@@ -1450,7 +1489,16 @@ class OpenClawTalkUI:
         finally:
             await session.close()
 
+    def note_pending_admission(self, waiting: bool) -> None:
+        """A device socket is in the heal wait, or has left it."""
+        if waiting:
+            self.pending_admissions += 1
+        elif self.pending_admissions > 0:
+            self.pending_admissions -= 1
+
     def _idle_for_page_heal(self) -> bool:
+        if self.pending_admissions > 0:
+            return False
         return not self.talk_active and self.idle_check is not None and self.idle_check() is True
 
     async def _heal_page_url(self, session: CdpSession, page: dict) -> str:
@@ -1467,11 +1515,74 @@ class OpenClawTalkUI:
                 return "already corrected"
             # Arm cooldown only when we actually attempt navigation (incl. CDP failures).
             self._page_heal_after = time.monotonic() + 120.0
+            if not self._idle_for_page_heal():
+                return "blocked: call claimed before navigate"
             LOG.warning("Talk page URL heal: navigating to /chat/main (idle; cooldown 120s)")
-            await session.call("Page.navigate", {"url": chat_main_url()})
-            return "navigation requested"
+            return await self._navigate_unless_call_claims(session)
         finally:
             self.page_heal_in_progress = False
+
+    async def _navigate_unless_call_claims(self, session: CdpSession) -> str:
+        """Send Page.navigate, and stop it if a call is waiting or this task is cancelled.
+
+        Page.navigate returns when the load starts, so the document is still
+        loading. A pending admission makes this idle check false before
+        live_call.claim runs. A cancelled health probe must stop the load too:
+        the in-progress flag is cleared as soon as this function leaves.
+        """
+        navigate = asyncio.create_task(
+            session.call("Page.navigate", {"url": chat_main_url()}),
+            name="talk-page-heal-navigate",
+        )
+        stopped = False
+
+        async def stop_loading() -> None:
+            nonlocal stopped
+            if stopped:
+                return
+            stopped = True
+            try:
+                await session.call("Page.stopLoading")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOG.warning("Talk page stopLoading after a claimed call failed: %s", exc)
+
+        async def abandon_navigate() -> None:
+            if not navigate.done():
+                navigate.cancel()
+                await _swallow_task(navigate)
+            await stop_loading()
+
+        try:
+            while True:
+                if not self._idle_for_page_heal():
+                    await abandon_navigate()
+                    LOG.warning("Talk page URL heal aborted: call claimed during navigate")
+                    return "aborted: call claimed during navigate"
+                if navigate.done():
+                    navigate.result()
+                    # The CDP call returns at the start of the load. A call that
+                    # arrived while it was in flight still needs the document stopped.
+                    if not self._idle_for_page_heal():
+                        await stop_loading()
+                        LOG.warning(
+                            "Talk page URL heal aborted: call waiting after navigate returned"
+                        )
+                        return "aborted: call claimed during navigate"
+                    return "navigation requested"
+                await asyncio.wait({navigate}, timeout=0.05)
+        except asyncio.CancelledError:
+            # The 2.5s health probe cancels this task. Awaiting stopLoading
+            # while the cancel count is still set just raises again.
+            _clear_task_cancel()
+            await abandon_navigate()
+            raise
+        finally:
+            if not navigate.done():
+                navigate.cancel()
+                await _swallow_task(navigate)
+                await stop_loading()
 
     async def ensure_browser(self) -> None:
         if await cdp_ready() and browser_pid() is not None:

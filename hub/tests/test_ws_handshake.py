@@ -55,7 +55,7 @@ class HandshakeTests(unittest.IsolatedAsyncioTestCase):
             hub.live_call.release()
         hub.active_bridge = None
 
-    async def test_page_heal_does_not_503_or_block_the_handshake(self) -> None:
+    async def test_page_heal_does_not_503_and_the_wait_is_bounded(self) -> None:
         ui = OpenClawTalkUI()
         ui.page_heal_in_progress = True
         called = {"n": 0}
@@ -81,7 +81,8 @@ class HandshakeTests(unittest.IsolatedAsyncioTestCase):
         body = bytes(writer.buf)
         self.assertNotIn(b"503", body)
         self.assertIn(b"409", body)
-        self.assertLess(elapsed, 0.3)
+        self.assertGreater(elapsed, hub.HEAL_ADMISSION_WAIT_S - 0.15)
+        self.assertLess(elapsed, hub.HEAL_ADMISSION_WAIT_S + 0.6)
         self.assertEqual(0, called["n"])
         text = "\n".join(logs.output)
         self.assertIn("device ws handshake attempt", text)
@@ -90,6 +91,34 @@ class HandshakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("peer=('203.0.113.8', 44000)", text)
         self.assertIn("device=moto-g84", text)
         self.assertIn("entrance=tailscale", text)
+
+    async def test_pending_admission_is_visible_before_the_heal_wait(self) -> None:
+        ui = OpenClawTalkUI()
+        ui.idle_check = lambda: True
+        ui.page_heal_in_progress = True
+        real = ui.note_pending_admission
+
+        def wrapped(waiting: bool) -> None:
+            real(waiting)
+            if waiting:
+                self.assertTrue(ui.idle_check())
+                self.assertFalse(ui._idle_for_page_heal())
+                ui.page_heal_in_progress = False
+
+        ui.note_pending_admission = wrapped
+        writer = _Writer()
+        device = hub._current_device_id.set("moto-g84")
+        try:
+            with patch.object(hub.live_call, "claim", return_value=False), patch.object(
+                hub, "get_talk_ui", return_value=ui
+            ):
+                await hub.handle_websocket(None, writer, _headers(), "/")  # type: ignore[arg-type]
+        finally:
+            hub._current_device_id.reset(device)
+        self.assertIn(b"409", bytes(writer.buf))
+        self.assertNotIn(b"503", bytes(writer.buf))
+        self.assertEqual(0, ui.pending_admissions)
+        self.assertFalse(hub.live_call.busy)
 
     async def test_admission_error_is_logged_with_peer_and_device(self) -> None:
         writer = _Writer()
