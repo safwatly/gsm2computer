@@ -17,6 +17,7 @@ import os
 import signal
 import socket
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -492,6 +493,16 @@ def cdp_available(timeout_s: float = 0.8) -> bool:
         return True
     except (URLError, TimeoutError, json.JSONDecodeError, OSError, socket.timeout):
         return False
+
+
+async def cdp_ready(timeout_s: float = 0.8) -> bool:
+    """Version probe on a worker thread. urllib on the event loop blocks WS accept."""
+    return await asyncio.to_thread(cdp_available, timeout_s)
+
+
+async def cdp_http(path: str, timeout_s: float = 2.0, *, method: str = "GET") -> Any:
+    """CDP HTTP off the event loop. wait_for cannot interrupt a blocking urlopen."""
+    return await asyncio.to_thread(partial(_cdp_http, path, timeout_s, method=method))
 
 
 def _read_proc_environ(pid: int) -> dict[str, str]:
@@ -994,6 +1005,10 @@ class OpenClawTalkUI:
         self.idle_check = None  # synchronous hub call-slot guard; unknown blocks healing
         self.page_heal_in_progress = False
         self._page_heal_after = 0.0
+        self._health_cache: dict[str, Any] = {}
+        self._health_checked_at: Optional[float] = None
+        self._health_error: Optional[str] = None
+        self._maint_task: Optional[asyncio.Task] = None
 
     @property
     def audio_frames(self) -> int:
@@ -1151,7 +1166,7 @@ class OpenClawTalkUI:
 
         async def _mid() -> None:
             await asyncio.sleep(DIAG_MID_CALL_S)
-            if not self.talk_active or self.talk_started_at != started or not cdp_available():
+            if not self.talk_active or self.talk_started_at != started or not await cdp_ready():
                 return
             try:
                 session = await self._connect_page()
@@ -1169,7 +1184,7 @@ class OpenClawTalkUI:
 
     async def talk_session_healthy(self) -> Optional[bool]:
         """Return whether Talk has a connected WebRTC transport (None if CDP unavailable)."""
-        if not cdp_available():
+        if not await cdp_ready():
             return None
         try:
             session = await self._connect_page()
@@ -1190,7 +1205,7 @@ class OpenClawTalkUI:
         self.talk_active = False
         self.webrtc_connected = False
         self.talk_started_at = None
-        if not cdp_available():
+        if not await cdp_ready():
             return
         try:
             session = await self._connect_page()
@@ -1252,7 +1267,7 @@ class OpenClawTalkUI:
         """Soft heal only while idle; repair URL before accepting readiness."""
         if not self._idle_for_page_heal():
             raise TalkUiError("refusing Control UI reload: idle not confirmed")
-        if not cdp_available():
+        if not await cdp_ready():
             raise TalkUiError("cdp unavailable for control ui reload")
         session = await self._connect_page(read_only=True)
         try:
@@ -1308,7 +1323,7 @@ class OpenClawTalkUI:
             deadline = time.monotonic() + 12.0
             still_live = True
             while time.monotonic() < deadline:
-                if not cdp_available():
+                if not await cdp_ready():
                     await asyncio.sleep(0.35)
                     continue
                 try:
@@ -1340,13 +1355,63 @@ class OpenClawTalkUI:
 
     async def stop(self) -> None:
         self._closed = True
+        task = self._maint_task
+        if task is not None and not task.done():
+            task.cancel()
         await self.stop_talk()
 
+    def health_snapshot(self) -> dict[str, Any]:
+        """Last Talk probe. No CDP and no navigate — safe on GET /health."""
+        info = dict(self._health_cache)
+        info.setdefault("cdp", None)
+        info.setdefault("browser_pid", None)
+        info.setdefault("user_data_dir", str(USER_DATA_DIR))
+        info.setdefault("pulse_source", PHONE_UPLINK_MONITOR)
+        info.setdefault("pulse_sink", OPENCLAW_BUS)
+        info.setdefault("url", control_ui_url())
+        info.setdefault("page", None)
+        info["talk_active"] = self.talk_active
+        info["webrtc_connected"] = self.webrtc_connected
+        checked = self._health_checked_at
+        info["age_s"] = None if checked is None else round(max(0.0, time.monotonic() - checked), 3)
+        if self._health_error and "error" not in info:
+            info["error"] = self._health_error
+        return info
+
+    def schedule_maintenance(self) -> None:
+        """Refresh Talk status, including URL heal, off the request that asked."""
+        task = self._maint_task
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._maint_task = loop.create_task(self._maintenance_loop())
+
+    async def _maintenance_loop(self) -> None:
+        while not self._closed:
+            try:
+                await asyncio.wait_for(self._refresh_cached_health(), timeout=8.0)
+            except asyncio.TimeoutError:
+                self._health_error = "talk probe timed out"
+                LOG.warning("talk health refresh timed out")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._health_error = str(exc)
+                LOG.warning("talk health refresh failed: %s", exc)
+            await asyncio.sleep(30.0)
+
     async def health(self) -> dict[str, Any]:
-        pid = browser_pid()
+        """Live probe for the CLI. The hub HTTP handler uses [health_snapshot]."""
+        await self._refresh_cached_health()
+        return self.health_snapshot()
+
+    async def _refresh_cached_health(self) -> None:
         info: dict[str, Any] = {
-            "cdp": cdp_available(),
-            "browser_pid": pid,
+            "cdp": await cdp_ready(),
+            "browser_pid": browser_pid(),
             "user_data_dir": str(USER_DATA_DIR),
             "pulse_source": PHONE_UPLINK_MONITOR,
             "pulse_sink": OPENCLAW_BUS,
@@ -1354,18 +1419,22 @@ class OpenClawTalkUI:
             "webrtc_connected": self.webrtc_connected,
             "url": control_ui_url(),
         }
-        if not info["cdp"]:
-            return info
-        # Never let a wedged CDP block /health (and thus e2e idle checks).
-        try:
-            info["page"] = await asyncio.wait_for(self._health_page_probe(), timeout=2.5)
-        except asyncio.TimeoutError:
-            info["error"] = "cdp probe timed out"
-            info["cdp_wedged"] = True
-            LOG.warning("talk health CDP probe timed out")
-        except Exception as exc:
-            info["error"] = str(exc)
-        return info
+        if info["cdp"]:
+            try:
+                info["page"] = await asyncio.wait_for(self._health_page_probe(), timeout=2.5)
+                self._health_error = None
+            except asyncio.TimeoutError:
+                info["error"] = "cdp probe timed out"
+                info["cdp_wedged"] = True
+                self._health_error = info["error"]
+                LOG.warning("talk health CDP probe timed out")
+            except Exception as exc:
+                info["error"] = str(exc)
+                self._health_error = str(exc)
+        else:
+            self._health_error = None
+        self._health_cache = info
+        self._health_checked_at = time.monotonic()
 
     async def _health_page_probe(self) -> dict[str, Any]:
         session = await self._connect_page(read_only=True)
@@ -1405,9 +1474,9 @@ class OpenClawTalkUI:
             self.page_heal_in_progress = False
 
     async def ensure_browser(self) -> None:
-        if cdp_available() and browser_pid() is not None:
+        if await cdp_ready() and browser_pid() is not None:
             return
-        if cdp_available():
+        if await cdp_ready():
             LOG.warning("cdp port %s is up but talk chromium pid was not found", CDP_PORT)
             return
         env = chromium_launch_env()
@@ -1435,7 +1504,7 @@ class OpenClawTalkUI:
                 if self._proc.stderr:
                     err = (await self._proc.stderr.read())[-500:].decode("utf-8", "replace")
                 raise TalkUiError(f"talk chromium exited rc={self._proc.returncode} {err}")
-            if cdp_available():
+            if await cdp_ready():
                 LOG.info("talk chromium cdp ready pid=%s", self._proc.pid)
                 return
             await asyncio.sleep(0.2)
@@ -1466,7 +1535,7 @@ class OpenClawTalkUI:
         except ImportError as exc:
             raise TalkUiError("websockets package required for Control UI CDP") from exc
         try:
-            targets = _cdp_http("/json/list", timeout_s=2.0)
+            targets = await cdp_http("/json/list", timeout_s=2.0)
         except Exception as exc:
             raise TalkUiError(f"cdp list failed: {exc}") from exc
 
@@ -1509,7 +1578,7 @@ class OpenClawTalkUI:
                     tid = None if read_only else target.get("id")
                     if tid:
                         try:
-                            _cdp_http(f"/json/close/{tid}", timeout_s=2.0)
+                            await cdp_http(f"/json/close/{tid}", timeout_s=2.0)
                         except Exception:
                             pass
                     continue
@@ -1532,14 +1601,14 @@ class OpenClawTalkUI:
         from urllib.parse import quote, urlencode
 
         try:
-            fresh = _cdp_http(
+            fresh = await cdp_http(
                 "/json/new?" + urlencode({"url": control_ui_url_with_token()}),
                 timeout_s=5.0,
                 method="PUT",
             )
         except Exception:
             try:
-                fresh = _cdp_http(
+                fresh = await cdp_http(
                     "/json/new/" + quote(control_ui_url_with_token(), safe=""),
                     timeout_s=5.0,
                 )
