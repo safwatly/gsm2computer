@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 from urllib.request import Request, urlopen
 
 LOG = logging.getLogger("gsm2computer-hub.grokbot")
@@ -105,10 +105,45 @@ function gsm2VoiceSessions(root) {
   }
   return sessions;
 }
+function gsm2DesktopSpeaker(label) {
+  const text = String(label || "").replace(/\s+/g, " ").trim().toLowerCase();
+  if (text === "your message") return "caller";
+  if (text.endsWith(" message")) return "assistant";
+  return null;
+}
+function gsm2DesktopTurns(root) {
+  const doc = root || document;
+  const log = (doc.querySelector && doc.querySelector('[role="log"][aria-label="Conversation transcript"]')) || doc;
+  const nodes = Array.from(log.querySelectorAll('[role="group"][aria-label$="message"]'));
+  const outer = nodes.filter((node) => !nodes.some((other) => other !== node && node.contains && node.contains(other)));
+  const turns = [];
+  for (const node of outer) {
+    const speaker = gsm2DesktopSpeaker(node.getAttribute && node.getAttribute("aria-label"));
+    if (!speaker) continue;
+    const text = gsm2Text(node);
+    if (!text) continue;
+    turns.push({ speaker: speaker, text: text, timestamp: gsm2Stamp(node) });
+  }
+  return turns;
+}
 """
 
 _READ_EXPR = VOICE_DOM_JS + "\ngsm2VoiceTurns(document)"
+_DESKTOP_READ_EXPR = VOICE_DOM_JS + "\ngsm2DesktopTurns(document)"
 _SESSIONS_EXPR = VOICE_DOM_JS + "\ngsm2VoiceSessions(document)"
+# Grok Bot desktop shell. Not a grok.com host. The chat DOM is different.
+_DESKTOP_RENDERER_SUFFIX = "/resources/app.asar/dist/renderer/index.html"
+
+
+def _is_desktop_renderer_url(url: str) -> bool:
+    """True only for the Electron renderer page, not any other file:// URL."""
+    parts = urlsplit(url or "")
+    if parts.scheme != "file":
+        return False
+    path = unquote(parts.path or "").replace("\\", "/")
+    if path and not path.startswith("/"):
+        path = "/" + path
+    return path.endswith(_DESKTOP_RENDERER_SUFFIX)
 
 
 def _is_grok_url(url: str) -> bool:
@@ -498,7 +533,8 @@ def _grok_page(targets: Any) -> Optional[dict[str, Any]]:
         return None
     pages = [t for t in targets if isinstance(t, dict) and t.get("type") == "page"]
     for page in pages:
-        if not _is_grok_url(str(page.get("url") or "")):
+        page_url = str(page.get("url") or "")
+        if not (_is_grok_url(page_url) or _is_desktop_renderer_url(page_url)):
             continue
         ws_url = str(page.get("webSocketDebuggerUrl") or "")
         if not _loopback_ws(ws_url):
@@ -611,9 +647,9 @@ async def read_voice_turns(
         raise RuntimeError("CDP URL is not a loopback HTTP endpoint")
     list_url = base if base.endswith("/json/list") else base + "/json/list"
 
-    async def _turns_from(ws: Any, nid: list[int]) -> list[dict[str, Any]]:
+    async def _turns_from(ws: Any, nid: list[int], expression: str = _READ_EXPR) -> list[dict[str, Any]]:
         _raise_if_abort(abort)
-        turns = _loads_list(await _cdp_eval(ws, nid, _READ_EXPR))
+        turns = _loads_list(await _cdp_eval(ws, nid, expression))
         return [t for t in turns if isinstance(t, dict)]
 
     async def _once() -> Any:
@@ -628,6 +664,9 @@ async def read_voice_turns(
         nid = [0]
         async with websockets.connect(ws_url, open_timeout=4, max_size=4_000_000) as ws:
             _raise_if_abort(abort)
+            # The desktop shell has no /c/ voice links. The open Suzie chat is the transcript.
+            if _is_desktop_renderer_url(str(page.get("url") or "")):
+                return await _turns_from(ws, nid, _DESKTOP_READ_EXPR)
             sessions = await _cdp_eval(ws, nid, _SESSIONS_EXPR)
             choice = select_voice_session(sessions, started_at, ended_at)
             if choice.get("status") != "chosen":

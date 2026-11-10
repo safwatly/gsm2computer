@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -154,6 +155,45 @@ class CdpBaseTests(unittest.TestCase):
         self.assertFalse(gt._loopback_ws("ws://203.0.113.5:9333/devtools/page/1"))
         self.assertTrue(gt._loopback_ws("ws://127.0.0.1:9333/devtools/page/2"))
 
+    def test_desktop_renderer_url_is_a_grok_page_on_loopback_only(self) -> None:
+        live = "file:///opt/Grok%20Bot/resources/app.asar/dist/renderer/index.html"
+        self.assertTrue(gt._is_desktop_renderer_url(live))
+        self.assertTrue(
+            gt._is_desktop_renderer_url(
+                "file:///opt/Grok Bot/resources/app.asar/dist/renderer/index.html"
+            )
+        )
+        self.assertFalse(gt._is_grok_url(live))
+        self.assertFalse(gt._is_desktop_renderer_url("file:///tmp/index.html"))
+        self.assertFalse(gt._is_desktop_renderer_url("file:///etc/passwd"))
+        self.assertFalse(
+            gt._is_desktop_renderer_url(
+                "file:///opt/Grok%20Bot/resources/app.asar/dist/renderer/other.html"
+            )
+        )
+        self.assertFalse(
+            gt._is_desktop_renderer_url(
+                "file:///opt/Grok%20Bot/resources/app.asar/dist/renderer/index.html.bak"
+            )
+        )
+        self.assertFalse(
+            gt._is_desktop_renderer_url(
+                "https://evil.example/resources/app.asar/dist/renderer/index.html"
+            )
+        )
+        page = {
+            "type": "page",
+            "url": live,
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9230/devtools/page/1",
+        }
+        self.assertEqual(gt._grok_page([page])["webSocketDebuggerUrl"], page["webSocketDebuggerUrl"])
+        public = dict(page, webSocketDebuggerUrl="ws://203.0.113.5:9230/devtools/page/1")
+        self.assertIsNone(gt._grok_page([public]))
+        other = dict(page, url="file:///tmp/notes.html")
+        self.assertIsNone(gt._grok_page([other]))
+        src = inspect.getsource(gt.read_voice_turns)
+        self.assertLess(src.index("_is_desktop_renderer_url"), src.index("select_voice_session"))
+
 
 class DomJsTests(unittest.TestCase):
     def test_voice_dom_reads_both_sides_and_picks_the_session(self) -> None:
@@ -224,6 +264,61 @@ assert.strictEqual(turns[1].timestamp, '0:04');
 const sessions = gsm2VoiceSessions(root);
 assert.deepStrictEqual(sessions.map((s) => s.href), ['/c/voice-1']);
 assert.strictEqual(sessions[0].started, '2026-11-09T12:00:30Z');
+""" % gt.VOICE_DOM_JS
+        proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+
+    def test_desktop_renderer_dom_is_not_the_grok_com_selectors(self) -> None:
+        script = r"""
+const assert = require('assert');
+%s
+class El {
+  constructor(attrs, text, children) {
+    this.attrs = attrs || {};
+    this.text = text || '';
+    this.children = children || [];
+    this.parent = null;
+    for (const child of this.children) child.parent = this;
+  }
+  getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; }
+  get innerText() { return this.text || this.children.map((c) => c.innerText).filter(Boolean).join(' '); }
+  get textContent() { return this.innerText; }
+  querySelectorAll(sel) { return this._all().filter((el) => el !== this && match(el, sel)); }
+  querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+  _all() { return [this, ...this.children.flatMap((c) => c._all())]; }
+  contains(other) { return this._all().includes(other); }
+  cloneNode() { return new El({...this.attrs}, this.text, this.children.map((c) => c.cloneNode())); }
+}
+function match(el, sel) {
+  if (sel === '.sr-only, .thinking-container, time') return false;
+  if (sel === '[role="log"][aria-label="Conversation transcript"]') {
+    return el.attrs.role === 'log' && el.attrs['aria-label'] === 'Conversation transcript';
+  }
+  if (sel === '[role="group"][aria-label$="message"]') {
+    return el.attrs.role === 'group' && String(el.attrs['aria-label'] || '').endsWith('message');
+  }
+  if (sel === '[data-testid="user-message"], [data-testid="assistant-message"], div.message-bubble') return false;
+  if (sel === 'a[href^="/c/"]') return false;
+  return false;
+}
+const log = new El({ role: 'log', 'aria-label': 'Conversation transcript' }, '', [
+  new El({ role: 'group', 'aria-label': 'Your message' }, 'Need a ride', []),
+  new El({ role: 'group', 'aria-label': 'Suzie message' }, '', [
+    new El({ role: 'group', 'aria-label': 'Suzie message' }, 'On the way', []),
+  ]),
+  new El({ role: 'group', 'aria-label': 'Open exchange with Bob' }, 'not a turn', []),
+]);
+const root = new El({}, '', [
+  new El({ role: 'group', 'aria-label': 'Your message' }, 'outside the log', []),
+  log,
+]);
+assert.deepStrictEqual(gsm2VoiceTurns(root), []);
+const turns = gsm2DesktopTurns(root);
+assert.strictEqual(turns.length, 2);
+assert.strictEqual(turns[0].speaker, 'caller');
+assert.strictEqual(turns[0].text, 'Need a ride');
+assert.strictEqual(turns[1].speaker, 'assistant');
+assert.strictEqual(turns[1].text, 'On the way');
 """ % gt.VOICE_DOM_JS
         proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])

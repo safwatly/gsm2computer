@@ -91,7 +91,16 @@ an in-flight open. An unlabeled `/c/` chat is not opened. Zero matches are
 `ambiguous`. Turns that are not clearly the caller or the assistant are
 dropped. The page host must be `grok.com`, `grok.x.ai`, or `x.com/i/grok` — a
 host that merely contains the name is ignored — and `webSocketDebuggerUrl`
-must be loopback.
+must be loopback. The Grok Bot desktop shell is also accepted when that
+debugger socket is loopback and the page is exactly
+`file://…/resources/app.asar/dist/renderer/index.html` (the live page is
+`file:///opt/Grok%20Bot/resources/app.asar/dist/renderer/index.html`). Other
+`file://` URLs are ignored. That renderer is not the grok.com DOM: messages
+are `[role=group]` nodes labeled `Your message` or `<bot> message` inside
+the conversation log, not `data-testid` bubbles or `/c/` links. The reader
+uses the chat already on screen and does not click a sidebar bot. The list
+is virtualized, so only the mounted rows are saved; the reader does not
+scroll it.
 
 The read gives up after about 12 seconds. A new call does not wait that out:
 it aborts the reader (about 1 second) and then runs `patchbay switch`, so the
