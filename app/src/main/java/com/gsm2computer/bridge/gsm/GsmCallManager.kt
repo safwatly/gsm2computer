@@ -2,6 +2,7 @@ package com.gsm2computer.bridge.gsm
 
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
@@ -11,12 +12,15 @@ import android.telecom.InCallService
 import android.util.Log
 import com.gsm2computer.bridge.ApiMuteCaptureGuard
 import com.gsm2computer.bridge.ApiMuteTiming
+import com.gsm2computer.bridge.BridgeConfig
 import com.gsm2computer.bridge.DeviceProfile
+import com.gsm2computer.bridge.GatewayApp
 import com.gsm2computer.bridge.HangupRestore
 import com.gsm2computer.bridge.InjectPolicy
 import com.gsm2computer.bridge.MicApiAction
 import com.gsm2computer.bridge.MicRestoreGate
 import com.gsm2computer.bridge.MotoIdleMixers
+import com.gsm2computer.bridge.MotoVoiceVolume
 import com.gsm2computer.bridge.PolicyLogLevel
 import com.gsm2computer.bridge.RootShell
 import com.gsm2computer.bridge.TinymixTrace
@@ -268,7 +272,7 @@ object GsmCallManager {
                     }
                     if (mask and android.telecom.CallAudioState.ROUTE_BLUETOOTH != 0) {
                         val dev = if (Build.VERSION.SDK_INT >= 28) st?.supportedBluetoothDevices?.firstOrNull() else null
-                        if (dev != null) {
+                        if (Build.VERSION.SDK_INT >= 28 && dev != null) {
                             btPut("bt_device_name", safeName(dev))
                             try { svc.requestBluetoothAudio(dev) } catch (e: Exception) { btPut("bt_route_err", "requestBluetoothAudio: ${e.message}") }
                         }
@@ -413,7 +417,7 @@ object GsmCallManager {
                 voiceTxDecisionLogged = true
                 appLog("voice tx unmute policy=${injectPolicy.wire} action=session-tuple")
             }
-            VoiceTxMuteJob.schedule("call-active", { isCallActive }, debounceMs = 500) { appLog(it) }
+            VoiceTxMuteJob.schedule(VoiceTxMuteJob.CALL_ACTIVE, { isCallActive }, debounceMs = 500) { appLog(it) }
         } else if (isMotoProfile() && profile.routing.sessionVoiceTxUnmute && !voiceTxDecisionLogged) {
             voiceTxDecisionLogged = true
             appLog("voice tx unmute skipped policy=${injectPolicy.wire}")
@@ -495,19 +499,16 @@ object GsmCallManager {
         // MSM8930: minimum (1) — speaker silenced by muteVoiceRx via tinymix.
         // Exynos 9820: 80% — no muteVoiceRx, need loud speaker for mic capture.
         // Volume=0 can confuse audio policy into treating call as inactive.
+        // Moto, while the bridge is open: the stream maximum. Build 352 asked
+        // for 0 here (muteLocalEarpiece) and AudioService clamped that to 1 of
+        // 8, which left the telephony output's stream 0 at -inf. The saved
+        // index is restored when the bridge closes. A late pass after that
+        // must not write the minimum back over the restored index.
         try {
-            val vcVol = if (muteLocalEarpiece) {
-                // Relay mode: mute the local earpiece entirely. Capture uses
-                // VOICE_DOWNLINK and injection uses STREAM_MUSIC, so nothing here
-                // depends on STREAM_VOICE_CALL being audible.
-                0
-            } else if (profile.audio.voiceCallVolPercent > 0) {
-                val maxVc = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
-                (maxVc * profile.audio.voiceCallVolPercent / 100).coerceAtLeast(1)
-            } else {
-                1
+            val vcVol = voiceCallIndex(am)
+            if (vcVol != null) {
+                am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, vcVol, 0)
             }
-            am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, vcVol, 0)
         } catch (_: SecurityException) {}
         // Music stream controls incall_music injection level into
         // the modem uplink.  Lower value = quieter speaker + quieter
@@ -560,14 +561,21 @@ object GsmCallManager {
     fun restoreBridgedAudio(reason: String) {
         if (!isMotoProfile()) return
         muteLocalEarpiece = false
-        synchronized(audioLock) {
+        VoiceTxMuteJob.forget(VoiceTxMuteJob.CALL_ACTIVE)
+        val skipped = synchronized(audioLock) {
             if (!bridgeAudioOpen && !micGate.open) {
-                Log.i(TAG, "audio restore skipped reason=$reason")
-                return
+                true
+            } else {
+                bridgeAudioOpen = false
+                injectPolicyLatched = false
+                voiceTxDecisionLogged = false
+                false
             }
-            bridgeAudioOpen = false
-            injectPolicyLatched = false
-            voiceTxDecisionLogged = false
+        }
+        if (skipped) {
+            Log.i(TAG, "audio restore skipped reason=$reason")
+            restoreSavedVoiceVolume(currentAudioManager(), reason)
+            return
         }
         Log.i(TAG, "audio restore reason=$reason")
         try {
@@ -582,14 +590,9 @@ object GsmCallManager {
             Log.e(TAG, "Failed to restore route: ${e.message}")
         }
         try {
-            currentAudioManager()?.let { am ->
-                try {
-                    am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
-                } catch (_: SecurityException) {}
-                try {
-                    val maxVc = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
-                    am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, (maxVc * 2 / 3).coerceAtLeast(1), 0)
-                } catch (_: SecurityException) {}
+            val am = currentAudioManager()
+            restoreSavedVoiceVolume(am, reason)
+            if (am != null) {
                 Log.i(TAG, "Audio restored: earpiece, VoiceRx unmuted, echoRef=SLIM_RX, incall_music=untouched")
             }
         } catch (e: Exception) {
@@ -597,6 +600,86 @@ object GsmCallManager {
         }
         restoreMotoMicrophone(reason)
     }
+
+    /**
+     * Put back the STREAM_VOICE_CALL index saved before the Moto bridge
+     * raised it. Nothing is saved on the other profiles, and a missing
+     * AudioManager leaves the index in prefs for the next restore or for
+     * idle startup. Mic restore is separate and is not touched here.
+     */
+    fun restoreSavedVoiceVolume(am: AudioManager?, reason: String) {
+        if (!isMotoProfile()) return
+        val prefs = voicePrefs()
+        if (prefs == null) {
+            Log.w(TAG, "voice volume restore skipped no context reason=$reason")
+            return
+        }
+        val stored = MotoVoiceVolume.restoreIndex(MotoVoiceVolume.read(prefs)) ?: return
+        if (am == null) {
+            Log.w(TAG, "voice volume restore kept prior=$stored reason=$reason")
+            return
+        }
+        try {
+            try {
+                am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
+            } catch (_: SecurityException) {}
+            am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, stored, 0)
+        } catch (e: SecurityException) {
+            Log.w(TAG, "voice volume restore kept prior=$stored reason=$reason err=${e.message}")
+            return
+        }
+        if (!MotoVoiceVolume.clear(prefs)) {
+            Log.w(TAG, "voice volume restore wrote $stored but the saved index remains reason=$reason")
+        }
+        val after = try {
+            am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+        } catch (_: Exception) {
+            -1
+        }
+        appLog("voice volume restore set=$stored after=$after reason=$reason")
+    }
+
+    /**
+     * Null leaves the stream alone. Moto does that once the bridge has
+     * closed so a late volume pass cannot replace the restored index.
+     */
+    private fun voiceCallIndex(am: AudioManager): Int? {
+        if (isMotoProfile()) {
+            if (!bridgeAudioOpen) return null
+            return raiseMotoVoiceCall(am)
+        }
+        if (muteLocalEarpiece) {
+            // Relay mode: mute the local earpiece entirely. Capture uses
+            // VOICE_DOWNLINK and injection uses STREAM_MUSIC, so nothing here
+            // depends on STREAM_VOICE_CALL being audible.
+            return 0
+        }
+        if (profile.audio.voiceCallVolPercent > 0) {
+            val maxVc = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+            return (maxVc * profile.audio.voiceCallVolPercent / 100).coerceAtLeast(1)
+        }
+        return 1
+    }
+
+    private fun raiseMotoVoiceCall(am: AudioManager): Int {
+        val maxVc = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+        val live = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+        val prefs = voicePrefs()
+        if (prefs == null) {
+            Log.w(TAG, "voice volume left unchanged: no app context")
+            return live
+        }
+        val toSave = MotoVoiceVolume.indexToSave(MotoVoiceVolume.read(prefs), live)
+        if (toSave != null && !MotoVoiceVolume.save(prefs, toSave)) {
+            Log.w(TAG, "voice volume left unchanged: save failed prior=$toSave")
+            return live
+        }
+        if (toSave != null) appLog("voice volume saved=$toSave max=$maxVc")
+        return MotoVoiceVolume.activeIndex(maxVc)
+    }
+
+    private fun voicePrefs(): SharedPreferences? =
+        GatewayApp.context()?.let { BridgeConfig.openPrefs(it) }
 
     /** Call objects this process already knows about. Empty before InCallService binds. */
     fun trackedCallStates(): List<Int> {

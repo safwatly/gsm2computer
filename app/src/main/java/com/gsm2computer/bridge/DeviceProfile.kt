@@ -610,7 +610,10 @@ data class DeviceProfile(
          *     kernel has no per-PCM status files. The other MMode slot is
          *     not written. The write goes through the Magisk Go helper
          *     (`tinymix-helper 351`); a readback cannot confirm it because
-         *     the kernel getter is NULL. Voice Rx/Tx Device Mute stay untouched.
+         *     the kernel getter is NULL. Each AUDIO-FLOW sample still logs
+         *     the raw `Voice Tx Mute` and `Voice Rx Device Mute` reads,
+         *     including a getter error, and does not pass values. Voice
+         *     Rx/Tx Device Mute stay unwritten.
          *   - The HAL owns Incall_Music. This profile does not write
          *     MM1/MM2/MM9 and does not cycle incall_music_enabled. Stale
          *     idle MM1/MM2 values are cleared once at service start.
@@ -663,6 +666,9 @@ data class DeviceProfile(
                 noiseGateThreshold = 3,
                 echoGateThreshold = 300,
                 doubleTalkRatio = 1.5f,
+                // 0 keeps the shared minimum path. While this bridge is open,
+                // enforceVolumes sets STREAM_VOICE_CALL to max and restores
+                // the saved index on hangup and idle startup.
                 voiceCallVolPercent = 0,
             ),
             routing = HalRoutingProfile(

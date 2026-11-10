@@ -14,6 +14,7 @@ import android.media.MediaRecorder
 import android.util.Log
 import com.gsm2computer.bridge.ApiMuteTiming
 import com.gsm2computer.bridge.DeviceProfile
+import com.gsm2computer.bridge.MotoMuteReadback
 import com.gsm2computer.bridge.diag.BridgeLog
 import com.gsm2computer.bridge.realtime.UplinkWire
 import com.gsm2computer.bridge.RootShell
@@ -1036,8 +1037,13 @@ class RtpSession(
                     } ?: ""
                 } catch (_: Exception) { "" }
                 // Enhanced "TRX/REC" heartbeat logging for user visibility
-                val flowStats = "AUDIO-FLOW: [GSM -> SIP: REC=${rawCaptureRms} TRX=${if(txPacketCount > lastFlowTxCount) "OK" else "IDLE"}] " +
+                val flowBase = "AUDIO-FLOW: [GSM -> SIP: REC=${rawCaptureRms} TRX=${if(txPacketCount > lastFlowTxCount) "OK" else "IDLE"}] " +
                                 "[SIP -> GSM: REC=${if(rxPacketCount > lastFlowRxCount) "OK" else "IDLE"} TRX=${playbackRms}]"
+                val flowStats = if (profile.name.startsWith("Moto g84")) {
+                    "$flowBase ${readMotoHardwareMutes()}"
+                } else {
+                    flowBase
+                }
                 lastFlowTxCount = txPacketCount
                 lastFlowRxCount = rxPacketCount
                 Log.i(TAG, flowStats)
@@ -1224,6 +1230,20 @@ class RtpSession(
                 Log.w(TAG, "api mute wait failed: ${e.message}")
             }
         }, "api-mute").apply { isDaemon = true }.start()
+    }
+
+    /**
+     * Moto only. Raw tinymix reads, no values, so neither control is written.
+     * `Voice Tx Mute` comes back as its three-element tuple when the getter works.
+     */
+    private fun readMotoHardwareMutes(): String {
+        return try {
+            val script = DeviceProfile.resolveCmd(MotoMuteReadback.script())
+            if (script.isEmpty()) return MotoMuteReadback.missing()
+            MotoMuteReadback.format(RootShell.execForOutput(script, 2_500))
+        } catch (e: Exception) {
+            "txMute=[read-failed] rxDevMute=[read-failed] ${e.message ?: ""}".trim()
+        }
     }
 
     private fun readIncallDump(): String = try {

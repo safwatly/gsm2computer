@@ -157,10 +157,73 @@ class MotoInjectGuardTest {
         assertNull(ApiMuteTiming.decide(true, true, split, 1_000L, 1_399L))
         assertFalse(ApiMuteTiming.audioFlingerIncallMusicActive("INCALL_MUSIC\nTELEPHONY_TX\nStandby: no\n"))
         assertEquals("api_mute fallback: no usecase signal", ApiMuteTiming.FALLBACK_LOG)
+        val audioService = """
+            Legacy stream types:
+            - STREAM_VOICE_CALL:
+               Muted: false
+               Current: 1
+               Max: 8
+            - STREAM_MUSIC:
+               Current: 9
+            Mode: MODE_IN_CALL
+            INCALL_MUSIC
+            Standby: no
+        """.trimIndent()
+        assertFalse(ApiMuteTiming.audioFlingerIncallMusicActive(audioService))
+        assertEquals(ApiMuteTiming.WRITE_DELAY, ApiMuteTiming.decide(true, true, audioService, 1_000L, 1_400L))
         val gsm = File("src/main/java/com/gsm2computer/bridge/gsm/GsmCallManager.kt").readText()
         assertTrue(gsm.contains("appLog(ApiMuteTiming.FALLBACK_LOG)"))
+        assertTrue(ApiMuteTiming.DUMP_CMD.startsWith("dumpsys media.audio_flinger"))
         assertTrue(ApiMuteTiming.DUMP_CMD.contains("Output thread"))
+        assertFalse(ApiMuteTiming.DUMP_CMD.contains("dumpsys audio"))
         assertFalse(ApiMuteTiming.DUMP_CMD.contains("grep"))
+    }
+
+    @Test
+    fun `moto voice volume is restored on every hangup path and idle startup`() {
+        val gsm = File("src/main/java/com/gsm2computer/bridge/gsm/GsmCallManager.kt").readText()
+        val service = File("src/main/java/com/gsm2computer/bridge/service/GatewayService.kt").readText()
+        val orchestrator = File("src/main/java/com/gsm2computer/bridge/bridge/CallOrchestrator.kt").readText()
+        val disconnected = gsm.substringAfter("STATE_DISCONNECTED ->").substringBefore("if (!waiting)")
+        assertTrue(disconnected.contains("restoreBridgedAudio"))
+        val removed = gsm.substringAfter("fun onCallRemoved").substringBefore("fun onCallStateChanged")
+        assertTrue(removed.contains("HangupRestore.removed"))
+        assertTrue(removed.contains("restoreBridgedAudio"))
+        val bridged = gsm.substringAfter("fun restoreBridgedAudio").substringBefore("fun restoreSavedVoiceVolume")
+        assertTrue(bridged.contains("restoreSavedVoiceVolume"))
+        assertTrue(bridged.contains("restoreMotoMicrophone(reason)"))
+        assertFalse(bridged.contains("maxVc * 2 / 3"))
+        val other = gsm.substringAfter("private fun restoreAudio").substringBefore("fun restoreBridgedAudio")
+        assertTrue(other.contains("maxVc * 2 / 3"))
+        val index = gsm.substringAfter("fun voiceCallIndex").substringBefore("fun raiseMotoVoiceCall")
+        assertTrue(index.contains("if (!bridgeAudioOpen) return null"))
+        assertTrue(index.contains("muteLocalEarpiece"))
+        assertTrue(gsm.contains("return MotoVoiceVolume.activeIndex(maxVc)"))
+        val teardown = orchestrator.substringAfter("fun tearDown").substringBefore("val party")
+        assertTrue(teardown.contains("restoreBridgedAudio(\"teardown\")"))
+        val destroy = service.substringAfter("fun onDestroy()").substringBefore("fun createNotificationChannel")
+        assertTrue(destroy.contains("restoreBridgedAudio(\"destroy\")"))
+        val startup = service.substringAfter("fun clearStaleMotoState").substringBefore("fun telephonyCallState")
+        val gate = startup.indexOf("noCallAtAll")
+        val mic = startup.indexOf("forceStartupMicUnmute()")
+        val mixer = startup.indexOf("clearIdleMusicMixers()")
+        val volume = startup.indexOf("restoreSavedVoiceVolume(am, \"startup\")")
+        assertTrue(gate in 0 until mic)
+        assertTrue(mic < mixer && mixer < volume)
+        val micFn = service.substringAfter("fun forceStartupMicUnmute").substringBefore("fun clearIdleMusicMixers")
+        assertTrue(micFn.contains("isMicrophoneMute = false"))
+    }
+
+    @Test
+    fun `audio flow logs raw voice mute reads only for moto`() {
+        val session = File("src/main/java/com/gsm2computer/bridge/rtp/RtpSession.kt").readText()
+        val flow = session.substringAfter("val flowStats").substringBefore("listener?.onRtpStats(flowStats)")
+        assertTrue(flow.contains("Moto g84"))
+        assertTrue(flow.contains("readMotoHardwareMutes()"))
+        val reader = session.substringAfter("fun readMotoHardwareMutes").substringBefore("fun readIncallDump")
+        assertTrue(reader.contains("MotoMuteReadback.script()"))
+        assertFalse(reader.contains("TinymixTrace.run"))
+        assertFalse(reader.contains("tinymix write"))
     }
 
     @Test

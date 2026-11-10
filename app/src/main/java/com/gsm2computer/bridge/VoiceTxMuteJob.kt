@@ -1,5 +1,6 @@
 package com.gsm2computer.bridge
 
+import android.os.SystemClock
 import android.util.Log
 
 /**
@@ -7,10 +8,19 @@ import android.util.Log
  * Each trigger runs at +0, +1s and +3s from that trigger, and stops
  * when [alive] goes false (call ended). Stderr is merged into the
  * logged output because the root shell keeps stdout only.
+ *
+ * [CALL_ACTIVE] is debounced. The previous stamp is null until the first
+ * attempt: a [Long.MIN_VALUE] sentinel overflows `now - prev` and the
+ * call-active job never starts.
  */
 internal object VoiceTxMuteJob {
     private const val TAG = "VoiceTxMute"
-    private val lastAt = HashMap<String, Long>()
+    const val CALL_ACTIVE = "call-active"
+    private val debounce = VoiceTxDebounce()
+
+    fun forget(reason: String) {
+        debounce.forget(reason)
+    }
 
     fun schedule(
         reason: String,
@@ -19,14 +29,10 @@ internal object VoiceTxMuteJob {
         log: (String) -> Unit,
     ) {
         if (debounceMs > 0) {
-            val now = System.currentTimeMillis()
-            synchronized(lastAt) {
-                val prev = lastAt[reason] ?: Long.MIN_VALUE
-                if (now - prev < debounceMs) {
-                    emit(log, "voice tx unmute schedule skipped reason=$reason debounceMs=$debounceMs")
-                    return
-                }
-                lastAt[reason] = now
+            val now = SystemClock.elapsedRealtime()
+            if (!debounce.allow(reason, now, debounceMs)) {
+                emit(log, "voice tx unmute schedule skipped reason=$reason debounceMs=$debounceMs")
+                return
             }
         }
         val delays = VoiceTxUnmute.RETRY_DELAYS_MS.joinToString(",")
