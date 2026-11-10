@@ -82,6 +82,23 @@ class DeviceProfileTest {
         assertEquals(false, p.mixer.mixerSetupCmd.contains("Voice Tx Device Mute"))
         assertTrue(p.routing.sessionVoiceTxUnmute)
         assertTrue(p.routing.playbackToTelephony)
+        assertFalse(p.mixer.mixerSetupCmd.contains("Incall_Music"))
+        assertFalse(p.mixer.mixerRestoreCmd.contains("Incall_Music"))
+        assertEquals("", p.mixer.mixerIncallMusicCmd)
+        assertEquals("", p.routing.incallMusicParam)
+        assertTrue(p.mixer.mixerSetupCmd.contains("TX_DEC0 Volume"))
+        assertTrue(p.mixer.mixerRestoreCmd.contains("RX_RX0 Digital Volume"))
+        assertTrue(p.mixer.mixerRestoreCmd.contains("TX_DEC0 Volume"))
+        assertTrue(p.mixer.mixerRestoreCmd.contains("ADC1 Volume"))
+    }
+
+    @Test
+    fun `generic qualcomm still writes Incall_Music and a one-value Voice Tx Mute`() {
+        val p = DeviceProfile.genericQualcomm()
+        assertTrue(p.mixer.mixerSetupCmd.contains("Incall_Music Audio Mixer MultiMedia1"))
+        assertTrue(p.mixer.mixerIncallMusicCmd.contains("Voice Tx Mute' 0"))
+        assertTrue(p.routing.incallMusicParam.isNotBlank())
+        assertFalse(p.routing.sessionVoiceTxUnmute)
     }
 
     @Test

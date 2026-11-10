@@ -38,12 +38,11 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        // versionCode 351: the Magisk tinymix helper writes every value in
-        // one ioctl. Voice Tx Mute is still [0, VSID, 0] on call ACTIVE.
-        // Readback is not used (kernel getter is NULL). The inject marker
-        // defaults on. 348 stays held.
-        versionCode = 351
-        versionName = "0.2.12"
+        // versionCode 352: Moto reads persist.gsm2computer.inject_policy at
+        // call start. Default hal_owned_api_mute. The HAL owns Incall_Music.
+        // hal_owned still uses the 351 session tuple. 348 stays held.
+        versionCode = 352
+        versionName = "0.2.13"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

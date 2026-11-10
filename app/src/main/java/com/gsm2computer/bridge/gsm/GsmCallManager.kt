@@ -9,7 +9,15 @@ import android.telecom.Call
 import android.telecom.CallAudioState
 import android.telecom.InCallService
 import android.util.Log
+import com.gsm2computer.bridge.ApiMuteCaptureGuard
+import com.gsm2computer.bridge.ApiMuteTiming
 import com.gsm2computer.bridge.DeviceProfile
+import com.gsm2computer.bridge.HangupRestore
+import com.gsm2computer.bridge.InjectPolicy
+import com.gsm2computer.bridge.MicApiAction
+import com.gsm2computer.bridge.MicRestoreGate
+import com.gsm2computer.bridge.MotoIdleMixers
+import com.gsm2computer.bridge.PolicyLogLevel
 import com.gsm2computer.bridge.RootShell
 import com.gsm2computer.bridge.TinymixTrace
 import com.gsm2computer.bridge.VoiceTxMuteJob
@@ -48,6 +56,18 @@ object GsmCallManager {
 
     /** Set when [batchMixerSetup] finishes; RtpSession waits past this before capture. */
     @Volatile var mixerSetupCompletedAtMs: Long = 0
+
+    /** Moto inject policy latched at call start. Other profiles ignore it. */
+    @Volatile var injectPolicy: InjectPolicy = InjectPolicy.DEFAULT
+        private set
+
+    @Volatile private var injectPolicyLatched = false
+    private var voiceTxDecisionLogged = false
+    private val audioLock = Any()
+    private val micGate = MicRestoreGate()
+    @Volatile private var bridgeAudioOpen = false
+    @Volatile private var apiMuteApplied = false
+    @Volatile private var captureGuard = ApiMuteCaptureGuard()
 
     /**
      * Relay mode: silence the gateway's own earpiece so the caller's voice isn't
@@ -127,15 +147,27 @@ object GsmCallManager {
     }
 
     fun onCallRemoved(call: Call) {
-        if (!isLiveGsmCall(activeCall, call)) {
+        if (!isMotoProfile()) {
+            if (!isLiveGsmCall(activeCall, call)) {
+                Log.i(TAG, "Non-live GSM call removed; live call unchanged")
+                return
+            }
+            Log.i(TAG, "GSM call removed")
+            activeCall = null
+            activeCallState = Call.STATE_DISCONNECTED
+            restoreAudio()
+            listener?.onGsmCallEnded(call)
+            return
+        }
+        val live = activeCall
+        if (live != null && live !== call) {
             Log.i(TAG, "Non-live GSM call removed; live call unchanged")
             return
         }
         Log.i(TAG, "GSM call removed")
-        activeCall = null
+        activeCall = HangupRestore.removed(live, call) { restoreBridgedAudio(it) }
         activeCallState = Call.STATE_DISCONNECTED
-        restoreAudio()
-        listener?.onGsmCallEnded(call)
+        if (live === call) listener?.onGsmCallEnded(call)
     }
 
     fun onCallStateChanged(call: Call, state: Int) {
@@ -173,8 +205,13 @@ object GsmCallManager {
                     return
                 }
                 Log.i(TAG, "GSM call disconnected")
-                listener?.onGsmCallEnded(call)
-                activeCall = null
+                if (isMotoProfile()) {
+                    activeCall = HangupRestore.disconnected(activeCall, call) { restoreBridgedAudio(it) }
+                    listener?.onGsmCallEnded(call)
+                } else {
+                    listener?.onGsmCallEnded(call)
+                    activeCall = null
+                }
             }
         }
         if (!waiting) {
@@ -366,11 +403,20 @@ object GsmCallManager {
     /** Configure audio for GSM↔SIP bridge using the active device profile. */
     private fun configureAudioBridge() {
         if (listener == null) return // Standalone mode: let Android handle audio routing natively
+        if (isMotoProfile()) markBridgeOpen()
 
         // Voice session is already up at ACTIVE. Do not wait for the playback
         // track or for a PCM status file. A waiting leg never reaches here.
-        if (profile.routing.sessionVoiceTxUnmute) {
+        latchMotoInjectPolicy()
+        if (profile.routing.sessionVoiceTxUnmute && writesSessionVoiceTxMute()) {
+            if (isMotoProfile() && !voiceTxDecisionLogged) {
+                voiceTxDecisionLogged = true
+                appLog("voice tx unmute policy=${injectPolicy.wire} action=session-tuple")
+            }
             VoiceTxMuteJob.schedule("call-active", { isCallActive }, debounceMs = 500) { appLog(it) }
+        } else if (isMotoProfile() && profile.routing.sessionVoiceTxUnmute && !voiceTxDecisionLogged) {
+            voiceTxDecisionLogged = true
+            appLog("voice tx unmute skipped policy=${injectPolicy.wire}")
         }
 
         mixerSetupCompletedAtMs = 0
@@ -394,7 +440,10 @@ object GsmCallManager {
                     // Samsung Exynos HAL treats API mic mute as full uplink mute
                     // (blocks incall_music injection).  Pixel/Tensor use tinymix +
                     // INCALL_TX and can safely mute the physical mic here.
-                    if (profile.routing.muteMicrophoneAtApi) {
+                    // Moto reads persist.gsm2computer.inject_policy instead.
+                    if (isMotoProfile()) {
+                        applyMotoMicrophone(am)
+                    } else if (profile.routing.muteMicrophoneAtApi) {
                         am.isMicrophoneMute = true
                     } else {
                         am.isMicrophoneMute = false
@@ -473,28 +522,21 @@ object GsmCallManager {
         appLog("Vol: voice=$actualVoice(m=$muted), music=$actualMusic/$maxMusic(target=$musicVol)")
     }
 
-    /** Restore audio state when call ends */
+    /** Pre-352 hangup path. Pixel and the other profiles still use only this. */
     private fun restoreAudio() {
         muteLocalEarpiece = false
-        if (listener == null) return // Standalone mode
-
+        if (listener == null) return
         try {
             mixerSetupCompletedAtMs = 0
-            // Single su call to restore all mixer controls
             batchMixerRestore()
-
             inCallService?.let { service ->
                 service.setAudioRoute(CallAudioState.ROUTE_EARPIECE)
-
                 val audioManager = service.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
                 audioManager?.let { am ->
                     am.isMicrophoneMute = false
-                    // Clear incall_music HAL parameter for clean state on next call
                     if (profile.routing.incallMusicParam.isNotEmpty()) {
                         am.setParameters("${profile.routing.incallMusicParam}=false")
                     }
-
-                    // Unmute voice call stream and restore volume for normal phone use
                     try {
                         am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
                     } catch (_: SecurityException) {}
@@ -507,6 +549,184 @@ object GsmCallManager {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to restore audio: ${e.message}")
+        }
+    }
+
+    /**
+     * Moto hangup restore. Mixer failure still attempts the mic write.
+     * The saved mic value stays until that write returns, so a missing
+     * AudioManager can be retried by the next hangup edge.
+     */
+    fun restoreBridgedAudio(reason: String) {
+        if (!isMotoProfile()) return
+        muteLocalEarpiece = false
+        synchronized(audioLock) {
+            if (!bridgeAudioOpen && !micGate.open) {
+                Log.i(TAG, "audio restore skipped reason=$reason")
+                return
+            }
+            bridgeAudioOpen = false
+            injectPolicyLatched = false
+            voiceTxDecisionLogged = false
+        }
+        Log.i(TAG, "audio restore reason=$reason")
+        try {
+            mixerSetupCompletedAtMs = 0
+            batchMixerRestore()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore mixer: ${e.message}")
+        }
+        try {
+            inCallService?.setAudioRoute(CallAudioState.ROUTE_EARPIECE)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore route: ${e.message}")
+        }
+        try {
+            currentAudioManager()?.let { am ->
+                try {
+                    am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
+                } catch (_: SecurityException) {}
+                try {
+                    val maxVc = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+                    am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, (maxVc * 2 / 3).coerceAtLeast(1), 0)
+                } catch (_: SecurityException) {}
+                Log.i(TAG, "Audio restored: earpiece, VoiceRx unmuted, echoRef=SLIM_RX, incall_music=untouched")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore volumes: ${e.message}")
+        }
+        restoreMotoMicrophone(reason)
+    }
+
+    /** Call objects this process already knows about. Empty before InCallService binds. */
+    fun trackedCallStates(): List<Int> {
+        val states = ArrayList<Int>()
+        try {
+            inCallService?.calls?.forEach { states.add(it.state) }
+        } catch (_: Exception) {
+        }
+        if (activeCall != null) states.add(activeCallState)
+        return states
+    }
+
+    fun wantsDeferredApiMute(): Boolean {
+        if (!bridgeAudioOpen || apiMuteApplied) return false
+        return isMotoProfile() && injectPolicy.micApi == MicApiAction.FORCE_TRUE
+    }
+
+    fun applyDeferredApiMute(reason: String) {
+        val applied = synchronized(audioLock) {
+            if (!bridgeAudioOpen || apiMuteApplied) return
+            if (!isMotoProfile() || injectPolicy.micApi != MicApiAction.FORCE_TRUE) return
+            val am = currentAudioManager() ?: return
+            val before = am.isMicrophoneMute
+            am.isMicrophoneMute = true
+            apiMuteApplied = true
+            appLog(
+                "micMute before=$before action=set-true after=${am.isMicrophoneMute} " +
+                    "policy=${injectPolicy.wire} when=$reason",
+            )
+            true
+        }
+        if (!applied) return
+        if (reason == ApiMuteTiming.WRITE_DELAY) appLog(ApiMuteTiming.FALLBACK_LOG)
+        logMutePath()
+    }
+
+    /** Logs 2 s capture windows around the API mute. Never changes the mute. */
+    fun observeCaptureRms(rms: Int, nowMs: Long) {
+        if (!isMotoProfile() || injectPolicy.micApi != MicApiAction.FORCE_TRUE) return
+        val line = captureGuard.onFrame(rms, nowMs, apiMuteApplied) ?: return
+        appLog(line)
+    }
+
+    private fun markBridgeOpen() {
+        synchronized(audioLock) {
+            if (bridgeAudioOpen) return
+            if (micGate.open) {
+                Log.w(TAG, "dropping unrestored mic prior at new bridge")
+                micGate.commit()
+            }
+            bridgeAudioOpen = true
+            apiMuteApplied = false
+            captureGuard = ApiMuteCaptureGuard()
+        }
+    }
+
+    private fun currentAudioManager(): AudioManager? =
+        inCallService?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+
+    private fun logMutePath() {
+        val cmd = DeviceProfile.resolveCmd(MotoIdleMixers.MUTE_PATH_CMD)
+        if (cmd.isEmpty()) {
+            appLog("mute path skipped: tinymix not found")
+            return
+        }
+        val lines = TinymixTrace.run(cmd, timeoutMs = 4_000) { appLog(it) }
+        appLog("mute path ${lines.joinToString(" | ")}")
+    }
+
+    fun isMotoProfile(): Boolean = profile.name.startsWith("Moto g84")
+
+    /** One read per call. A later ACTIVE callback must not change the experiment. */
+    private fun latchMotoInjectPolicy() {
+        if (!isMotoProfile() || injectPolicyLatched) return
+        injectPolicyLatched = true
+        val raw = InjectPolicy.rawProperty()
+        injectPolicy = InjectPolicy.parse(raw)
+        val shown = if (InjectPolicy.recognized(raw)) {
+            raw.trim().ifEmpty { "(default)" }
+        } else {
+            "${raw.trim()} unrecognized"
+        }
+        val line = "inject policy=${injectPolicy.wire} property=${InjectPolicy.PROPERTY} raw=$shown"
+        if (InjectPolicy.logLevel(raw) == PolicyLogLevel.WARN) {
+            Log.w(TAG, line)
+            logCallback?.invoke(line)
+        } else {
+            appLog(line)
+        }
+    }
+
+    private fun writesSessionVoiceTxMute(): Boolean {
+        if (!isMotoProfile()) return true
+        return injectPolicy.writesVoiceTxMute
+    }
+
+    private fun applyMotoMicrophone(am: AudioManager) {
+        val before = am.isMicrophoneMute
+        synchronized(audioLock) { micGate.open(before) }
+        val action = when (injectPolicy.micApi) {
+            MicApiAction.FORCE_FALSE -> {
+                am.isMicrophoneMute = false
+                MicApiAction.FORCE_FALSE.wire
+            }
+            MicApiAction.LEAVE -> MicApiAction.LEAVE.wire
+            // The incall-music usecase is not up yet. Muting now makes Qualcomm
+            // stream-mute Voice Tx instead of device-muting the handset mic.
+            MicApiAction.FORCE_TRUE -> "deferred"
+        }
+        val after = am.isMicrophoneMute
+        appLog("micMute before=$before action=$action after=$after policy=${injectPolicy.wire}")
+    }
+
+    private fun restoreMotoMicrophone(reason: String) {
+        val am = currentAudioManager()
+        val wrote = try {
+            micGate.write(am != null) { prior ->
+                val before = am!!.isMicrophoneMute
+                am.isMicrophoneMute = prior
+                appLog(
+                    "micMute restore before=$before set=$prior after=${am.isMicrophoneMute} " +
+                        "policy=${injectPolicy.wire}",
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "micMute restore write failed: ${e.message}")
+            false
+        }
+        if (!wrote) {
+            Log.w(TAG, "micMute restore kept prior=${micGate.pending()} reason=$reason")
         }
     }
 
