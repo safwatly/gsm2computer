@@ -12,6 +12,7 @@ import android.util.Log
 import com.gsm2computer.bridge.DeviceProfile
 import com.gsm2computer.bridge.RootShell
 import com.gsm2computer.bridge.TinymixTrace
+import com.gsm2computer.bridge.VoiceTxMuteJob
 
 /**
  * GSM call manager: answers/makes/hangs up GSM calls, tracks state.
@@ -365,7 +366,13 @@ object GsmCallManager {
     /** Configure audio for GSM↔SIP bridge using the active device profile. */
     private fun configureAudioBridge() {
         if (listener == null) return // Standalone mode: let Android handle audio routing natively
-        
+
+        // Voice session is already up at ACTIVE. Do not wait for the playback
+        // track or for a PCM status file. A waiting leg never reaches here.
+        if (profile.routing.sessionVoiceTxUnmute) {
+            VoiceTxMuteJob.schedule("call-active", { isCallActive }, debounceMs = 500) { appLog(it) }
+        }
+
         mixerSetupCompletedAtMs = 0
         try {
             // Run ABOX/ALSA discovery on first call for diagnostics
