@@ -3,6 +3,7 @@ package com.gsm2computer.bridge.realtime
 import com.gsm2computer.bridge.DialRequest
 import com.gsm2computer.bridge.DialResponse
 import com.gsm2computer.bridge.DialStatus
+import com.gsm2computer.bridge.EndpointRace
 import com.gsm2computer.bridge.HubEndpoints
 import com.gsm2computer.bridge.classifyHubStatus
 import com.gsm2computer.bridge.scrubSecrets
@@ -29,6 +30,9 @@ class HubCallDialer(
     private val handshakeTimeoutMs: Long = ATTEMPT_TIMEOUT_MS,
 ) {
     @Volatile private var activeModel: String = model
+
+    /** Test seam: runs on the websocket thread at the start of onOpen, before the gate. */
+    internal var beforeOwnSocket: ((HandshakeGate) -> Unit)? = null
 
     fun mintedModel(): String = activeModel
 
@@ -80,19 +84,29 @@ class HubCallDialer(
         race?.track(request.endpoint.url) { socketRef.get()?.cancel() }
         val socket = http.newWebSocket(builder.build(), object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                if (race != null && !race.claim(request.endpoint.url)) {
-                    webSocket.cancel()
-                    failure.set(DialResponse(DialStatus.RETRYABLE, 0, "lost race"))
-                    latch.countDown()
-                    return
+                beforeOwnSocket?.invoke(gate)
+                when (ownSocket(gate, race, request.endpoint.url)) {
+                    OwnSocket.LOST_GATE -> {
+                        failure.compareAndSet(
+                            null,
+                            DialResponse(DialStatus.RETRYABLE, 0, "handshake timeout"),
+                        )
+                        webSocket.cancel()
+                        latch.countDown()
+                    }
+                    OwnSocket.LOST_RACE -> {
+                        failure.compareAndSet(
+                            null,
+                            DialResponse(DialStatus.RETRYABLE, 0, "lost race"),
+                        )
+                        webSocket.cancel()
+                        latch.countDown()
+                    }
+                    OwnSocket.OWNED -> {
+                        latch.countDown()
+                        live.onOpen(webSocket, request)
+                    }
                 }
-                if (!gate.onOpen()) {
-                    race?.release(request.endpoint.url)
-                    webSocket.cancel()
-                    return
-                }
-                latch.countDown()
-                live.onOpen(webSocket, request)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -101,7 +115,8 @@ class HubCallDialer(
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 if (!gate.opened()) {
-                    failure.set(
+                    failure.compareAndSet(
+                        null,
                         failureResponse(
                             response?.code ?: 0,
                             t.message ?: "websocket failure",
@@ -121,7 +136,8 @@ class HubCallDialer(
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 if (!gate.opened()) {
-                    failure.set(
+                    failure.compareAndSet(
+                        null,
                         failureResponse(
                             code,
                             reason.ifBlank { "websocket closed" },
@@ -141,10 +157,14 @@ class HubCallDialer(
         }
         if (!latch.await(remainingMs(), TimeUnit.MILLISECONDS)) {
             val status = timeoutDecision(gate) { socket.cancel() }
-            if (status == DialStatus.OPENED) return DialResponse(DialStatus.OPENED, 101, "")
+            if (status == DialStatus.OPENED && ownsUpgrade(race, request.endpoint.url)) {
+                return DialResponse(DialStatus.OPENED, 101, "")
+            }
             return failure.get() ?: DialResponse(DialStatus.RETRYABLE, 0, "handshake timeout")
         }
-        if (gate.opened()) return DialResponse(DialStatus.OPENED, 101, "")
+        if (gate.opened() && ownsUpgrade(race, request.endpoint.url)) {
+            return DialResponse(DialStatus.OPENED, 101, "")
+        }
         return failure.get() ?: DialResponse(DialStatus.RETRYABLE, 0, "handshake ended")
     }
 
@@ -235,6 +255,22 @@ internal class HandshakeGate {
 
 /** One attempt covers the token POST and the websocket upgrade together. */
 internal const val ATTEMPT_TIMEOUT_MS = 6_000L
+
+internal enum class OwnSocket { OWNED, LOST_GATE, LOST_RACE }
+
+/**
+ * The handshake gate has to win before [EndpointRace.claim]. Claiming first
+ * cancels the sibling legs, and a gate that then loses its 6s budget drops
+ * this 101 as well.
+ */
+internal fun ownSocket(gate: HandshakeGate, race: EndpointRace?, url: String): OwnSocket {
+    if (!gate.onOpen()) return OwnSocket.LOST_GATE
+    if (race != null && !race.claim(url)) return OwnSocket.LOST_RACE
+    return OwnSocket.OWNED
+}
+
+internal fun ownsUpgrade(race: EndpointRace?, url: String): Boolean =
+    race == null || race.winner() == url
 
 /** Timeout outcome. [cancel] runs only when this attempt is the one that failed. */
 internal fun timeoutDecision(gate: HandshakeGate, cancel: () -> Unit): DialStatus {

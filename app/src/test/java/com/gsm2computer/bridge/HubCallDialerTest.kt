@@ -11,6 +11,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
@@ -18,6 +19,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 class HubCallDialerTest {
 
@@ -182,6 +184,57 @@ class HubCallDialerTest {
             Thread.sleep(2_500)
             assertFalse(installed.get())
             assertFalse(response.detail.contains(secret))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun timeoutWinsTheGateBeforeOnOpenAndDoesNotCancelTheSibling() {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setBody("""{"value":"hub-token","model":"hub"}"""))
+            server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {}))
+            val siblingCancelled = AtomicBoolean(false)
+            val race = EndpointRace()
+            race.track("ws://100.113.222.47:8787") { siblingCancelled.set(true) }
+            val installed = AtomicBoolean(false)
+            val dialer = HubCallDialer(
+                http = OkHttpClient.Builder()
+                    .connectTimeout(2, TimeUnit.SECONDS)
+                    .readTimeout(2, TimeUnit.SECONDS)
+                    .build(),
+                hubOwned = true,
+                openAiTokenUrl = "",
+                model = "hub",
+                handshakeTimeoutMs = 3_000,
+            )
+            dialer.beforeOwnSocket = { gate ->
+                val status = AtomicReference<DialStatus?>(null)
+                val abandoned = CountDownLatch(1)
+                Thread {
+                    status.set(timeoutDecision(gate) { })
+                    abandoned.countDown()
+                }.apply { isDaemon = true }.start()
+                assertTrue(abandoned.await(2, TimeUnit.SECONDS))
+                assertEquals(DialStatus.RETRYABLE, status.get())
+            }
+            val response = dialer.dial(
+                DialRequest(HubEndpoint(server.url("/").toString(), secret), "hub-session", race),
+                object : HubCallDialer.Live {
+                    override fun onOpen(webSocket: WebSocket, request: DialRequest) {
+                        installed.set(true)
+                    }
+                    override fun onMessage(webSocket: WebSocket, text: String) = Unit
+                    override fun onDead(webSocket: WebSocket, code: Int, detail: String) = Unit
+                },
+            )
+            assertEquals(DialStatus.RETRYABLE, response.status)
+            assertEquals("handshake timeout", response.detail)
+            assertFalse(installed.get())
+            assertFalse(siblingCancelled.get())
+            assertNull(race.winner())
         } finally {
             server.shutdown()
         }

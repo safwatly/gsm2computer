@@ -40,9 +40,9 @@ android {
         targetSdk = 34
         // versionCode 355 (after 331–354): an ACTIVE call races
         // wss://gsm.ta3leam.com and ws://100.113.222.47:8787 with a 6s
-        // attempt budget and keeps that backoff until hangup. A grace
-        // window expiry or a hub-link error does not cancel the retries
-        // or tear the bridge down while telephony is still off-hook.
+        // attempt budget and keeps the first socket that owns its handshake.
+        // Retries continue only while the hub transport is still dialing.
+        // A code-1000 close, stop(), or exhausted retries tear the bridge down.
         versionCode = 355
         versionName = "0.2.16"
 

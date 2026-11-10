@@ -213,8 +213,7 @@ class HubConnectionRoutine(
                 }, "hub-dial-$index").also { it.isDaemon = true }
             }
             threads.forEach { it.start() }
-            val deadline = System.currentTimeMillis() + RACE_WAIT_MS
-            while (signal.count > 0L && System.currentTimeMillis() < deadline) {
+            while (opened.get() == null && finished.get() < endpoints.size) {
                 if (!proceed()) {
                     race.seal()
                     break
@@ -222,6 +221,10 @@ class HubConnectionRoutine(
                 signal.await(50, TimeUnit.MILLISECONDS)
             }
             while (opened.get() == null && race.winner() != null && finished.get() < endpoints.size) {
+                if (!proceed()) {
+                    race.seal()
+                    break
+                }
                 signal.await(20, TimeUnit.MILLISECONDS)
             }
             opened.get()?.let { return it.copy(attempts = attempts.toList()) }
@@ -229,11 +232,12 @@ class HubConnectionRoutine(
                 race.seal()
                 return cancelled(sessionId, attempts.toList(), secrets)
             }
-            val pending = finished.get() < endpoints.size
-            // Every leg finished with no 101, or the wait bound expired.
-            // A single 409 never reaches this while a sibling is still in dial().
-            race.seal()
-            if (terminal.get() == DialStatus.STOP && !pending) {
+            // Seal only after every leg has left dial(). A leg still pending
+            // may be the 101 the hub already admitted.
+            if (finished.get() == endpoints.size) {
+                race.seal()
+            }
+            if (terminal.get() == DialStatus.STOP && finished.get() == endpoints.size) {
                 val last = attempts.lastOrNull()
                 return ConnectResult(
                     opened = false,
@@ -326,54 +330,61 @@ internal fun preferTerminal(terminal: AtomicReference<DialStatus?>, next: DialSt
 
 /**
  * One pass racing every entrance. [claim] is the only way an [onOpen] may
- * install the socket. [seal] abandons everyone who has not won. Hangup,
- * the wait bound, and a pass that finished with no 101 seal the race.
- * One leg's 409 does not.
+ * install the socket. [seal] abandons everyone who has not won. Hangup and
+ * a pass that finished with no 101 seal the race. One leg's 409 does not,
+ * and neither does the clock while a sibling is still inside dial().
  */
 class EndpointRace {
-    private val winnerUrl = AtomicReference<String?>(null)
-    private val sealed = AtomicInteger(0)
+    private val lock = Any()
+    private var winnerUrl: String? = null
+    private var sealed = false
     private val cancels = ConcurrentHashMap<String, () -> Unit>()
 
-    fun winner(): String? = winnerUrl.get()
+    fun winner(): String? = synchronized(lock) { winnerUrl }
 
     fun claim(url: String): Boolean {
-        if (sealed.get() != 0) return false
-        if (!winnerUrl.compareAndSet(null, url)) return false
-        if (sealed.get() != 0) {
-            winnerUrl.compareAndSet(url, null)
-            return false
+        val drop = synchronized(lock) {
+            if (sealed || winnerUrl != null) return false
+            winnerUrl = url
+            pendingCancels(url)
         }
-        cancelExcept(url)
+        drop.forEach { invoke(it) }
         return true
     }
 
     fun release(url: String) {
-        winnerUrl.compareAndSet(url, null)
+        synchronized(lock) {
+            if (winnerUrl == url && !sealed) winnerUrl = null
+        }
     }
 
     fun seal() {
-        sealed.set(1)
-        cancelExcept(winnerUrl.get())
+        val drop = synchronized(lock) {
+            sealed = true
+            pendingCancels(winnerUrl)
+        }
+        drop.forEach { invoke(it) }
     }
 
-    fun abandoned(url: String): Boolean {
-        if (winnerUrl.get() == url) return false
-        if (sealed.get() != 0) return true
-        val winner = winnerUrl.get() ?: return false
+    fun abandoned(url: String): Boolean = synchronized(lock) { abandonedLocked(url) }
+
+    fun track(url: String, cancel: () -> Unit) {
+        val runNow = synchronized(lock) {
+            cancels[url] = cancel
+            abandonedLocked(url)
+        }
+        if (runNow) invoke(cancel)
+    }
+
+    private fun abandonedLocked(url: String): Boolean {
+        if (winnerUrl == url) return false
+        if (sealed) return true
+        val winner = winnerUrl ?: return false
         return winner != url
     }
 
-    fun track(url: String, cancel: () -> Unit) {
-        cancels[url] = cancel
-        if (abandoned(url)) invoke(cancel)
-    }
-
-    private fun cancelExcept(keep: String?) {
-        for ((url, cancel) in cancels) {
-            if (url != keep) invoke(cancel)
-        }
-    }
+    private fun pendingCancels(keep: String?): List<() -> Unit> =
+        cancels.filterKeys { it != keep }.values.toList()
 
     private fun invoke(cancel: () -> Unit) {
         try {
@@ -456,8 +467,6 @@ data class Backoff(
         return delay.toLong()
     }
 }
-
-private const val RACE_WAIT_MS = 30_000L
 
 fun scrubSecrets(text: String, secrets: Collection<String>): String {
     var out = text
