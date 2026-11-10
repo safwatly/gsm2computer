@@ -120,13 +120,13 @@ class VoiceTxUnmuteTest {
         assertEquals("tinymix 'Voice Tx Mute' 0 297816064 0", cmd)
         assertFalse(cmd.contains("Device Mute"))
         assertFalse(cmd.contains("Voice Rx"))
-        val readback = VoiceTxUnmute.readbackCommand()
-        assertEquals("tinymix 'Voice Tx Mute'", readback)
-        assertFalse(readback.contains("Device Mute"))
+        assertEquals("tinymix --version", VoiceTxUnmute.helperVersionCommand())
+        assertEquals("tinymix-helper 351", VoiceTxUnmute.HELPER_BANNER)
+        assertTrue(VoiceTxUnmute.READBACK_SKIPPED.contains("kernel-getter-null"))
     }
 
     @Test
-    fun attemptLogCarriesArgvExitAndReadback() {
+    fun attemptLogCarriesArgvExitAndNotAReadback() {
         val argv = VoiceTxUnmute.unmuteCommand(VoiceTxUnmute.MMODE1_VSID)
         val line = VoiceTxUnmute.attemptLine(
             "call-active",
@@ -141,11 +141,50 @@ class VoiceTxUnmuteTest {
         assertTrue(line.contains("exit=0"))
         assertTrue(line.contains("out=ok"))
         assertTrue(line.contains("delayMs=0"))
-        val read = VoiceTxUnmute.readbackLine("route-type-18", 3000, VoiceTxUnmute.readbackCommand(), 1, "(read error)")
-        assertTrue(read.startsWith("voice tx unmute readback"))
-        assertTrue(read.contains("argv=tinymix 'Voice Tx Mute'"))
-        assertTrue(read.contains("exit=1"))
-        assertTrue(read.contains("out=(read error)"))
+        assertFalse(VoiceTxUnmute.READBACK_SKIPPED.contains("exit="))
+    }
+
+    @Test
+    fun newInvalidSessionZeroFailsTheAttempt() {
+        val before = "voice_get_idx_for_session: Invalid session_id : 0\nolder line"
+        val after = before + "\nvoice_get_idx_for_session: Invalid session_id : 0"
+        val line = VoiceTxUnmute.dmesgCheck(1, 2, before, after)
+        assertTrue(line.contains("invalid_session_id_0=present"))
+        assertTrue(line.contains("count_before=1"))
+        assertTrue(line.contains("count_after=2"))
+    }
+
+    @Test
+    fun oldInvalidSessionZeroDoesNotFailACleanWrite() {
+        val tail = "voice_get_idx_for_session: Invalid session_id : 0\ncall already up"
+        val line = VoiceTxUnmute.dmesgCheck(6, 6, tail, tail)
+        assertTrue(line.contains("invalid_session_id_0=absent"))
+        assertTrue(line.contains("positive=(none)"))
+    }
+
+    @Test
+    fun playbackInvalidSessionIsNotTheSessionIdCheck() {
+        val before = "anchor"
+        val after = "anchor\nvoc_start_playback: Invalid session"
+        val line = VoiceTxUnmute.dmesgCheck(0, 0, before, after)
+        assertTrue(line.contains("invalid_session_id_0=absent"))
+        assertTrue(line.contains("playback_invalid_session=ignored"))
+        assertFalse(line.contains("invalid_session_id_0=present"))
+    }
+
+    @Test
+    fun mutePutLineIsThePositiveKernelLog() {
+        val before = "anchor"
+        val after = "anchor\nmsm_voice_mute_put: mute=0 session_id=0x11c05000 ramp_duration=0"
+        val line = VoiceTxUnmute.dmesgCheck(0, 0, before, after)
+        assertTrue(line.contains("invalid_session_id_0=absent"))
+        assertTrue(line.contains("positive=msm_voice_mute_put: mute=0 session_id=0x11c05000"))
+    }
+
+    @Test
+    fun dmesgCountReadsWcOutput() {
+        assertEquals(6, VoiceTxUnmute.dmesgCount("6\n"))
+        assertEquals(0, VoiceTxUnmute.dmesgCount(""))
     }
 
     @Test

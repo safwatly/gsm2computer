@@ -59,14 +59,31 @@ internal object VoiceTxMuteJob {
             emit(log, "voice tx unmute: tinymix not found reason=$reason delayMs=$delayMs argv=$argv")
             return
         }
+        val versionArgv = DeviceProfile.resolveCmd(VoiceTxUnmute.helperVersionCommand())
+        val (versionCode, versionBody) = exec(versionArgv)
+        if (!versionBody.contains(VoiceTxUnmute.HELPER_BANNER)) {
+            emit(
+                log,
+                "voice tx unmute: helper mismatch want=${VoiceTxUnmute.HELPER_BANNER} " +
+                    "exit=$versionCode argv=$versionArgv out=${VoiceTxUnmute.oneLine(versionBody)}",
+            )
+            return
+        }
         for (vsid in choice.vsids) {
             val argv = DeviceProfile.resolveCmd(VoiceTxUnmute.unmuteCommand(vsid))
+            val beforeCount = VoiceTxUnmute.dmesgCount(read(VoiceTxUnmute.DMESG_COUNT, 2000))
+            val beforeTail = read(VoiceTxUnmute.DMESG_TAIL, 2000)
             val (code, body) = exec(argv)
-            emit(log, VoiceTxUnmute.attemptLine(reason, delayMs, choice.why, vsid, argv, code, body))
+            val afterCount = VoiceTxUnmute.dmesgCount(read(VoiceTxUnmute.DMESG_COUNT, 2000))
+            val afterTail = read(VoiceTxUnmute.DMESG_TAIL, 2000)
+            emit(
+                log,
+                VoiceTxUnmute.attemptLine(reason, delayMs, choice.why, vsid, argv, code, body) +
+                    " helper=${VoiceTxUnmute.HELPER_BANNER}",
+            )
+            emit(log, VoiceTxUnmute.dmesgCheck(beforeCount, afterCount, beforeTail, afterTail))
+            emit(log, VoiceTxUnmute.READBACK_SKIPPED)
         }
-        val readArgv = DeviceProfile.resolveCmd(VoiceTxUnmute.readbackCommand())
-        val (code, body) = exec(readArgv)
-        emit(log, VoiceTxUnmute.readbackLine(reason, delayMs, readArgv, code, body))
     }
 
     private fun exec(argv: String): Pair<Int, String> {

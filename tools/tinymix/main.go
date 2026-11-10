@@ -3,13 +3,20 @@
 // No external dependencies (no libtinyalsa needed).
 //
 // Usage:
-//   tinymix                     — list all controls
-//   tinymix <id>                — get control by numeric ID
-//   tinymix <id> <value>        — set control by numeric ID
-//   tinymix '<name>'            — get control by name
-//   tinymix '<name>' <value>    — set control by name (enum by name or index)
-//   tinymix -e '<name>'         — dump enum items with hex (diagnostic)
-//   tinymix -D <card> ...       — use specific ALSA card
+//
+//	tinymix                     — list all controls
+//	tinymix <id>                — get control by numeric ID
+//	tinymix <id> <value>...     — set control by numeric ID
+//	tinymix '<name>'            — get control by name
+//	tinymix '<name>' <value>... — set control by name (enum by name or index)
+//	tinymix -e '<name>'         — dump enum items with hex (diagnostic)
+//	tinymix -D <card> ...       — use specific ALSA card
+//	tinymix --version           — print "tinymix-helper 351"
+//
+// One value is copied into every element. Two or more values are written
+// in one SNDRV_CTL_IOCTL_ELEM_WRITE, element i = value i, and the count
+// must match the control. The old helper used only args[1] and broadcast
+// it, so `Voice Tx Mute 0 297816064 0` became [0,0,0] (session id 0).
 package main
 
 import (
@@ -97,8 +104,9 @@ type elemList struct {
 // snd_ctl_elem_info — 272 bytes
 // Kernel layout: id(64) + type/access/count/pid(16) + value_union(128) + dimen+reserved(64)
 // The value union contains:
-//   ENUMERATED: items(4) + item(4) + name[64] + names_ptr(8) + names_length(4) + pad
-//   INTEGER: min(8) + max(8) + step(8)
+//
+//	ENUMERATED: items(4) + item(4) + name[64] + names_ptr(8) + names_length(4) + pad
+//	INTEGER: min(8) + max(8) + step(8)
 type elemInfo struct {
 	ID     elemID // 64
 	Type   uint32
@@ -269,51 +277,138 @@ func getElemValue(fd int, id elemID) (elemValue, error) {
 	return val, err
 }
 
-func setElemValue(fd int, id elemID, info elemInfo, valueStr string) error {
+// helperVersion is the string the bridge requires before it will write.
+const helperVersion = "351"
+
+func boolBit(valueStr string) int64 {
+	if valueStr == "1" || strings.EqualFold(valueStr, "on") || strings.EqualFold(valueStr, "true") {
+		return 1
+	}
+	return 0
+}
+
+// parseControlValues turns CLI values into integers. One value is left as
+// one value so the encoder can broadcast it. More than one value must
+// match the control's element count. Enum names are resolved here; the
+// encoder only sees indexes.
+func parseControlValues(info elemInfo, raw []string, enumIndex func(string) (uint32, bool)) ([]int64, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("no value")
+	}
+	if len(raw) != 1 && uint32(len(raw)) != info.Count {
+		return nil, fmt.Errorf("control has %d elements, got %d values", info.Count, len(raw))
+	}
+	out := make([]int64, len(raw))
+	for i, valueStr := range raw {
+		switch info.Type {
+		case SND_CTL_ELEM_TYPE_BOOLEAN:
+			out[i] = boolBit(valueStr)
+		case SND_CTL_ELEM_TYPE_INTEGER:
+			n, err := strconv.ParseInt(valueStr, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid integer: %s", valueStr)
+			}
+			out[i] = n
+		case SND_CTL_ELEM_TYPE_ENUMERATED:
+			n, err := strconv.ParseUint(valueStr, 10, 32)
+			if err != nil {
+				if enumIndex == nil {
+					return nil, fmt.Errorf("enum value '%s' not found", valueStr)
+				}
+				idx, found := enumIndex(valueStr)
+				if !found {
+					return nil, fmt.Errorf("enum value '%s' not found (items: %d)", valueStr, info.enumItems())
+				}
+				n = uint64(idx)
+			}
+			out[i] = int64(n)
+		default:
+			return nil, fmt.Errorf("unsupported type: %s", typeName(info.Type))
+		}
+	}
+	return out, nil
+}
+
+// expandValues broadcasts a single value. A longer list is returned as-is
+// only when its length is the control's element count.
+func expandValues(count uint32, values []int64) ([]int64, error) {
+	if len(values) == 0 {
+		return nil, fmt.Errorf("no values")
+	}
+	if len(values) == 1 {
+		out := make([]int64, count)
+		for i := range out {
+			out[i] = values[0]
+		}
+		return out, nil
+	}
+	if uint32(len(values)) != count {
+		return nil, fmt.Errorf("control has %d elements, got %d values", count, len(values))
+	}
+	return values, nil
+}
+
+// encodeElemValues fills the snd_ctl_elem_value value union. INTEGER and
+// BOOLEAN are 8-byte little-endian longs. ENUMERATED is 4-byte indexes.
+func encodeElemValues(elemType uint32, count uint32, values []int64) ([1024]byte, error) {
+	var buf [1024]byte
+	slots, err := expandValues(count, values)
+	if err != nil {
+		return buf, err
+	}
+	switch elemType {
+	case SND_CTL_ELEM_TYPE_BOOLEAN, SND_CTL_ELEM_TYPE_INTEGER:
+		for i, n := range slots {
+			binary.LittleEndian.PutUint64(buf[uint32(i)*8:], uint64(n))
+		}
+	case SND_CTL_ELEM_TYPE_ENUMERATED:
+		for i, n := range slots {
+			if n < 0 || n > 0xffffffff {
+				return buf, fmt.Errorf("enum index out of range: %d", n)
+			}
+			binary.LittleEndian.PutUint32(buf[uint32(i)*4:], uint32(n))
+		}
+	default:
+		return buf, fmt.Errorf("unsupported type: %s", typeName(elemType))
+	}
+	return buf, nil
+}
+
+// elemWritePayload is the single SNDRV_CTL_IOCTL_ELEM_WRITE argument:
+// one 1224-byte snd_ctl_elem_value, not one write per element.
+func elemWritePayload(id elemID, info elemInfo, values []int64) ([]byte, error) {
+	val, err := fillElemValue(id, info, values)
+	if err != nil {
+		return nil, err
+	}
+	size := int(unsafe.Sizeof(val))
+	out := make([]byte, size)
+	copy(out, unsafe.Slice((*byte)(unsafe.Pointer(&val)), size))
+	return out, nil
+}
+
+func fillElemValue(id elemID, info elemInfo, values []int64) (elemValue, error) {
 	var val elemValue
 	val.ID = id
-
-	switch info.Type {
-	case SND_CTL_ELEM_TYPE_BOOLEAN:
-		// On 64-bit, boolean uses long (8 bytes per value)
-		v := uint64(0)
-		if valueStr == "1" || strings.EqualFold(valueStr, "on") || strings.EqualFold(valueStr, "true") {
-			v = 1
-		}
-		for i := uint32(0); i < info.Count; i++ {
-			binary.LittleEndian.PutUint64(val.Value[i*8:], v)
-		}
-
-	case SND_CTL_ELEM_TYPE_INTEGER:
-		// On 64-bit, integer uses long (8 bytes per value)
-		n, err := strconv.ParseInt(valueStr, 10, 64)
-		if err != nil {
-			return fmt.Errorf("invalid integer: %s", valueStr)
-		}
-		for i := uint32(0); i < info.Count; i++ {
-			binary.LittleEndian.PutUint64(val.Value[i*8:], uint64(n))
-		}
-
-	case SND_CTL_ELEM_TYPE_ENUMERATED:
-		// Enumerated uses unsigned int (4 bytes per value)
-		// Try as numeric index first
-		n, err := strconv.ParseUint(valueStr, 10, 32)
-		if err != nil {
-			// Not numeric — resolve enum name to index
-			idx, found := findEnumIndex(fd, id, info, valueStr)
-			if !found {
-				return fmt.Errorf("enum value '%s' not found (items: %d)", valueStr, info.enumItems())
-			}
-			n = uint64(idx)
-		}
-		for i := uint32(0); i < info.Count; i++ {
-			binary.LittleEndian.PutUint32(val.Value[i*4:], uint32(n))
-		}
-
-	default:
-		return fmt.Errorf("unsupported type: %s", typeName(info.Type))
+	buf, err := encodeElemValues(info.Type, info.Count, values)
+	if err != nil {
+		return val, err
 	}
+	val.Value = buf
+	return val, nil
+}
 
+func setElemValues(fd int, id elemID, info elemInfo, raw []string) error {
+	nums, err := parseControlValues(info, raw, func(name string) (uint32, bool) {
+		return findEnumIndex(fd, id, info, name)
+	})
+	if err != nil {
+		return err
+	}
+	val, err := fillElemValue(id, info, nums)
+	if err != nil {
+		return err
+	}
 	return ioctl(fd, SNDRV_CTL_IOCTL_ELEM_WRITE, unsafe.Pointer(&val))
 }
 
@@ -412,8 +507,13 @@ func findControlByName(fd int, name string) (elemID, elemInfo, bool) {
 }
 
 func main() {
-	card := 0
 	args := os.Args[1:]
+	if len(args) == 1 && args[0] == "--version" {
+		fmt.Println("tinymix-helper " + helperVersion)
+		return
+	}
+
+	card := 0
 
 	// Parse options: -D card, -e (enum dump)
 	enumDump := false
@@ -494,11 +594,11 @@ func main() {
 		}
 		fmt.Printf("%s: %s\n", id.nameStr(), formatValue(fd, info, val))
 	} else {
-		// Set control value
-		err := setElemValue(fd, id, info, args[1])
+		// One ioctl. args[1:] are the element values, in order.
+		err := setElemValues(fd, id, info, args[1:])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error setting control '%s' to '%s': %v\n",
-				controlName, args[1], err)
+				controlName, strings.Join(args[1:], " "), err)
 			os.Exit(1)
 		}
 		// Read back

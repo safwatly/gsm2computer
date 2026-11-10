@@ -38,12 +38,12 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        // versionCode 350: Moto Voice Tx Mute is mute/VSID/ramp on call ACTIVE
-        // and again when the playback track routes. No /proc status RUNNING
-        // gate. Default VSID is VoiceMMode1 0x11C05000. The inject marker
+        // versionCode 351: the Magisk tinymix helper writes every value in
+        // one ioctl. Voice Tx Mute is still [0, VSID, 0] on call ACTIVE.
+        // Readback is not used (kernel getter is NULL). The inject marker
         // defaults on. 348 stays held.
-        versionCode = 350
-        versionName = "0.2.11"
+        versionCode = 351
+        versionName = "0.2.12"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

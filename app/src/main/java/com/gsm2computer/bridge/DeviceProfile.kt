@@ -606,7 +606,9 @@ data class DeviceProfile(
          *     VoiceMMode1 `0x11C05000` unless a HAL log, property, or a pcm
          *     id names exactly one MMode frontend. There is no RUNNING gate:
          *     this kernel has no per-PCM status files. The other MMode slot
-         *     is not written. Voice Rx/Tx Device Mute stay untouched.
+         *     is not written. The write goes through the Magisk Go helper
+         *     (`tinymix-helper 351`); a readback cannot confirm it because
+         *     the kernel getter is NULL. Voice Rx/Tx Device Mute stay untouched.
          *   - Follow-up, not this build: stop the manual Incall_Music
          *     MM1/MM2/MM9 toggles and the PhasedInjector raw resets, and let
          *     the HAL own incall_music_uplink.

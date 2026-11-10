@@ -22,12 +22,31 @@ package com.gsm2computer.bridge
  * of the two MMode VSIDs wins. A pcm list that contains exactly one of
  * the two ids wins when the HAL text is empty or names both.
  *
+ * The Moto tinymix is the Go helper in the Magisk module, copied to
+ * `/data/local/tmp/tinymix` by `service.sh`. Helper 351 writes every
+ * value in one ioctl. The kernel getter for this control is NULL, so
+ * a readback cannot confirm the value; each attempt checks dmesg for a
+ * new `Invalid session_id : 0` instead. `voc_start_playback: Invalid
+ * session` is iteration noise and is not that check.
+ *
  * Does not write `Voice Rx Device Mute` or `Voice Tx Device Mute`.
  */
 internal object VoiceTxUnmute {
     const val CONTROL = "Voice Tx Mute"
     const val MMODE1_VSID = 0x11C05000L
     const val MMODE2_VSID = 0x11DC5000L
+
+    /** Printed by `tinymix --version`. The bridge will not write an older helper. */
+    const val HELPER_BANNER = "tinymix-helper 351"
+
+    /** `voice_get_idx_for_session` prints this when the session id is 0. */
+    const val INVALID_SESSION_ZERO = "Invalid session_id : 0"
+
+    /** Tail only. The verdict also uses a full count of the same string. */
+    const val DMESG_TAIL = "dmesg | tail -n 80"
+
+    const val DMESG_COUNT =
+        "dmesg | grep -F 'Invalid session_id : 0' | wc -l"
 
     /** From the trigger: immediately, then 1s, then 3s. Not cumulative. */
     val RETRY_DELAYS_MS: List<Long> = listOf(0L, 1_000L, 3_000L)
@@ -110,7 +129,13 @@ internal object VoiceTxUnmute {
     /** `[mute=0, vsid, ramp_ms=0]`. Decimal, because tinymix parses integers in base 10. */
     fun unmuteCommand(vsid: Long): String = "tinymix '$CONTROL' 0 $vsid 0"
 
-    fun readbackCommand(): String = "tinymix '$CONTROL'"
+    fun helperVersionCommand(): String = "tinymix --version"
+
+    /**
+     * The kernel `.get` for Voice Tx Mute is NULL, so ELEM_READ returns
+     * EPERM even as root. Do not treat a tinymix read as the value.
+     */
+    const val READBACK_SKIPPED = "voice tx unmute readback skipped reason=kernel-getter-null"
 
     fun oneLine(output: String): String =
         output.replace('\n', ' ').trim().take(300).ifEmpty { "(empty)" }
@@ -127,7 +152,47 @@ internal object VoiceTxUnmute {
         "voice tx unmute attempt reason=$reason delayMs=$delayMs why=$why " +
             "vsid=$vsid argv=$argv exit=$exitCode out=${oneLine(output)}"
 
-    fun readbackLine(reason: String, delayMs: Long, argv: String, exitCode: Int, output: String): String =
-        "voice tx unmute readback reason=$reason delayMs=$delayMs argv=$argv " +
-            "exit=$exitCode out=${oneLine(output)}"
+    /**
+     * [beforeCount] and [afterCount] are `wc -l` of [INVALID_SESSION_ZERO]
+     * across dmesg. A new warning after the write fails the attempt.
+     * [beforeTail] and [afterTail] are the end of dmesg, used for a positive
+     * `msm_voice_mute_put` line when dynamic debug is on. `voc_start_playback:
+     * Invalid session` is not the session-id check.
+     */
+    fun dmesgCheck(beforeCount: Int, afterCount: Int, beforeTail: String, afterTail: String): String {
+        val fresh = freshKernelLines(beforeTail, afterTail)
+        val bad = afterCount > beforeCount ||
+            fresh.lineSequence().any { it.contains(INVALID_SESSION_ZERO) }
+        val positive = fresh.lineSequence().filter { line ->
+            line.contains("msm_voice_mute_put:") || line.contains("session_id=0x11c05000", ignoreCase = true)
+        }.joinToString(" | ")
+        val playbackNoise = fresh.lineSequence().any { line ->
+            line.contains("voc_start_playback") &&
+                line.contains("Invalid session") &&
+                !line.contains("session_id")
+        }
+        val interesting = fresh.lineSequence().filter { line ->
+            line.contains("Invalid session") || line.contains("voice_get_idx") || line.contains("msm_voice_mute")
+        }.joinToString(" | ")
+        return "voice tx unmute dmesg invalid_session_id_0=${if (bad) "present" else "absent"} " +
+            "count_before=$beforeCount count_after=$afterCount " +
+            "positive=${if (positive.isEmpty()) "(none)" else oneLine(positive)} " +
+            "playback_invalid_session=${if (playbackNoise) "ignored" else "absent"} " +
+            "fresh=${oneLine(interesting)}"
+    }
+
+    /** Lines in [after] that follow the last line of [before]. */
+    fun freshKernelLines(before: String, after: String): String {
+        val older = before.lines().filter { it.isNotBlank() }
+        val newer = after.lines().filter { it.isNotBlank() }
+        if (newer.isEmpty()) return ""
+        if (older.isEmpty()) return newer.joinToString("\n")
+        val anchor = older.last()
+        val idx = newer.indexOfLast { it == anchor }
+        if (idx < 0) return ""
+        return newer.drop(idx + 1).joinToString("\n")
+    }
+
+    fun dmesgCount(text: String): Int =
+        text.trim().lineSequence().firstOrNull { it.isNotBlank() }?.trim()?.toIntOrNull() ?: 0
 }
