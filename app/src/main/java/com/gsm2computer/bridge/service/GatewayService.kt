@@ -15,7 +15,10 @@ import android.os.PowerManager
 import android.util.Log
 import com.gsm2computer.bridge.BridgeConfig
 import com.gsm2computer.bridge.BuildConfig
+import com.gsm2computer.bridge.DeviceProfile
 import com.gsm2computer.bridge.MainActivity
+import com.gsm2computer.bridge.MotoIdleMixers
+import com.gsm2computer.bridge.TinymixTrace
 import com.gsm2computer.bridge.diag.BridgeLog
 import com.gsm2computer.bridge.MicCapabilityGuard
 import com.gsm2computer.bridge.R
@@ -137,6 +140,7 @@ class GatewayService : Service() {
 
         thread(name = "bridge-init") {
             forceAllowRecordAudio()
+            clearStaleMotoMusicMixers()
             initOrchestrator(cfg)
         }
     }
@@ -285,6 +289,40 @@ class GatewayService : Service() {
     private fun isCallActive(): Boolean {
         val state = orchestrator?.bridgeState ?: return false
         return state != CallOrchestrator.BridgeState.IDLE
+    }
+
+    /**
+     * Older builds left Incall_Music MM1/MM2 On after hangup. Clear them
+     * once, while this process is idle, and log the tinymix readback.
+     * A live call is left alone so the HAL's own route is not disturbed.
+     */
+    private fun clearStaleMotoMusicMixers() {
+        val name = try {
+            GsmCallManager.profile.name
+        } catch (e: Exception) {
+            Log.w(TAG, "moto idle mixer clear skipped: ${e.message}")
+            return
+        }
+        if (!name.startsWith("Moto g84")) return
+        val callActive = GsmCallManager.isCallActive
+        if (!MotoIdleMixers.shouldClear(name, callActive)) {
+            Log.i(TAG, "moto idle mixer clear skipped profile=$name callActive=$callActive")
+            return
+        }
+        val clear = DeviceProfile.resolveCmd(MotoIdleMixers.CLEAR_CMD)
+        if (clear.isEmpty()) {
+            Log.w(TAG, "moto idle mixer clear skipped: tinymix not found")
+            return
+        }
+        val writes = TinymixTrace.run(clear, timeoutMs = 4_000) { BridgeLog.i(it) }
+        val readback = TinymixTrace.run(
+            DeviceProfile.resolveCmd(MotoIdleMixers.READBACK_CMD),
+            timeoutMs = 4_000,
+        ) { BridgeLog.i(it) }
+        val line = "moto idle MM1/MM2 clear ${writes.joinToString(" | ")} " +
+            "readback=${readback.joinToString(" | ")}"
+        Log.i(TAG, line)
+        BridgeLog.i(line)
     }
 
     private fun stopGateway() {

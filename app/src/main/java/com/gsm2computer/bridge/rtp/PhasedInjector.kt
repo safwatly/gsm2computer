@@ -14,7 +14,8 @@ import java.io.OutputStream
  * marker unless `persist.gsm2computer.inject_marker` is `0`. Builds 342's
  * later phases (PCM 23 reorder, AFE-proxy, and the post-45s decide) were
  * never called from [start] and are not in this class.
- * Mixers are reverted at stop / call end. Meta keys are inject_*.
+ * The HAL owns Incall_Music; stop does not reset those mixers.
+ * Meta keys are inject_*.
  */
 class PhasedInjector(
     private val ctx: Context,
@@ -164,14 +165,9 @@ class PhasedInjector(
     fun stop() {
         alive = false
         killInj()
-        val traced = com.gsm2computer.bridge.TinymixTrace.run(
-            "tinymix 'Incall_Music Audio Mixer MultiMedia9' 0; tinymix 'Incall_Music_2 Audio Mixer MultiMedia9' 0",
-            timeoutMs = 4000,
-        ).joinToString(" ")
         val tail = sh("tail -3 /data/local/tmp/calldump/afeproxy.log", 2000)
-        val r = "$traced $tail"
         put("inject_bytes", bytes); put("inject_track_bytes", trackBytes)
-        phaseMark("STOP reverted=[$r]")
+        phaseMark("STOP hal_owned_mixers afe=[$tail]")
     }
 
     companion object {

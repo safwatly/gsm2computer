@@ -680,6 +680,7 @@ class RtpSession(
             profile.name,
             profile.routing.playbackToTelephony,
         )
+        recordInjectPolicy()
         // Re-assert Telephony Tx now the call is ACTIVE: policy only picks the
         // INCALL_MUSIC output (incall_music_uplink -> MultiMedia9) while in call.
         if (profile.routing.playbackToTelephony) {
@@ -1812,8 +1813,19 @@ class RtpSession(
      * The VSID defaults to VoiceMMode1. Does not touch Voice Rx Device Mute
      * or Voice Tx Device Mute, and does not wait on a PCM status file.
      */
+    private fun recordInjectPolicy() {
+        if (!profile.name.startsWith("Moto g84")) return
+        val policy = GsmCallManager.injectPolicy
+        captureTap?.putMeta("inject_policy", policy.wire)
+        val voice = if (policy.writesVoiceTxMute) "session-tuple" else "skipped"
+        val line = "inject policy=${policy.wire} voiceTxMute=$voice micApi=${policy.micApi.wire}"
+        Log.i(TAG, line)
+        listener?.onRtpStats(line)
+    }
+
     private fun unmuteVoiceTxForActiveSession(reason: String) {
         if (!profile.routing.sessionVoiceTxUnmute) return
+        if (profile.name.startsWith("Moto g84") && !GsmCallManager.injectPolicy.writesVoiceTxMute) return
         VoiceTxMuteJob.schedule(reason, { running.get() }) { listener?.onRtpStats(it) }
     }
 

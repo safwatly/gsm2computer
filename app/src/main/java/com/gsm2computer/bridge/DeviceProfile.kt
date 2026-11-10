@@ -596,22 +596,31 @@ data class DeviceProfile(
          *     DAC, both aw87xxx amps and the codec RX volumes after the route
          *     settles.  These are codec-side (post-DSP), so DSP incall-record
          *     and Incall_Music injection are unaffected.
-         *   - Room mic cut at the codec (TX_DEC/ADC volumes), not via
-         *     setMicrophoneMute: the QCOM HAL maps API mute to 'Voice Tx Mute',
-         *     which would also mute Incall_Music injection.
+         *   - Room mic is cut at the codec (TX_DEC/ADC volumes) for every
+         *     inject policy. API mic mute is separate and policy-selected:
+         *     the default sets isMicrophoneMute so the HAL can device-mute
+         *     the handset mic without stream-muting in-call music.
          *   - Capture caller-only via VOICE_DOWNLINK (incall-rec-downlink =
          *     MultiMedia9 Mixer VOC_REC_DL), so injected audio cannot echo back.
          *   - `Voice Tx Mute` is a 3-value control (mute, VSID, ramp). The
-         *     one-value `0` write hits session 0. [VoiceTxMuteJob] writes
-         *     VoiceMMode1 `0x11C05000` unless a HAL log, property, or a pcm
-         *     id names exactly one MMode frontend. There is no RUNNING gate:
-         *     this kernel has no per-PCM status files. The other MMode slot
-         *     is not written. The write goes through the Magisk Go helper
+         *     one-value `0` write hits session 0. When the call's inject
+         *     policy asks for it, [VoiceTxMuteJob] writes VoiceMMode1
+         *     `0x11C05000` unless a HAL log, property, or a pcm id names
+         *     exactly one MMode frontend. There is no RUNNING gate: this
+         *     kernel has no per-PCM status files. The other MMode slot is
+         *     not written. The write goes through the Magisk Go helper
          *     (`tinymix-helper 351`); a readback cannot confirm it because
          *     the kernel getter is NULL. Voice Rx/Tx Device Mute stay untouched.
-         *   - Follow-up, not this build: stop the manual Incall_Music
-         *     MM1/MM2/MM9 toggles and the PhasedInjector raw resets, and let
-         *     the HAL own incall_music_uplink.
+         *   - The HAL owns Incall_Music. This profile does not write
+         *     MM1/MM2/MM9 and does not cycle incall_music_enabled. Stale
+         *     idle MM1/MM2 values are cleared once at service start.
+         *   - `persist.gsm2computer.inject_policy` is read when the call
+         *     goes ACTIVE. Default `hal_owned_api_mute` skips the Voice Tx
+         *     Mute tuple and sets AudioManager.isMicrophoneMute for the
+         *     bridge, then restores the previous value. `hal_owned` keeps
+         *     the session tuple and forces the API mic unmuted.
+         *     `hal_owned_no_unmute` writes neither. TX_DEC, ADC, and amp
+         *     isolation stay on for every policy.
          */
         fun motoG84Holi() = DeviceProfile(
             name = "Moto g84 (holi)",
@@ -622,27 +631,18 @@ data class DeviceProfile(
                     append("tinymix 'EAR_RDAC Switch' 0 2>/dev/null; ")
                     for (i in 0..3) append("tinymix 'TX_DEC$i Volume' 0 2>/dev/null; ")
                     for (i in 1..3) append("tinymix 'ADC$i Volume' 0 2>/dev/null; ")
-                    append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
-                    append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
-                    // holi HAL: USECASE_INCALL_MUSIC_UPLINK = PCM 23 = MultiMedia9
-                    append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 1 2>/dev/null")
                 },
                 mixerRestoreCmd = buildString {
-                    // Idle baseline captured 2026-11-01 (moto-mixer-baseline.txt)
+                    // Idle baseline captured 2026-11-01 (moto-mixer-baseline.txt).
+                    // Incall_Music is left to the HAL; only the physical gains return.
                     append("tinymix 'RX_RX0 Digital Volume' 79 2>/dev/null; ")
                     append("tinymix 'RX_RX1 Digital Volume' 79 2>/dev/null; ")
                     append("tinymix 'RX_RX2 Digital Volume' 84 2>/dev/null; ")
                     for (i in 0..3) append("tinymix 'TX_DEC$i Volume' 84 2>/dev/null; ")
                     for (i in 1..3) append("tinymix 'ADC$i Volume' 12 2>/dev/null; ")
-                    append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 0 2>/dev/null; ")
-                    append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 0 2>/dev/null; ")
-                    append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 0 2>/dev/null")
                 },
-                mixerIncallMusicCmd = buildString {
-                    append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
-                    append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
-                    append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 1 2>/dev/null")
-                },
+                // Empty: post-play, rebuild, and the +3s fallback must not write MM1/MM2/MM9.
+                mixerIncallMusicCmd = "",
                 mixerDiagGrep = "tinymix 2>&1 | grep -iE '(MultiMedia9 Mixer|VOC_REC|Incall_Music|" +
                     "Voice Tx Mute|Voice Rx|aw87xxx_profile|EAR_RDAC|TX_DEC[0-3] Vol|ADC[1-3] Vol|VoiceMMode1)'",
                 // Re-asserted during the bridge: HAL route changes re-enable amps/mics.
@@ -669,7 +669,8 @@ data class DeviceProfile(
                 // Inject via Telephony Tx (incall_music_uplink mixPort in the
                 // Moto audio_policy) instead of MEDIA->handset, which stalled.
                 playbackToTelephony = true,
-                incallMusicParam = "incall_music_enabled",
+                // Empty skips the false→50ms→true cycle and the teardown false.
+                incallMusicParam = "",
                 voiceDownlinkWorks = false,
                 captureSource = MediaRecorder.AudioSource.VOICE_CALL,
                 routeChangeDelayMs = 700,
@@ -898,8 +899,9 @@ data class HalRoutingProfile(
      *  Pixel/Tensor: safe when SIP playback routes via INCALL_TX tinymix. */
     val muteMicrophoneAtApi: Boolean = false,
 
-    /** After the voice PCM is RUNNING, write `Voice Tx Mute` as mute/VSID/ramp.
-     *  Moto g84 only. Other profiles keep their existing one-value commands. */
+    /** Moto g84 knows the 3-value `Voice Tx Mute` write. [InjectPolicy]
+     *  chooses whether this call writes it. Other profiles keep their
+     *  existing one-value commands. */
     val sessionVoiceTxUnmute: Boolean = false,
 )
 
