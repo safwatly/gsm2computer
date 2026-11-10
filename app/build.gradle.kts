@@ -38,15 +38,13 @@ android {
         applicationId = "com.gsm2computer.bridge"
         minSdk = 26
         targetSdk = 34
-        // versionCode 354 (after 331–353): Moto hal_owned_no_capture leaves
-        // voice-call capture closed for the whole call. AUDIO-FLOW mute
-        // reads use tinymix-helper 351 on the root shell and log a null
-        // kernel getter. Voice-call volume writes share audioLock with
-        // hangup restore, including forceReset. The inject-policy latch
-        // is released after the RTP session stops, so the next ACTIVE
-        // reads persist.gsm2computer.inject_policy again.
-        versionCode = 354
-        versionName = "0.2.15"
+        // versionCode 355 (after 331–354): an ACTIVE call races
+        // wss://gsm.ta3leam.com and ws://100.113.222.47:8787 with a 6s
+        // attempt budget and keeps that backoff until hangup. A grace
+        // window expiry or a hub-link error does not cancel the retries
+        // or tear the bridge down while telephony is still off-hook.
+        versionCode = 355
+        versionName = "0.2.16"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

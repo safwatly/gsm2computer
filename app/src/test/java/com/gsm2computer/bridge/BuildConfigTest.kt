@@ -56,6 +56,16 @@ class BuildConfigTest {
     }
 
     @Test
+    fun versionCode355KeepsThe331Through354Lineage() {
+        assertTrue(gradleScript.contains("versionCode = 355"))
+        assertTrue(gradleScript.contains("versionName = \"0.2.16\""))
+        assertTrue(
+            "the 331–354 lineage must stay in the version comment",
+            gradleScript.contains("331–354") || gradleScript.contains("331-354"),
+        )
+    }
+
+    @Test
     fun defaultHubControlUrlPointsAtTailscaleHub() {
         assertTrue(
             "DEFAULT_HUB_CONTROL_URL must point at the Tailscale hub",

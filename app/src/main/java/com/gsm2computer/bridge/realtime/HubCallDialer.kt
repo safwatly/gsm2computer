@@ -26,7 +26,7 @@ class HubCallDialer(
     private val hubOwned: Boolean,
     private val openAiTokenUrl: String,
     private val model: String,
-    private val handshakeTimeoutMs: Long = 4_000,
+    private val handshakeTimeoutMs: Long = ATTEMPT_TIMEOUT_MS,
 ) {
     @Volatile private var activeModel: String = model
 
@@ -40,8 +40,17 @@ class HubCallDialer(
 
     fun dial(request: DialRequest, live: Live): DialResponse {
         val secrets = listOf(request.endpoint.deviceToken)
+        val race = request.race
+        if (race != null && race.abandoned(request.endpoint.url)) {
+            return DialResponse(DialStatus.RETRYABLE, 0, "lost race")
+        }
+        val startedNs = System.nanoTime()
+        fun remainingMs(): Long {
+            val spent = (System.nanoTime() - startedNs) / 1_000_000L
+            return (handshakeTimeoutMs - spent).coerceAtLeast(1L)
+        }
         val minted = try {
-            mint(request)
+            mint(request) { remainingMs() }
         } catch (failed: DialFailed) {
             return failed.response
         } catch (e: Exception) {
@@ -61,12 +70,24 @@ class HubCallDialer(
         for ((name, value) in HubEndpoints.hubHeaders(request.endpoint, request.sessionId)) {
             builder.header(name, value)
         }
+        if (race != null && race.abandoned(request.endpoint.url)) {
+            return DialResponse(DialStatus.RETRYABLE, 0, "lost race")
+        }
         val gate = HandshakeGate()
         val failure = AtomicReference<DialResponse?>(null)
         val latch = CountDownLatch(1)
+        val socketRef = AtomicReference<WebSocket?>(null)
+        race?.track(request.endpoint.url) { socketRef.get()?.cancel() }
         val socket = http.newWebSocket(builder.build(), object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (race != null && !race.claim(request.endpoint.url)) {
+                    webSocket.cancel()
+                    failure.set(DialResponse(DialStatus.RETRYABLE, 0, "lost race"))
+                    latch.countDown()
+                    return
+                }
                 if (!gate.onOpen()) {
+                    race?.release(request.endpoint.url)
                     webSocket.cancel()
                     return
                 }
@@ -114,7 +135,11 @@ class HubCallDialer(
                 live.onDead(webSocket, code, scrubSecrets(reason, secrets))
             }
         })
-        if (!latch.await(handshakeTimeoutMs, TimeUnit.MILLISECONDS)) {
+        socketRef.set(socket)
+        if (race != null && race.abandoned(request.endpoint.url)) {
+            socket.cancel()
+        }
+        if (!latch.await(remainingMs(), TimeUnit.MILLISECONDS)) {
             val status = timeoutDecision(gate) { socket.cancel() }
             if (status == DialStatus.OPENED) return DialResponse(DialStatus.OPENED, 101, "")
             return failure.get() ?: DialResponse(DialStatus.RETRYABLE, 0, "handshake timeout")
@@ -123,7 +148,7 @@ class HubCallDialer(
         return failure.get() ?: DialResponse(DialStatus.RETRYABLE, 0, "handshake ended")
     }
 
-    private fun mint(request: DialRequest): String {
+    private fun mint(request: DialRequest, remainingMs: () -> Long): String {
         val secrets = listOf(request.endpoint.deviceToken)
         val url = if (hubOwned) {
             HubEndpoints.tokenUrl(HubEndpoints.httpOrigin(request.endpoint.url), "")
@@ -138,7 +163,8 @@ class HubCallDialer(
             builder.header(name, value)
         }
         val call = http.newCall(builder.build())
-        call.timeout().timeout(10, TimeUnit.SECONDS)
+        request.race?.track(request.endpoint.url) { call.cancel() }
+        call.timeout().timeout(remainingMs(), TimeUnit.MILLISECONDS)
         call.execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) {
@@ -206,6 +232,9 @@ internal class HandshakeGate {
         const val FAILED = 2
     }
 }
+
+/** One attempt covers the token POST and the websocket upgrade together. */
+internal const val ATTEMPT_TIMEOUT_MS = 6_000L
 
 /** Timeout outcome. [cancel] runs only when this attempt is the one that failed. */
 internal fun timeoutDecision(gate: HandshakeGate, cancel: () -> Unit): DialStatus {

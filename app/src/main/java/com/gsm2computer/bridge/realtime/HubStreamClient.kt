@@ -5,11 +5,13 @@ import android.util.Log
 import com.gsm2computer.bridge.DialRequest
 import com.gsm2computer.bridge.DialResponse
 import com.gsm2computer.bridge.DialStatus
+import com.gsm2computer.bridge.EndpointRace
 import com.gsm2computer.bridge.HubConnectionRoutine
 import com.gsm2computer.bridge.HubEndpoint
 import com.gsm2computer.bridge.HubLink
 import com.gsm2computer.bridge.diag.BridgeLog
 import com.gsm2computer.bridge.diag.HubLinkGrace
+import com.gsm2computer.bridge.diag.HubRetry
 import com.gsm2computer.bridge.rtp.MediaTransport
 import okhttp3.OkHttpClient
 import okhttp3.WebSocket
@@ -24,11 +26,13 @@ import java.util.concurrent.atomic.AtomicReference
  * WebSocket transport for the GSM bridge.
  *
  * A mid-call socket failure does not end the GSM call. This client keeps
- * retrying, with backoff, until [linkGraceMs] expires or [stop] runs because
- * the GSM call itself ended. Close code 1000 is a real hangup and is not
- * retried. Silence is what the caller hears during the gap.
+ * retrying, with backoff, for the whole time [stop] has not run. [linkGraceMs]
+ * still shapes the backoff (1s, 2s, …, 8s). When that window ends and the
+ * call is still up, retries continue at the cap. [stop] runs on hangup.
+ * Close code 1000 is a real hub hangup and is not retried. Silence is what
+ * the caller hears during the gap.
  *
- * Each connect and each reconnect walks [endpoints] with [HubConnectionRoutine].
+ * Each connect races [endpoints] with [HubConnectionRoutine.connectRacing].
  * The first that opens is held until the socket dies. Uplink stays 16 kHz
  * s16le in a binary frame ([UplinkWire]). Downlink stays the JSON PCM the hub
  * already sends. Appends without format/rate stay 8 kHz μ-law.
@@ -46,7 +50,7 @@ class HubStreamClient(
 ) : MediaTransport {
 
     private val http = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
+        .connectTimeout(ATTEMPT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         // Default write timeout is 10s. A blocked audio write then fails the
         // socket on its own, with no log of the queue that caused it.
         // Liveness is the 20s ping plus [WsSendBudget] cancelling a wedged queue.
@@ -76,6 +80,8 @@ class HubStreamClient(
 
     @Volatile private var linkEndpoint: String = ""
     @Volatile private var linkEntrance: String = ""
+    @Volatile private var activeRace: EndpointRace? = null
+    @Volatile private var loggedGraceHold = false
 
     override fun currentLink(): HubLink = HubLink(linkEndpoint, linkEntrance, sessionId)
 
@@ -120,10 +126,16 @@ class HubStreamClient(
                     }
                     val now = System.currentTimeMillis()
                     grace.markLost(now)
-                    val baseDelay = grace.retryDelayMs(now)
+                    val baseDelay = HubRetry.delayWhileOffHook(grace, now, offHook = !closed)
                     if (baseDelay == null) {
                         fail("hub link grace expired after ${linkGraceMs}ms: $pending")
                         return
+                    }
+                    if (grace.retryDelayMs(now) == null && !loggedGraceHold) {
+                        loggedGraceHold = true
+                        BridgeLog.w(
+                            "hub grace elapsed after ${linkGraceMs}ms; telephony still off-hook, continuing",
+                        )
                     }
                     val delay = baseDelay + ((grace.attempt * 173L) % 500L)
                     linkState = "hold"
@@ -193,6 +205,7 @@ class HubStreamClient(
                 linkState = "open"
                 openedAtMs = System.currentTimeMillis()
                 grace.markLinked()
+                loggedGraceHold = false
                 sink?.onLinkHold(false, "hub ws open")
                 trace(
                     "ws_open",
@@ -246,11 +259,27 @@ class HubStreamClient(
             hubOwned = hubOwnedSession,
             openAiTokenUrl = tokenUrl,
             model = connectModel,
+            handshakeTimeoutMs = ATTEMPT_TIMEOUT_MS,
         )
-        val routine = HubConnectionRoutine(targets) { request ->
-            if (closed) DialResponse(DialStatus.STOP, 0, "stopped") else dialer.dial(request, live)
+        val routine = HubConnectionRoutine(
+            targets,
+            onAttempt = { attempt ->
+                BridgeLog.i(
+                    "hub dial pass=${attempt.pass} index=${attempt.index} url=${attempt.url} " +
+                        "outcome=${attempt.outcome} http=${attempt.httpStatus} " +
+                        "detail=${attempt.detail.take(120)}",
+                )
+            },
+            onRace = { activeRace = it },
+        ) { request ->
+            if (closed) {
+                DialResponse(DialStatus.STOP, 0, "stopped")
+            } else {
+                BridgeLog.i("hub dial start url=${request.endpoint.url}")
+                dialer.dial(request, live)
+            }
         }
-        val result = routine.connect(sessionId, maxPasses = 1) { !closed }
+        val result = routine.connectRacing(sessionId, maxPasses = 1) { !closed }
         BridgeLog.i("connect ${result.summary()}")
         if (!result.opened) {
             if (closed || result.cancelled) return null
@@ -521,6 +550,7 @@ class HubStreamClient(
         if (closed) return
         closed = true
         linkState = "closed"
+        activeRace?.seal()
         trace("ws_closed", mapOf("code" to 1000, "reason" to "call ended", "local" to true))
         sessionThread?.interrupt()
         pingThread?.interrupt()

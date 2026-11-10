@@ -12,6 +12,7 @@ import com.gsm2computer.bridge.HubLink
 import com.gsm2computer.bridge.RootShell
 import com.gsm2computer.bridge.audio.MicIsolationGuard
 import com.gsm2computer.bridge.diag.CallTraceSampler
+import com.gsm2computer.bridge.diag.HubRetry
 import com.gsm2computer.bridge.gsm.GsmCallManager
 import com.gsm2computer.bridge.realtime.HubStreamClient
 import com.gsm2computer.bridge.rtp.MediaTransport
@@ -250,6 +251,11 @@ class CallOrchestrator(
                 listener?.onError("Audio: $error")
             }
             override fun onRtpTimeout(reason: String) {
+                if (gsmStillOffHook()) {
+                    Log.w(TAG, "hub link down while GSM off-hook; holding retries ($reason)")
+                    onHubLinkHold(true, reason)
+                    return
+                }
                 tearDown(reason.ifBlank { "Hub stream timeout" })
             }
             override fun onLinkHold(holding: Boolean, detail: String) {
@@ -261,6 +267,17 @@ class CallOrchestrator(
         }
         session.start()
         activeSession = session
+    }
+
+    private fun gsmStillOffHook(): Boolean {
+        val call = activeGsmCall ?: return false
+        val state = try {
+            call.state
+        } catch (e: Exception) {
+            Log.w(TAG, "gsm state unreadable; keeping hub retries: ${e.message}")
+            return true
+        }
+        return HubRetry.keepsRetrying(state)
     }
 
     @Synchronized

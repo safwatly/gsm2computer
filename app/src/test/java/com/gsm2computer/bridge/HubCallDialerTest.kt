@@ -17,6 +17,7 @@ import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class HubCallDialerTest {
 
@@ -186,7 +187,55 @@ class HubCallDialerTest {
         }
     }
 
-    private fun dialer(): HubCallDialer = HubCallDialer(
+    @Test
+    fun parallelEntrancesTakeTheFirstOpenInsideOneAttemptBudget() {
+        val slow = MockWebServer()
+        val fast = MockWebServer()
+        slow.start()
+        fast.start()
+        try {
+            val token = MockResponse().setBody("""{"value":"hub-token","model":"hub"}""")
+            slow.enqueue(token)
+            slow.enqueue(
+                MockResponse()
+                    .setHeadersDelay(2, TimeUnit.SECONDS)
+                    .withWebSocketUpgrade(object : WebSocketListener() {}),
+            )
+            fast.enqueue(MockResponse().setBody("""{"value":"hub-token","model":"hub"}"""))
+            fast.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {}))
+            val installed = AtomicInteger(0)
+            val dialer = dialer(handshakeTimeoutMs = 1_500)
+            val routine = HubConnectionRoutine(
+                listOf(
+                    HubEndpoint(slow.url("/").toString(), secret),
+                    HubEndpoint(fast.url("/").toString(), secret),
+                ),
+            ) { request ->
+                dialer.dial(request, object : HubCallDialer.Live {
+                    override fun onOpen(webSocket: WebSocket, request: DialRequest) {
+                        installed.incrementAndGet()
+                    }
+                    override fun onMessage(webSocket: WebSocket, text: String) = Unit
+                    override fun onDead(webSocket: WebSocket, code: Int, detail: String) = Unit
+                })
+            }
+            val started = System.currentTimeMillis()
+            val result = routine.connectRacing()
+            val elapsed = System.currentTimeMillis() - started
+            assertTrue(result.opened)
+            assertTrue(result.url.startsWith(fast.url("/").toString().substringBefore("/")))
+            assertEquals(fast.url("/").toString(), result.url)
+            assertEquals(1, installed.get())
+            assertTrue("elapsed=$elapsed", elapsed < 1_200)
+            Thread.sleep(500)
+            assertEquals(1, installed.get())
+        } finally {
+            slow.shutdown()
+            fast.shutdown()
+        }
+    }
+
+    private fun dialer(handshakeTimeoutMs: Long = 3_000): HubCallDialer = HubCallDialer(
         http = OkHttpClient.Builder()
             .connectTimeout(2, TimeUnit.SECONDS)
             .readTimeout(2, TimeUnit.SECONDS)
@@ -194,7 +243,7 @@ class HubCallDialerTest {
         hubOwned = true,
         openAiTokenUrl = "",
         model = "hub",
-        handshakeTimeoutMs = 3_000,
+        handshakeTimeoutMs = handshakeTimeoutMs,
     )
 
     private fun quietLive(): HubCallDialer.Live = object : HubCallDialer.Live {
