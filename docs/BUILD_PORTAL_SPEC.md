@@ -39,12 +39,20 @@ Inbound SMS forwarder is already shipped: [SAF-18](https://linear.app/safwatly/i
 
 ```
 GET  /portal/              → PWA static files
-GET  /portal/api/threads           → [{peer, lastBody, lastAt, unread?}]
-GET  /portal/api/messages?peer=+1  → thread messages
+GET  /portal/api/threads           → [{peer, lastBody, lastAt, unread}]
+GET  /portal/api/threads?viewer=   → same, plus that viewer's unread, readTs, readId
+GET  /portal/api/messages?peer=+1  → JSON array, whole thread, oldest first (unchanged)
+GET  /portal/api/messages?peer=+1&limit=50
+GET  /portal/api/messages?peer=+1&before=<ts>&before_id=<id>&limit=50
+GET  /portal/api/messages?peer=+1&since=<ts>&since_id=<id>&limit=50
+                                   → {messages, hasOlder, hasNewer}; does not mark read
+POST /portal/api/messages/read     → {viewer, peer, ts, id} advances that viewer only
 POST /portal/api/messages/send     → {to, body} queue outbound
 GET  /portal/api/calls             → call history
 GET  /portal/api/events            → SSE stream (new message, new call)
 ```
+
+Message window, unread cursors, and how this differs from WhatsApp / Messages / Signal / Telegram / iMessage: [PORTAL_MESSAGING_UX.md](PORTAL_MESSAGING_UX.md).
 
 Existing `POST /sms` from Pixel: **persist** to SQLite in addition to current logging/routing.
 

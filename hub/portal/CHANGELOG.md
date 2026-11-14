@@ -1,5 +1,12 @@
 # Hub portal changelog
 
+## 0.1.2 — Transcript window and per-viewer unread
+
+- A thread opens on the newest page (50 messages), pinned to the bottom of `#messages`. Older pages load on scroll-up with `before` / `before_id`.
+- `GET /portal/api/messages?peer=` with no window params is still the full JSON array. Bots that only list messages do not move a read cursor.
+- Unread is a per-viewer cursor (`POST /portal/api/messages/read`). The thread list badge, “N new messages” divider, jump-to-latest control, document title, and favicon use that count.
+- Live `message` events append or update one row. A dropped SSE connection catches up with `since` / `since_id`.
+
 ## 0.1.1 — Rich cockpit + SMS desk alerts + open latest
 
 Operator PWA at `/portal/` with Overview, Messaging, Switchboard, and Simulator. Live updates use EventSource `GET /portal/api/events` (`connectEvents` in `src/api.js`).

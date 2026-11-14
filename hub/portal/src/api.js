@@ -1,3 +1,5 @@
+import { normalizeMessagePage } from "./thread-window.js";
+
 const env = import.meta.env || {};
 const HUB_ORIGIN = (env.VITE_HUB_ORIGIN || "").replace(/\/$/, "");
 const API = `${HUB_ORIGIN}/portal/api`;
@@ -42,19 +44,40 @@ function usageFromHealth(health) {
   return null;
 }
 
-export async function getThreads() {
-  const { data } = await fetchOrMock(`${API}/threads`, () => import("./mocks/threads.json"));
+export async function getThreads(viewer) {
+  const qs = viewer ? `?viewer=${encodeURIComponent(viewer)}` : "";
+  const { data } = await fetchOrMock(`${API}/threads${qs}`, () => import("./mocks/threads.json"));
   return data;
 }
 
-export async function getMessages(peer) {
+export async function getMessages(peer, params = {}) {
+  const qs = new URLSearchParams();
+  qs.set("peer", peer);
+  if (params.limit) qs.set("limit", String(params.limit));
+  if (params.before) qs.set("before", params.before);
+  if (params.beforeId) qs.set("before_id", params.beforeId);
+  if (params.since) qs.set("since", params.since);
+  if (params.sinceId) qs.set("since_id", params.sinceId);
   try {
-    return await jsonGet(`${API}/messages?peer=${encodeURIComponent(peer)}`);
+    return normalizeMessagePage(await jsonGet(`${API}/messages?${qs}`), params);
   } catch {
     const loaded = await import("./mocks/messages.json");
     const all = loaded.default;
-    return all[peer] || [];
+    return normalizeMessagePage(all[peer] || [], params);
   }
+}
+
+export async function markThreadRead({ viewer, peer, ts, id }) {
+  const resp = await fetch(`${API}/messages/read`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ viewer, peer, ts, id: id || "" }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(text || `HTTP ${resp.status}`);
+  }
+  return resp.json();
 }
 
 export async function getCalls() {
@@ -86,6 +109,11 @@ export async function sendMessage(to, body) {
 
 export function connectEvents(onEvent) {
   const source = new EventSource(`${API}/events`);
+  let opened = false;
+  source.onopen = () => {
+    if (opened) onEvent("reconnect", {});
+    opened = true;
+  };
   for (const type of ["message", "call", "outbox"]) {
     source.addEventListener(type, (ev) => {
       try {

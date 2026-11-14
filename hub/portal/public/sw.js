@@ -1,5 +1,5 @@
 const BASE = self.registration.scope;
-const CACHE = "gsm2portal-v3";
+const CACHE = "gsm2portal-v4";
 const SHELL = [BASE, `${BASE}index.html`, `${BASE}manifest.json`, `${BASE}icon-192.png`];
 
 self.addEventListener("install", (event) => {

@@ -58,6 +58,15 @@ CREATE TABLE IF NOT EXISTS outbox (
     available_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS outbox_status ON outbox (status, created_at);
+
+CREATE TABLE IF NOT EXISTS read_cursors (
+    viewer TEXT NOT NULL,
+    peer TEXT NOT NULL,
+    read_ts TEXT NOT NULL,
+    read_id TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (viewer, peer)
+);
 """
 
 
@@ -77,9 +86,25 @@ OUTBOUND_SMS_GAP_SECONDS = 6
 # the radio may already have accepted the message.
 OUTBOX_SEND_LEASE_SECONDS = 90
 
+# Portal transcript window. Bots that omit these stay on the full list.
+MESSAGE_PAGE_DEFAULT = 50
+MESSAGE_PAGE_MAX = 200
+_VIEWER_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+
 
 def _parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def cursor_after(ts: str, msg_id: str, other_ts: str, other_id: str) -> bool:
+    """True when (ts, id) is strictly newer than (other_ts, other_id).
+
+    Matches ORDER BY ts, id. ISO-8601 strings sort in the same order the
+    transcript uses; id is only a tie-break, not a clock.
+    """
+    if ts != other_ts:
+        return ts > other_ts
+    return (msg_id or "") > (other_id or "")
 
 
 def normalize_e164(raw: str) -> str:
@@ -407,7 +432,15 @@ class PortalStore:
             return None
         return _row_message(row)
 
-    def list_threads(self) -> list[dict[str, Any]]:
+    def list_threads(self, viewer: Optional[str] = None) -> list[dict[str, Any]]:
+        """Thread list. Without a viewer, unread stays 0 (bot-compatible).
+
+        A viewer id opts into that viewer's inbound unread count and read cursor.
+        Counting is inbound-only and never written by this read.
+        """
+        viewer_id = (viewer or "").strip()
+        if viewer_id and _VIEWER_RE.fullmatch(viewer_id) is None:
+            raise ValueError("invalid viewer")
         sql = """
             SELECT m.peer, m.body, m.ts, m.direction, m.status
             FROM messages m
@@ -420,6 +453,8 @@ class PortalStore:
         """
         with self._lock:
             rows = self._conn.execute(sql).fetchall()
+            counts = self._unread_by_peer_locked(viewer_id) if viewer_id else {}
+            cursors = self._cursors_locked(viewer_id) if viewer_id else {}
         threads: list[dict[str, Any]] = []
         seen: set[str] = set()
         for row in rows:
@@ -427,17 +462,21 @@ class PortalStore:
             if peer in seen:
                 continue
             seen.add(peer)
-            threads.append(
-                {
-                    "peer": peer,
-                    "lastBody": row["body"],
-                    "lastAt": row["ts"],
-                    "unread": 0,
-                }
-            )
+            item: dict[str, Any] = {
+                "peer": peer,
+                "lastBody": row["body"],
+                "lastAt": row["ts"],
+                "unread": counts.get(peer, 0) if viewer_id else 0,
+            }
+            if viewer_id:
+                cursor = cursors.get(peer)
+                item["readTs"] = cursor[0] if cursor else None
+                item["readId"] = cursor[1] if cursor else None
+            threads.append(item)
         return threads
 
     def list_messages(self, peer: str) -> list[dict[str, Any]]:
+        """Every message for this peer, oldest first. Does not mark anything read."""
         peer_n = normalize_e164(peer) or peer.strip()
         with self._lock:
             self._expire_stale_send_leases(utc_now())
@@ -447,6 +486,163 @@ class PortalStore:
             ).fetchall()
             self._conn.commit()
         return [_row_message(r) for r in rows]
+
+    def page_messages(
+        self,
+        peer: str,
+        *,
+        before: Optional[str] = None,
+        before_id: Optional[str] = None,
+        since: Optional[str] = None,
+        since_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """One transcript window. Does not mark anything read.
+
+        No before/since: the newest `limit` rows, oldest-first inside the page.
+        `before` walks older. `since` walks newer. The two cursors cannot combine.
+        """
+        if before and since:
+            raise ValueError("before and since are mutually exclusive")
+        if limit is None:
+            limit = MESSAGE_PAGE_DEFAULT
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 or limit > MESSAGE_PAGE_MAX:
+            raise ValueError(f"limit must be 1..{MESSAGE_PAGE_MAX}")
+        peer_n = normalize_e164(peer) or peer.strip()
+        before_ts = (before or "").strip()
+        since_ts = (since or "").strip()
+        before_key = (before_id or "").strip()
+        since_key = (since_id or "").strip()
+        where = ["peer = ?"]
+        args: list[Any] = [peer_n]
+        newest_window = not before_ts and not since_ts
+        if before_ts:
+            order = "ts DESC, id DESC"
+            if before_key:
+                where.append("(ts < ? OR (ts = ? AND id < ?))")
+                args.extend([before_ts, before_ts, before_key])
+            else:
+                where.append("ts < ?")
+                args.append(before_ts)
+        elif since_ts:
+            order = "ts ASC, id ASC"
+            if since_key:
+                where.append("(ts > ? OR (ts = ? AND id > ?))")
+                args.extend([since_ts, since_ts, since_key])
+            else:
+                where.append("ts > ?")
+                args.append(since_ts)
+        else:
+            order = "ts DESC, id DESC"
+        sql = f"SELECT * FROM messages WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ?"
+        args.append(limit + 1)
+        with self._lock:
+            self._expire_stale_send_leases(utc_now())
+            rows = self._conn.execute(sql, args).fetchall()
+            self._conn.commit()
+        extra = len(rows) > limit
+        rows = rows[:limit]
+        if order.startswith("ts DESC"):
+            rows.reverse()
+            has_older = extra
+            has_newer = bool(before_ts)
+        else:
+            has_older = bool(since_ts)
+            has_newer = extra
+        if newest_window:
+            has_newer = False
+        return {
+            "messages": [_row_message(row) for row in rows],
+            "hasOlder": has_older,
+            "hasNewer": has_newer,
+        }
+
+    def mark_read(self, viewer: str, peer: str, ts: str, msg_id: str = "") -> dict[str, Any]:
+        """Advance one viewer's cursor. Other viewers are left alone.
+
+        The cursor only moves forward. Listing messages does not call this.
+        """
+        viewer_id = (viewer or "").strip()
+        if _VIEWER_RE.fullmatch(viewer_id) is None:
+            raise ValueError("invalid viewer")
+        peer_n = normalize_e164(peer) or peer.strip()
+        if not peer_n:
+            raise ValueError("peer required")
+        read_ts = (ts or "").strip()
+        if not read_ts:
+            raise ValueError("ts required")
+        read_id = (msg_id or "").strip()
+        with self._lock:
+            current = self._conn.execute(
+                "SELECT read_ts, read_id FROM read_cursors WHERE viewer = ? AND peer = ?",
+                (viewer_id, peer_n),
+            ).fetchone()
+            if current is None or cursor_after(read_ts, read_id, current["read_ts"], current["read_id"]):
+                self._conn.execute(
+                    """INSERT INTO read_cursors (viewer, peer, read_ts, read_id, updated_at)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(viewer, peer) DO UPDATE SET
+                         read_ts = excluded.read_ts,
+                         read_id = excluded.read_id,
+                         updated_at = excluded.updated_at""",
+                    (viewer_id, peer_n, read_ts, read_id, utc_now()),
+                )
+                self._conn.commit()
+                stored_ts, stored_id = read_ts, read_id
+            else:
+                stored_ts, stored_id = current["read_ts"], current["read_id"]
+            unread = self._unread_count_locked(viewer_id, peer_n)
+        return {
+            "ok": True,
+            "viewer": viewer_id,
+            "peer": peer_n,
+            "readTs": stored_ts,
+            "readId": stored_id,
+            "unread": unread,
+        }
+
+    def _cursors_locked(self, viewer: str) -> dict[str, tuple[str, str]]:
+        rows = self._conn.execute(
+            "SELECT peer, read_ts, read_id FROM read_cursors WHERE viewer = ?",
+            (viewer,),
+        ).fetchall()
+        return {row["peer"]: (row["read_ts"], row["read_id"]) for row in rows}
+
+    def _unread_count_locked(self, viewer: str, peer: str) -> int:
+        row = self._conn.execute(
+            "SELECT read_ts, read_id FROM read_cursors WHERE viewer = ? AND peer = ?",
+            (viewer, peer),
+        ).fetchone()
+        if row is None:
+            count = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE peer = ? AND direction = 'in'",
+                (peer,),
+            ).fetchone()["n"]
+            return int(count)
+        count = self._conn.execute(
+            """SELECT COUNT(*) AS n FROM messages
+               WHERE peer = ? AND direction = 'in'
+                 AND (ts > ? OR (ts = ? AND id > ?))""",
+            (peer, row["read_ts"], row["read_ts"], row["read_id"]),
+        ).fetchone()["n"]
+        return int(count)
+
+    def _unread_by_peer_locked(self, viewer: str) -> dict[str, int]:
+        rows = self._conn.execute(
+            """SELECT m.peer AS peer, COUNT(*) AS n
+               FROM messages m
+               LEFT JOIN read_cursors c
+                 ON c.viewer = ? AND c.peer = m.peer
+               WHERE m.direction = 'in'
+                 AND (
+                   c.viewer IS NULL
+                   OR m.ts > c.read_ts
+                   OR (m.ts = c.read_ts AND m.id > c.read_id)
+                 )
+               GROUP BY m.peer""",
+            (viewer,),
+        ).fetchall()
+        return {row["peer"]: int(row["n"]) for row in rows}
 
     def enqueue_outbound(self, to_number: str, body: str) -> dict[str, Any]:
         """Queue one already-segmented message, pacing this destination."""

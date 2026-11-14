@@ -107,6 +107,76 @@ class PortalStoreTest(unittest.TestCase):
         item = self.store.add_message("in", "  ", "hi")
         self.assertEqual(item["peer"], "")
 
+    def _seed_thread(self, peer="+15557777", count=5):
+        rows = []
+        for index in range(count):
+            rows.append(
+                self.store.add_message(
+                    "in",
+                    peer,
+                    f"m{index}",
+                    ts=f"2026-04-01T00:00:{index:02d}Z",
+                    msg_id=f"id-{index:02d}",
+                )
+            )
+        return rows
+
+    def test_page_is_the_newest_window_and_walks_older(self):
+        self._seed_thread(count=5)
+        full = self.store.list_messages("+15557777")
+        self.assertEqual([m["body"] for m in full], ["m0", "m1", "m2", "m3", "m4"])
+        page = self.store.page_messages("+15557777", limit=2)
+        self.assertEqual([m["body"] for m in page["messages"]], ["m3", "m4"])
+        self.assertTrue(page["hasOlder"])
+        self.assertFalse(page["hasNewer"])
+        oldest = page["messages"][0]
+        older = self.store.page_messages(
+            "+15557777", before=oldest["ts"], before_id=oldest["id"], limit=2
+        )
+        self.assertEqual([m["body"] for m in older["messages"]], ["m1", "m2"])
+        self.assertTrue(older["hasOlder"])
+        self.assertTrue(older["hasNewer"])
+        newest = full[-1]
+        since = self.store.page_messages("+15557777", since=newest["ts"], since_id=newest["id"], limit=10)
+        self.assertEqual(since["messages"], [])
+        self.assertFalse(since["hasNewer"])
+
+    def test_same_timestamp_cursor_uses_id_tie_break(self):
+        peer = "+15558888"
+        for msg_id in ("a", "b", "c"):
+            self.store.add_message("in", peer, msg_id, ts="2026-05-01T00:00:00Z", msg_id=msg_id)
+        page = self.store.page_messages(peer, limit=2)
+        self.assertEqual([m["id"] for m in page["messages"]], ["b", "c"])
+        older = self.store.page_messages(peer, before="2026-05-01T00:00:00Z", before_id="b", limit=2)
+        self.assertEqual([m["id"] for m in older["messages"]], ["a"])
+
+    def test_listing_messages_does_not_mark_them_read(self):
+        self._seed_thread(count=3)
+        self.store.list_messages("+15557777")
+        self.store.page_messages("+15557777", limit=1)
+        threads = self.store.list_threads("owner")
+        self.assertEqual(threads[0]["unread"], 3)
+        self.assertIsNone(threads[0]["readTs"])
+        self.assertEqual(self.store.list_threads()[0]["unread"], 0)
+        self.assertNotIn("readTs", self.store.list_threads()[0])
+
+    def test_read_cursors_are_per_viewer_and_only_move_forward(self):
+        rows = self._seed_thread(count=3)
+        self.store.add_message("out", "+15557777", "sent-by-us", ts="2026-04-01T00:00:03Z", msg_id="out-1")
+        owner = self.store.mark_read("owner", "+15557777", rows[1]["ts"], rows[1]["id"])
+        self.assertEqual(owner["unread"], 1)
+        self.assertEqual(self.store.list_threads("ahmed")[0]["unread"], 3)
+        rewound = self.store.mark_read("owner", "+15557777", rows[0]["ts"], rows[0]["id"])
+        self.assertEqual(rewound["readId"], rows[1]["id"])
+        self.assertEqual(rewound["unread"], 1)
+        done = self.store.mark_read("owner", "+15557777", rows[2]["ts"], rows[2]["id"])
+        self.assertEqual(done["unread"], 0)
+        self.assertEqual(self.store.list_threads("ahmed")[0]["unread"], 3)
+        with self.assertRaises(ValueError):
+            self.store.page_messages("+15557777", before="2026-04-01T00:00:00Z", since="2026-04-01T00:00:01Z")
+        with self.assertRaises(ValueError):
+            self.store.mark_read("not a viewer", "+15557777", rows[2]["ts"], rows[2]["id"])
+
 
 if __name__ == "__main__":
     unittest.main()

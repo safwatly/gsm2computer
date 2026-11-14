@@ -176,6 +176,83 @@ class PortalHttpTest(unittest.IsolatedAsyncioTestCase):
         writer.close()
         await writer.wait_closed()
 
+    async def test_message_window_and_per_viewer_read(self):
+        for index, body in enumerate(("one", "two", "three")):
+            payload = json.dumps(
+                {
+                    "from": "+15556666",
+                    "body": body,
+                    "receivedAt": f"2026-09-19T12:00:0{index}Z",
+                }
+            ).encode()
+            status, _, _ = await self._exchange(_encode_request("POST", "/sms", payload))
+            self.assertEqual(status, 200)
+        status, _, body = await self._exchange(
+            _encode_request("GET", "/portal/api/messages?peer=%2B15556666")
+        )
+        self.assertEqual(status, 200)
+        listed = json.loads(body)
+        self.assertIsInstance(listed, list)
+        self.assertEqual([item["body"] for item in listed], ["one", "two", "three"])
+
+        status, _, body = await self._exchange(
+            _encode_request("GET", "/portal/api/messages?peer=%2B15556666&limit=2")
+        )
+        self.assertEqual(status, 200)
+        page = json.loads(body)
+        self.assertEqual([item["body"] for item in page["messages"]], ["two", "three"])
+        self.assertTrue(page["hasOlder"])
+        self.assertFalse(page["hasNewer"])
+        cursor = page["messages"][0]
+        older_url = (
+            "/portal/api/messages?peer=%2B15556666&limit=2"
+            f"&before={cursor['ts']}&before_id={cursor['id']}"
+        )
+        status, _, body = await self._exchange(_encode_request("GET", older_url))
+        self.assertEqual(status, 200)
+        older = json.loads(body)
+        self.assertEqual([item["body"] for item in older["messages"]], ["one"])
+        self.assertFalse(older["hasOlder"])
+
+        newest = listed[-1]
+        since_url = (
+            "/portal/api/messages?peer=%2B15556666&limit=50"
+            f"&since={listed[0]['ts']}&since_id={listed[0]['id']}"
+        )
+        status, _, body = await self._exchange(_encode_request("GET", since_url))
+        self.assertEqual([item["body"] for item in json.loads(body)["messages"]], ["two", "three"])
+
+        mark = json.dumps(
+            {"viewer": "human-owner", "peer": "+15556666", "ts": newest["ts"], "id": newest["id"]}
+        ).encode()
+        status, _, body = await self._exchange(_encode_request("POST", "/portal/api/messages/read", mark))
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["unread"], 0)
+
+        await self._exchange(_encode_request("GET", "/portal/api/messages?peer=%2B15556666"))
+        status, _, body = await self._exchange(_encode_request("GET", "/portal/api/threads?viewer=ahmed"))
+        ahmed = next(item for item in json.loads(body) if item["peer"] == "+15556666")
+        self.assertEqual(ahmed["unread"], 3)
+        self.assertIsNone(ahmed["readTs"])
+        status, _, body = await self._exchange(
+            _encode_request("GET", "/portal/api/threads?viewer=human-owner")
+        )
+        owner = next(item for item in json.loads(body) if item["peer"] == "+15556666")
+        self.assertEqual(owner["unread"], 0)
+        status, _, body = await self._exchange(_encode_request("GET", "/portal/api/threads"))
+        plain = next(item for item in json.loads(body) if item["peer"] == "+15556666")
+        self.assertEqual(plain["unread"], 0)
+        self.assertNotIn("readTs", plain)
+
+        status, _, body = await self._exchange(
+            _encode_request("GET", "/portal/api/messages?peer=%2B15556666&before=1&since=2")
+        )
+        self.assertEqual(status, 400)
+        status, _, body = await self._exchange(
+            _encode_request("POST", "/portal/api/messages/read", b'{"viewer":"bad viewer","peer":"+15556666","ts":"2026-01-01T00:00:00Z"}')
+        )
+        self.assertEqual(status, 400)
+
     async def test_health_still_ok(self):
         status, _, body = await self._exchange(_encode_request("GET", "/health"))
         self.assertEqual(status, 200)

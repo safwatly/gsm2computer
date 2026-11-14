@@ -48,6 +48,10 @@ class EventBus:
                 LOG.warning("portal sse drop event=%s (subscriber queue full)", event_type)
 
 
+def _query_one(query: dict[str, list[str]], name: str) -> str:
+    return (query.get(name) or [""])[0].strip()
+
+
 def json_response(status: int, body: Any, extra_headers: Optional[dict] = None) -> bytes:
     payload = json.dumps(body).encode("utf-8")
     status_text = {
@@ -197,17 +201,56 @@ class PortalApp:
             return "stream"
 
         if method == "GET" and route == "/portal/api/threads":
-            writer.write(json_response(200, self.store.list_threads()))
+            viewer = _query_one(query, "viewer")
+            try:
+                threads = self.store.list_threads(viewer or None)
+            except ValueError as exc:
+                writer.write(json_response(400, {"ok": False, "error": str(exc)}))
+                return "handled"
+            writer.write(json_response(200, threads))
             return "handled"
 
         if method == "GET" and route == "/portal/api/messages":
-            peer = (query.get("peer") or [""])[0]
-            if not peer.strip():
+            # Default (peer only) stays a JSON array of the whole thread so existing
+            # bot readers keep working. before/since/limit return one page object
+            # and never advance a read cursor.
+            peer = _query_one(query, "peer")
+            if not peer:
                 writer.write(json_response(400, {"ok": False, "error": "peer required"}))
                 return "handled"
-            messages = self.store.list_messages(peer)
+            before = _query_one(query, "before")
+            since = _query_one(query, "since")
+            before_id = _query_one(query, "before_id")
+            since_id = _query_one(query, "since_id")
+            limit_raw = _query_one(query, "limit")
+            if not (before or since or before_id or since_id or limit_raw):
+                messages = self.store.list_messages(peer)
+                self._publish_lease_timeouts()
+                writer.write(json_response(200, messages))
+                return "handled"
+            try:
+                limit = int(limit_raw) if limit_raw else None
+            except ValueError:
+                writer.write(json_response(400, {"ok": False, "error": "limit must be an integer"}))
+                return "handled"
+            try:
+                page = self.store.page_messages(
+                    peer,
+                    before=before or None,
+                    before_id=before_id or None,
+                    since=since or None,
+                    since_id=since_id or None,
+                    limit=limit,
+                )
+            except ValueError as exc:
+                writer.write(json_response(400, {"ok": False, "error": str(exc)}))
+                return "handled"
             self._publish_lease_timeouts()
-            writer.write(json_response(200, messages))
+            writer.write(json_response(200, page))
+            return "handled"
+
+        if method == "POST" and route == "/portal/api/messages/read":
+            writer.write(self._mark_read(body))
             return "handled"
 
         if method == "POST" and route == "/portal/api/messages/send":
@@ -267,6 +310,24 @@ class PortalApp:
             return "handled"
 
         return "unhandled"
+
+    def _mark_read(self, body: bytes) -> bytes:
+        try:
+            payload = json.loads(body.decode("utf-8") if body else "{}")
+        except json.JSONDecodeError:
+            return json_response(400, {"ok": False, "error": "invalid json"})
+        if not isinstance(payload, dict):
+            return json_response(400, {"ok": False, "error": "invalid json"})
+        try:
+            result = self.store.mark_read(
+                str(payload.get("viewer") or ""),
+                str(payload.get("peer") or ""),
+                str(payload.get("ts") or ""),
+                str(payload.get("id") or ""),
+            )
+        except ValueError as exc:
+            return json_response(400, {"ok": False, "error": str(exc)})
+        return json_response(200, result)
 
     def _send_message(self, body: bytes) -> bytes:
         try:
