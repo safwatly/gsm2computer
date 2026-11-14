@@ -2,7 +2,7 @@ import "./style.css";
 import { connectEvents } from "./api.js";
 import { renderCallSim, stopCallSim } from "./call-sim.js";
 import { renderDashboard } from "./dashboard.js";
-import { bumpUnread, paintUnreadBadge } from "./desk-state.js";
+import { bumpUnread, paintUnreadBadge, syncUnreadFromServer } from "./desk-state.js";
 import {
   bindCallsApp,
   handleCallsEvent,
@@ -14,6 +14,7 @@ import {
   handleMessagingEvent,
   openMessagingPeer,
   parseMessagingRest,
+  markVisibleRead,
   renderMessaging,
   resetMessagingSuppress,
 } from "./messaging.js";
@@ -33,7 +34,7 @@ async function onLiveEvent(type, data) {
   const event = data && typeof data === "object" ? { ...data, type: data.type || type } : { type };
   if (type === "message") {
     const ctx = getMessagingContext();
-    const notified = await notifySmsEvent(event, {
+    await notifySmsEvent(event, {
       selectedPeer: ctx.peer,
       documentHidden: document.hidden,
       route: notifyRoute(),
@@ -41,18 +42,24 @@ async function onLiveEvent(type, data) {
         if (peer) openMessagingPeer(peer);
       },
     });
-    const viewingThread =
-      parseRoute().page === "messaging" &&
-      ctx.peer === event.peer &&
-      !document.hidden;
-    if (notified && event.peer && !viewingThread) {
-      bumpUnread(event.peer);
+  }
+  if (type === "reconnect" || type === "message" || type === "outbox") {
+    if (parseRoute().page === "messaging") {
+      await handleMessagingEvent(app, type, data);
+    } else if (type === "message") {
+      try {
+        await syncUnreadFromServer();
+      } catch (err) {
+        if (event.direction === "in") bumpUnread(event.peer);
+        paintUnreadBadge();
+        console.warn(err);
+      }
+    } else {
       paintUnreadBadge();
     }
+    return;
   }
-  if (parseRoute().page === "messaging") {
-    await handleMessagingEvent(app, type);
-  } else if (parseRoute().page === "calls") {
+  if (parseRoute().page === "calls") {
     await handleCallsEvent(app, type);
   } else {
     paintUnreadBadge();
@@ -132,6 +139,12 @@ async function renderRouting() {
     </main>
   `;
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  if (parseRoute().page !== "messaging") return;
+  markVisibleRead().catch((err) => console.warn(err));
+});
 
 onRouteChange(() => {
   render();
