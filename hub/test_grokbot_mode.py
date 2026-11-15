@@ -37,14 +37,14 @@ exit "$code"
 
 
 class FakePatchbay:
-    def __init__(self) -> None:
-        self.dir = Path(tempfile.mkdtemp(prefix="fakepb-"))
-        self.bin = self.dir / "patchbay"
-        self.bin.write_text(FAKE_PATCHBAY)
+    def __init__(self, name: str = "patchbay") -> None:
+        self.dir = Path(tempfile.mkdtemp(prefix=f"fake{name}-"))
+        self.bin = self.dir / name
+        # Each fake logs to its own dir, so a second fake bakes its paths in.
+        script = FAKE_PATCHBAY.replace("$FAKE_LOG", str(self.dir / "log")).replace("$FAKE_DIR", str(self.dir))
+        self.bin.write_text(script)
         self.bin.chmod(self.bin.stat().st_mode | stat.S_IEXEC)
         self.log = self.dir / "log"
-        os.environ["FAKE_LOG"] = str(self.log)
-        os.environ["FAKE_DIR"] = str(self.dir)
         os.environ.pop("FAKE_SLEEP", None)
 
     def codes(self, sub: str, *codes: int) -> None:
@@ -99,6 +99,57 @@ class GrokBotVoiceTest(unittest.TestCase):
         self.assertFalse(v.live)
         snap = v.snapshot()
         self.assertEqual(snap["last_switch"]["rc"], 6)
+
+    def test_switch_uses_grokcdp_voice(self) -> None:
+        pb = FakePatchbay()
+        cdp = FakePatchbay(name="grokcdp")
+        v = gv.GrokBotVoice(
+            bot="suzie", binary=str(pb.bin), grokcdp_binary=str(cdp.bin),
+            switch_timeout_s=5, off_timeout_s=5, lock_retry_delay_s=0.01,
+        )
+        res = asyncio.run(v.start())
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["via"], "grokcdp voice")
+        asyncio.run(v.stop())
+        # switch goes to grokcdp; off still goes to patchbay
+        self.assertEqual(cdp.calls(), ["voice suzie"])
+        self.assertEqual(pb.calls(), ["off --json"])
+
+    def test_grokcdp_voice_failure_semantics(self) -> None:
+        pb = FakePatchbay()
+        cdp = FakePatchbay(name="grokcdp")
+        cdp.codes("voice", 4, 4, 0)
+        v = gv.GrokBotVoice(
+            bot="suzie", binary=str(pb.bin), grokcdp_binary=str(cdp.bin),
+            switch_timeout_s=5, lock_retry_delay_s=0.01,
+        )
+        res = asyncio.run(v.start())
+        self.assertEqual((res["ok"], res["rc"], res["meaning"]), (False, 4, "lock busy"))
+        self.assertEqual(len(cdp.calls()), 2)
+        self.assertEqual(pb.calls(), [])
+        cdp.codes("voice", 6)
+        res = asyncio.run(v.start())
+        self.assertEqual(res["meaning"], "audio routing failed")
+        self.assertFalse(v.live)
+
+    def test_grokcdp_missing_falls_back_to_patchbay_switch(self) -> None:
+        pb = FakePatchbay()
+        v = gv.GrokBotVoice(
+            bot="suzie", binary=str(pb.bin), grokcdp_binary="/nonexistent/grokcdp",
+            switch_timeout_s=5, lock_retry_delay_s=0.01,
+        )
+        res = asyncio.run(v.start())
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["via"], "patchbay switch")
+        self.assertEqual(pb.calls(), ["switch suzie --json"])
+
+    def test_failure_text_ignores_deprecation_notice(self) -> None:
+        err = "patchbay switch is deprecated; use grokcdp voice\nselected bot did not become ready"
+        self.assertEqual(
+            gv._failure_text({"ok": False, "error": "mic not flowing"}, err),
+            "mic not flowing | selected bot did not become ready",
+        )
+        self.assertIsNone(gv._failure_text(None, "patchbay switch is deprecated; use grokcdp voice"))
 
     def test_missing_binary(self) -> None:
         v = gv.GrokBotVoice(binary="/nonexistent/patchbay")

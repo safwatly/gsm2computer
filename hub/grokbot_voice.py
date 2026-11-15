@@ -7,8 +7,9 @@ The hub owns the audio path; patchbay/grokcdp own the Grok Bot app:
 
 Mix-minus is by construction: the hub only writes caller audio into
 patchbay_mic and only reads grok_bus, so the bot never hears itself.
-Call start runs ``patchbay switch <bot> --json``; call end runs
-``patchbay off --json``. Exit 4 (mutation lock busy) is retried once.
+Call start runs ``grokcdp voice <bot>`` (``patchbay switch`` is deprecated and
+only forwards to it; it stays as a fallback when grokcdp is missing); call end
+runs ``patchbay off --json``. Exit 4 (mutation lock busy) is retried once.
 Nothing here touches pactl or moves streams by hand.
 """
 from __future__ import annotations
@@ -25,6 +26,7 @@ from typing import Any, Optional
 LOG = logging.getLogger("gsm2computer-hub.grokbot")
 
 PATCHBAY_BIN = os.environ.get("GSM2COMPUTER_PATCHBAY_BIN", str(Path.home() / "bin" / "patchbay"))
+GROKCDP_BIN = os.environ.get("GSM2COMPUTER_GROKCDP_BIN", str(Path.home() / "bin" / "grokcdp"))
 GROKBOT_BOT = os.environ.get("GSM2COMPUTER_GROKBOT_BOT", "suzie")
 GROKBOT_MIC_SINK = os.environ.get("GSM2COMPUTER_GROKBOT_MIC_SINK", "patchbay_mic")
 GROKBOT_MIC_SOURCE = os.environ.get("GSM2COMPUTER_GROKBOT_MIC_SOURCE", "grok_mic")
@@ -145,13 +147,30 @@ async def run_patchbay(*args: str, timeout_s: float, binary: Optional[str] = Non
     rc = proc.returncode if proc.returncode is not None else 1
     out = out_b.decode("utf-8", "replace")
     err = err_b.decode("utf-8", "replace").strip()
+    parsed = _parse_json(out)
     return {
         "rc": rc,
         "meaning": EXIT_MEANING.get(rc, "unknown"),
-        "json": _parse_json(out),
+        "json": parsed,
         "ms": int((time.monotonic() - t0) * 1000),
-        "error": err[-300:] if (rc and err) else None,
+        "error": _failure_text(parsed, err) if rc else None,
     }
+
+
+def _failure_text(parsed: Optional[dict[str, Any]], stderr: str) -> Optional[str]:
+    """Why a command failed: its JSON ``error`` first, then stderr.
+
+    The deprecation notice ``patchbay switch`` prints on stderr is not a
+    reason; it used to be the only text the log showed for a failed switch.
+    """
+    parts: list[str] = []
+    if isinstance(parsed, dict) and parsed.get("error"):
+        parts.append(str(parsed["error"]))
+    lines = [ln for ln in stderr.splitlines() if "deprecated" not in ln.lower()]
+    if lines:
+        parts.append("\n".join(lines))
+    text = " | ".join(parts)
+    return text[-300:] if text else None
 
 
 class GrokBotVoice:
@@ -161,12 +180,14 @@ class GrokBotVoice:
         self,
         bot: str = GROKBOT_BOT,
         binary: Optional[str] = None,
+        grokcdp_binary: Optional[str] = None,
         switch_timeout_s: float = SWITCH_TIMEOUT_S,
         off_timeout_s: float = OFF_TIMEOUT_S,
         lock_retry_delay_s: float = LOCK_RETRY_DELAY_S,
     ) -> None:
         self.bot = bot
         self.binary = binary
+        self.grokcdp_binary = grokcdp_binary
         self.switch_timeout_s = switch_timeout_s
         self.off_timeout_s = off_timeout_s
         self.lock_retry_delay_s = lock_retry_delay_s
@@ -181,13 +202,46 @@ class GrokBotVoice:
         self.transcript_abort_s = TRANSCRIPT_ABORT_S
         self.on_transcript_abort: Optional[Any] = None
 
-    async def _run_with_lock_retry(self, *args: str, timeout_s: float) -> dict[str, Any]:
-        res = await run_patchbay(*args, timeout_s=timeout_s, binary=self.binary)
+    def _grokcdp_for_switch(self) -> Optional[str]:
+        """grokcdp binary for the call-start switch, or None to use ``patchbay switch``.
+
+        An explicit ``binary`` (patchbay path override) without an explicit
+        ``grokcdp_binary`` keeps the old path, so callers and tests that fake
+        patchbay are unchanged. Otherwise grokcdp is used when it is executable.
+        """
+        if self.grokcdp_binary:
+            return self.grokcdp_binary
+        if self.binary is None and os.access(GROKCDP_BIN, os.X_OK):
+            return GROKCDP_BIN
+        return None
+
+    async def _run_with_lock_retry(
+        self, *args: str, timeout_s: float, binary: Optional[str] = None
+    ) -> dict[str, Any]:
+        binary = binary or self.binary
+        res = await run_patchbay(*args, timeout_s=timeout_s, binary=binary)
         if res["rc"] == 4:
-            LOG.warning("patchbay %s: lock busy; retrying once", " ".join(args))
+            LOG.warning("%s %s: lock busy; retrying once", Path(binary or PATCHBAY_BIN).name, " ".join(args))
             await asyncio.sleep(self.lock_retry_delay_s)
-            res = await run_patchbay(*args, timeout_s=timeout_s, binary=self.binary)
+            res = await run_patchbay(*args, timeout_s=timeout_s, binary=binary)
             res["retried"] = True
+        return res
+
+    async def _switch(self) -> dict[str, Any]:
+        """``grokcdp voice <bot>``; ``patchbay switch <bot> --json`` if grokcdp is missing."""
+        grokcdp = self._grokcdp_for_switch()
+        if grokcdp is not None:
+            res = await self._run_with_lock_retry(
+                "voice", self.bot, timeout_s=self.switch_timeout_s, binary=grokcdp
+            )
+            res["via"] = "grokcdp voice"
+            if res["rc"] != 127:
+                return res
+            LOG.warning("grokcdp missing (%s); falling back to patchbay switch", res.get("error"))
+        res = await self._run_with_lock_retry(
+            "switch", self.bot, "--json", timeout_s=self.switch_timeout_s
+        )
+        res["via"] = "patchbay switch"
         return res
 
     async def wait_pending_off(self, timeout_s: float = 25.0) -> None:
@@ -228,9 +282,7 @@ class GrokBotVoice:
         async with self._lock:
             self.switching = True
             try:
-                res = await self._run_with_lock_retry(
-                    "switch", self.bot, "--json", timeout_s=self.switch_timeout_s
-                )
+                res = await self._switch()
             finally:
                 self.switching = False
             res["at"] = time.time()
@@ -238,11 +290,12 @@ class GrokBotVoice:
             self.live = res["ok"]
             self.last_switch = res
             if res["ok"]:
-                LOG.info("grokbot live: patchbay switch %s ok in %sms", self.bot, res["ms"])
+                LOG.info("grokbot live: %s %s ok in %sms", res.get("via"), self.bot, res["ms"])
             else:
                 LOG.error(
-                    "grokbot switch %s FAILED rc=%s (%s) in %sms err=%s",
-                    self.bot, res["rc"], res["meaning"], res["ms"], res.get("error"),
+                    "grokbot switch %s FAILED via %s rc=%s (%s) in %sms err=%s json=%s",
+                    self.bot, res.get("via"), res["rc"], res["meaning"], res["ms"],
+                    res.get("error"), json.dumps(res.get("json"), default=str)[:400],
                 )
             return res
 
@@ -311,7 +364,7 @@ class GrokBotVoice:
         def _brief(r: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
             if not r:
                 return None
-            return {k: r.get(k) for k in ("ok", "rc", "meaning", "ms", "at", "retried") if k in r}
+            return {k: r.get(k) for k in ("ok", "rc", "meaning", "ms", "at", "retried", "via") if k in r}
 
         return {
             "bot": self.bot,
