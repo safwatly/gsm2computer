@@ -14,8 +14,11 @@ hears the caller.
 
 ## Lifecycle
 
-* Call start (after `session.updated`): `patchbay switch $GSM2COMPUTER_GROKBOT_BOT --json`
+* Call start (after `session.updated`): `grokcdp voice $GSM2COMPUTER_GROKBOT_BOT`
   runs beside the WS loop (caller hears patchbay's hold tone). Exit 4 retried once.
+  `patchbay switch` is deprecated (it prints a notice and forwards to `grokcdp voice`);
+  the hub only falls back to it when `grokcdp` is missing. A failed switch logs the
+  command's JSON `error` and the `via` field, not the deprecation notice.
 * Call end (hub releases the slot: clean hangup, watchdog abort, or relink grace
   expired, not a bare WS blip): `patchbay off --json` in the background, after any
   still-running switch. The next call waits for a pending off.
@@ -177,6 +180,7 @@ that pointer from the bundle `hub/portal/dist/index.html` loads.
 | GSM2COMPUTER_AUTO_MODE | openclaw (set `grokbot`) |
 | GSM2COMPUTER_GROKBOT_BOT | suzie |
 | GSM2COMPUTER_PATCHBAY_BIN | ~/bin/patchbay |
+| GSM2COMPUTER_GROKCDP_BIN | ~/bin/grokcdp |
 | GSM2COMPUTER_GROKBOT_UPLINK_GAIN | 1.0 |
 | GSM2COMPUTER_GROKBOT_SWITCH_TIMEOUT_S | 60 |
 | GSM2COMPUTER_GROKBOT_CDP | unset; loopback URL from `patchbay status --json` |
