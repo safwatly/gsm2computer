@@ -4,6 +4,7 @@ import unittest
 
 from portal_sms import (
     format_ops_sms_alert,
+    inbound_sms_routes,
     is_ops_sender,
     looks_like_system_down,
     normalize_msisdn,
@@ -47,6 +48,21 @@ class OpsSmsWakeTests(unittest.TestCase):
         self.assertIn("ops SMS wake-up", text)
         self.assertIn("+201280043725", text)
         self.assertIn("still down", text)
+
+    def test_sms_webhook_gets_every_text_and_ops_gets_system_down(self):
+        self.assertEqual(inbound_sms_routes("+1999", "Orange: votre solde", sms_webhook=True), (True, False))
+        self.assertEqual(inbound_sms_routes("+1999", "thanks", sms_webhook=True), (True, False))
+        self.assertEqual(inbound_sms_routes("+201280043725", "see you at 5", sms_webhook=True), (True, False))
+        self.assertEqual(inbound_sms_routes("+1999", "STATUS", sms_webhook=True), (True, True))
+        self.assertEqual(inbound_sms_routes("+1999", "system down", sms_webhook=True), (True, True))
+        self.assertEqual(inbound_sms_routes("+201280043725", "still down", sms_webhook=True), (True, True))
+
+    def test_unset_sms_webhook_keeps_should_wake_only(self):
+        self.assertEqual(inbound_sms_routes("+1999", "Orange: votre solde", sms_webhook=False), (False, False))
+        self.assertEqual(inbound_sms_routes("+1999", "thanks", sms_webhook=False), (False, False))
+        self.assertEqual(inbound_sms_routes("+201280043725", "see you at 5", sms_webhook=False), (False, True))
+        self.assertEqual(inbound_sms_routes("+1999", "STATUS", sms_webhook=False), (False, True))
+        self.assertEqual(inbound_sms_routes("+1999", "system down", sms_webhook=False), (False, True))
 
 
 if __name__ == "__main__":

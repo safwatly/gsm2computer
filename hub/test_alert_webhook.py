@@ -344,6 +344,57 @@ class SmsRouting(unittest.TestCase):
         self.assertIsNotNone(self.rows(w.SMS)[0]["delivered"])
         self.assertFalse(Path(self.alert_spool).exists())
 
+    def _deliver_like_hub(self, sender: str, body: str) -> None:
+        from portal_sms import format_ops_sms_alert, inbound_sms_routes
+
+        to_sms, to_ops = inbound_sms_routes(
+            sender, body, sms_webhook=w.sms_webhook_configured()
+        )
+        text = format_ops_sms_alert(sender, body, "t")
+        if to_sms:
+            w.post_sms_event(text, sender=sender, body=body, received_at="t")
+        if to_ops:
+            w.post_system_alert(text)
+
+    def test_every_inbound_sms_reaches_suzie_and_system_down_also_ops(self):
+        os.environ.pop("GSM2COMPUTER_OPS_SMS_NUMBERS", None)
+        os.environ[w.SMS_URL_ENV] = "https://sms.example/hook"
+        os.environ[w.SMS_KEY_ENV] = "sms-key"
+        self._deliver_like_hub("+1999", "Orange: votre solde")
+        self._deliver_like_hub("+201280043725", "see you at 5")
+        self._deliver_like_hub("+1999", "STATUS")
+        self._deliver_like_hub("+201280043725", "still down")
+        sms_payloads = [json.loads(row["payload"]) for row in self.rows(w.SMS)]
+        ops_payloads = [json.loads(row["payload"]) for row in self.rows(w.ALERT)]
+        self.assertEqual([item["body"] for item in sms_payloads], [
+            "Orange: votre solde",
+            "see you at 5",
+            "STATUS",
+            "still down",
+        ])
+        self.assertTrue(all(item["event"] == "sms_in" for item in sms_payloads))
+        self.assertEqual(len(ops_payloads), 2)
+        self.assertTrue(all(set(item) == {"text"} for item in ops_payloads))
+        joined = " ".join(item["text"] for item in ops_payloads)
+        self.assertIn("STATUS", joined)
+        self.assertIn("still down", joined)
+        self.assertNotIn("Orange", joined)
+        self.assertNotIn("see you at 5", joined)
+
+    def test_unset_url_posts_only_should_wake_texts_to_ops(self):
+        os.environ.pop("GSM2COMPUTER_OPS_SMS_NUMBERS", None)
+        self.assertFalse(w.sms_webhook_configured())
+        self._deliver_like_hub("+1999", "Orange: votre solde")
+        self._deliver_like_hub("+201280043725", "see you at 5")
+        self._deliver_like_hub("+1999", "thanks")
+        self._deliver_like_hub("+1999", "STATUS")
+        self.assertFalse(Path(self.sms_spool).exists())
+        ops_texts = [json.loads(row["payload"])["text"] for row in self.rows(w.ALERT)]
+        self.assertEqual(len(ops_texts), 2)
+        self.assertTrue(any("see you at 5" in text for text in ops_texts))
+        self.assertTrue(any("STATUS" in text for text in ops_texts))
+        self.assertTrue(all(set(json.loads(row["payload"])) == {"text"} for row in self.rows(w.ALERT)))
+
 
 if __name__ == "__main__":
     unittest.main()

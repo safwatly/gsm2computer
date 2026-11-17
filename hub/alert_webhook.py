@@ -9,10 +9,11 @@ Structured call_ended events (including dry-run test:true) always post —
 they must wake Cup after real phone hangups and must not be swallowed by
 the e2e text filter.
 
-Inbound SMS wake-ups use a second destination when
-GSM2COMPUTER_SMS_WEBHOOK_URL is set (see post_sms_event). That queue is a
-separate spool file and worker. An unset SMS URL posts the same ops alert
-as before.
+Inbound SMS use a second destination when GSM2COMPUTER_SMS_WEBHOOK_URL is
+set (see post_sms_event). That queue is a separate spool file and worker.
+The hub sends every non-duplicate inbound SMS there, and also posts the
+ops text when the body looks like a system-down, including STATUS. An unset
+SMS URL leaves that queue unused; only should_wake_cup texts go to ops.
 """
 from __future__ import annotations
 
@@ -274,6 +275,11 @@ def _ensure_worker(dest: _Destination) -> None:
             dest.pid = os.getpid()
 
 
+def sms_webhook_configured() -> bool:
+    """True when GSM2COMPUTER_SMS_WEBHOOK_URL is set to a non-blank URL."""
+    return bool(SMS.url())
+
+
 def start_sms_worker() -> None:
     """Resume persisted SMS events. A no-op when the SMS URL is unset."""
     _ensure_worker(SMS)
@@ -328,12 +334,15 @@ def post_sms_event(
     body: str,
     received_at: str,
 ) -> None:
-    """Enqueue one inbound SMS wake-up.
+    """Enqueue one inbound SMS on the SMS webhook, or the ops webhook if unset.
 
-    With GSM2COMPUTER_SMS_WEBHOOK_URL set, the payload goes only to that
-    webhook (the same text as the ops alert, plus event/from/body/receivedAt).
-    With the URL unset, this is post_system_alert(text): the ops spool and
-    the ops webhook, text only.
+    With GSM2COMPUTER_SMS_WEBHOOK_URL set, the payload is today's ops text
+    plus event/from/body/receivedAt, and this function does not touch the
+    ops queue. The hub posts post_system_alert separately when the body
+    looks like a system-down, including STATUS.
+
+    With the URL unset, this is post_system_alert(text). The hub uses that
+    only for should_wake_cup messages.
     """
     if SMS.url():
         if is_test_alert(text):
