@@ -180,3 +180,29 @@ def ingest_inbound_sms(
             return log_entry, None
         events.publish("message", _msg)
     return log_entry, parse_sms_command(body_text)
+
+
+def fanout_inbound_sms(log_entry: dict[str, Any]) -> None:
+    """Route one non-duplicate inbound SMS the way POST /sms does.
+
+    With GSM2COMPUTER_SMS_WEBHOOK_URL set, every message is an sms_in event
+    and a system-down body (including STATUS) is also an ops alert. With the
+    URL unset, only should_wake_cup messages go to the ops webhook.
+    """
+    from alert_webhook import post_sms_event, post_system_alert, sms_webhook_configured
+
+    sender = str(log_entry.get("from") or "")
+    body_text = str(log_entry.get("body") or "")
+    received_at = str(log_entry.get("receivedAt") or "")
+    to_sms, to_ops = inbound_sms_routes(
+        sender,
+        body_text,
+        sms_webhook=sms_webhook_configured(),
+    )
+    if not (to_sms or to_ops):
+        return
+    text = format_ops_sms_alert(sender, body_text, received_at)
+    if to_sms:
+        post_sms_event(text, sender=sender, body=body_text, received_at=received_at)
+    if to_ops:
+        post_system_alert(text)

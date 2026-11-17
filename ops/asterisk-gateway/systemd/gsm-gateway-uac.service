@@ -1,0 +1,12 @@
+[Unit]
+Description=Arm Quectel EC25 USB audio before Asterisk
+Before=asterisk.service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/gsm-gateway-enable-uac
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
