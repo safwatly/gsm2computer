@@ -259,15 +259,17 @@ class HubConnectionRoutineTest {
 
     @Test
     fun racingStopWhenEveryLegFinishedEndsTheWalk() {
-        var dials = 0
         val routine = routine(listOf(public, tailscale)) {
-            dials += 1
             DialResponse(DialStatus.STOP, 409, "call in progress")
         }
         val result = routine.connectRacing(maxPasses = 3)
         assertTrue(result.stopped)
         assertFalse(result.opened)
-        assertEquals(2, dials)
+        assertEquals(0, result.pass)
+        assertEquals(
+            listOf(0 to "stop", 0 to "stop"),
+            result.attempts.map { it.pass to it.outcome },
+        )
     }
 
     @Test
