@@ -92,6 +92,20 @@ The URL and key belong on the process that posts `call_ended` and
 [docs/CUP_HUB_CUTOVER.md](../docs/CUP_HUB_CUTOVER.md). Do not add a second
 copy of the drop-in on the hub unit.
 
+Every non-duplicate inbound SMS is posted by the hub process when
+`GSM2COMPUTER_SMS_WEBHOOK_URL` is set, including carrier texts. Suzie
+filters. `GSM2COMPUTER_SMS_WEBHOOK_KEY` belongs on `gsm2computer-hub.service`
+(its own drop-in, not `alert-webhook.conf`). The same Bearer header and the
+same retry rules apply, in a separate file
+(`~/.local/state/gsm2computer/sms-webhook/outbox.sqlite3`, override with
+`GSM2COMPUTER_SMS_SPOOL`) and a separate worker. The payload keeps the ops
+text and adds `event` (`sms_in`), `from`, `body`, and `receivedAt`. A body
+that looks like a system-down report, including `STATUS`, is also posted as
+the existing text-only ops alert. An ops-number sender that is not
+system-down goes only to the SMS webhook. An unset or blank SMS URL keeps
+today's path: only `should_wake_cup` texts are posted, and only to the ops
+alert webhook. Call, slot, and watchdog alerts stay on the ops webhook.
+
 ## Commands
 
 ```bash

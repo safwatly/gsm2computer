@@ -114,6 +114,21 @@ def should_wake_cup(from_raw: str, body: str) -> bool:
     return looks_like_system_down(body)
 
 
+def inbound_sms_routes(from_raw: str, body: str, *, sms_webhook: bool) -> tuple[bool, bool]:
+    """Return (sms_webhook, ops_alert) for one non-duplicate inbound SMS.
+
+    With the SMS webhook configured, every message goes there. A system-down
+    body, including STATUS, is also an ops alert. An ops-number sender that
+    is not system-down is SMS-only.
+
+    With the SMS webhook unset, only should_wake_cup messages are an ops
+    alert, and nothing is sent to the SMS webhook.
+    """
+    if sms_webhook:
+        return True, looks_like_system_down(body)
+    return False, should_wake_cup(from_raw, body)
+
+
 def format_ops_sms_alert(from_raw: str, body: str, received_at: str) -> str:
     preview = (body or "").strip().replace("\n", " ")
     if len(preview) > 280:

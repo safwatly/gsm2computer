@@ -23,7 +23,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from alert_webhook import post_system_alert, start_alert_worker
+from alert_webhook import (
+    post_sms_event,
+    post_system_alert,
+    sms_webhook_configured,
+    start_alert_worker,
+)
 from device_auth import (
     ENTRANCE_PUBLIC,
     TOKENS,
@@ -3051,24 +3056,35 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             if log_entry.get("duplicate"):
                 writer.write(json_response(200, {"ok": True, "sms": log_entry, "duplicate": True}))
             else:
-                # The webhook repeats the SMS text the phone reported. It does not
-                # parse MODE or STATUS and it does not change the switchboard.
+                # Non-duplicate inbound SMS. With the SMS webhook set, every
+                # message goes there, and a system-down body (including
+                # STATUS) is also the text-only ops alert. With the URL
+                # unset, only should_wake_cup messages go to the ops webhook.
+                # This does not parse MODE or STATUS for the switchboard.
                 # Those commands run only on the Tailscale entrance, below.
                 try:
-                    from portal_sms import should_wake_cup, format_ops_sms_alert
-                    if should_wake_cup(
-                        str(log_entry.get("from") or ""),
-                        str(log_entry.get("body") or ""),
-                    ):
-                        post_system_alert(
-                            format_ops_sms_alert(
-                                str(log_entry.get("from") or ""),
-                                str(log_entry.get("body") or ""),
-                                str(log_entry.get("receivedAt") or ""),
+                    from portal_sms import format_ops_sms_alert, inbound_sms_routes
+                    sender = str(log_entry.get("from") or "")
+                    body_text = str(log_entry.get("body") or "")
+                    received_at = str(log_entry.get("receivedAt") or "")
+                    to_sms, to_ops = inbound_sms_routes(
+                        sender,
+                        body_text,
+                        sms_webhook=sms_webhook_configured(),
+                    )
+                    if to_sms or to_ops:
+                        text = format_ops_sms_alert(sender, body_text, received_at)
+                        if to_sms:
+                            post_sms_event(
+                                text,
+                                sender=sender,
+                                body=body_text,
+                                received_at=received_at,
                             )
-                        )
+                        if to_ops:
+                            post_system_alert(text)
                 except Exception:
-                    LOG.warning("ops SMS alert webhook failed", exc_info=True)
+                    LOG.warning("inbound SMS webhook failed", exc_info=True)
                 if command and entrance.name != ENTRANCE_PUBLIC:
                     result = await set_switchboard_mode(command)
                     writer.write(json_response(200, {"ok": True, "sms": log_entry, "routing": result}))
