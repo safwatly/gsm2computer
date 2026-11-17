@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from alert_webhook import post_system_alert, start_alert_worker
+from alert_webhook import post_sms_event, post_system_alert, start_alert_worker
 from device_auth import (
     ENTRANCE_PUBLIC,
     TOKENS,
@@ -3051,21 +3051,25 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             if log_entry.get("duplicate"):
                 writer.write(json_response(200, {"ok": True, "sms": log_entry, "duplicate": True}))
             else:
-                # The webhook repeats the SMS text the phone reported. It does not
-                # parse MODE or STATUS and it does not change the switchboard.
-                # Those commands run only on the Tailscale entrance, below.
+                # Wake-up SMS goes to GSM2COMPUTER_SMS_WEBHOOK_URL when that is
+                # set, and otherwise to the ops alert webhook. The text is the
+                # phone's message. This does not parse MODE or STATUS and it
+                # does not change the switchboard. Those commands run only on
+                # the Tailscale entrance, below.
                 try:
                     from portal_sms import should_wake_cup, format_ops_sms_alert
                     if should_wake_cup(
                         str(log_entry.get("from") or ""),
                         str(log_entry.get("body") or ""),
                     ):
-                        post_system_alert(
-                            format_ops_sms_alert(
-                                str(log_entry.get("from") or ""),
-                                str(log_entry.get("body") or ""),
-                                str(log_entry.get("receivedAt") or ""),
-                            )
+                        sender = str(log_entry.get("from") or "")
+                        body_text = str(log_entry.get("body") or "")
+                        received_at = str(log_entry.get("receivedAt") or "")
+                        post_sms_event(
+                            format_ops_sms_alert(sender, body_text, received_at),
+                            sender=sender,
+                            body=body_text,
+                            received_at=received_at,
                         )
                 except Exception:
                     LOG.warning("ops SMS alert webhook failed", exc_info=True)
