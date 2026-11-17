@@ -12,6 +12,7 @@ Architecture decisions live in **[docs/adr/](docs/adr/)**. Read those before cha
 | [docs/adr/0006-portal-messaging.md](docs/adr/0006-portal-messaging.md) | Hub PWA / SQLite SMS + call log; Pixel 10s outbox poll; Tailscale-only auth (SAF-29–34) |
 | [docs/adr/0007-hub-machine-name-and-https.md](docs/adr/0007-hub-machine-name-and-https.md) | Machine `hub`; no `portal.hub…`; do not Tailscale Serve `/` to gsm2computer |
 | [docs/adr/0008-public-audio-entrance.md](docs/adr/0008-public-audio-entrance.md) | Public phone audio on cup: one handler, device token, Caddy TLS, nftables |
+| [docs/adr/0009-asterisk-gsm-gateway.md](docs/adr/0009-asterisk-gsm-gateway.md) | EC25 gateway: AudioSocket + AMI, off unless `GSM2COMPUTER_ASTERISK_GATEWAY` is set |
 | [docs/TAILSCALE_PORTAL_HTTPS.md](docs/TAILSCALE_PORTAL_HTTPS.md) | MagicDNS URLs, Chrome cert red flags, rename checklist |
 | [hub/TALK_WEBRTC.md](hub/TALK_WEBRTC.md) | Commands, first DCV login, env knobs |
 

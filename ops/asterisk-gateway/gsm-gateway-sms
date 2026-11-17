@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""POST one modem SMS to the hub /sms route.
+
+Asterisk runs this from the sms extension. The hub adapter posts the same
+clientId from the AMI UserEvent. The store treats a repeat as a duplicate, so
+whichever path arrives second does not page the webhook again.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+
+def build_payload(sender: str, body64: str, client_id: str, received_at: str = "") -> dict[str, str]:
+    body = base64.b64decode(body64, validate=False).decode("utf-8", errors="replace") if body64 else ""
+    payload = {
+        "from": sender,
+        "body": body,
+        "clientId": (client_id or "")[:80],
+    }
+    if received_at:
+        payload["receivedAt"] = received_at
+    return payload
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Forward one Quectel SMS to the gsm2computer hub")
+    parser.add_argument("--from", dest="sender", required=True)
+    parser.add_argument("--body64", default="")
+    parser.add_argument("--client-id", default="")
+    args = parser.parse_args()
+    if not args.body64.strip() or not args.sender.strip():
+        return 0
+    base = (os.environ.get("GSM_GATEWAY_HUB_BASE") or "").strip().rstrip("/")
+    if not base:
+        print("gsm-gateway-sms: GSM_GATEWAY_HUB_BASE is unset", file=sys.stderr)
+        return 1
+    payload = build_payload(args.sender, args.body64.strip(), args.client_id.strip())
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base}/sms",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            response.read()
+    except urllib.error.URLError as exc:
+        print(f"gsm-gateway-sms: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

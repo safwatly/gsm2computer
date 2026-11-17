@@ -24,10 +24,13 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from alert_webhook import (
-    post_sms_event,
     post_system_alert,
-    sms_webhook_configured,
     start_alert_worker,
+)
+from asterisk_gateway import (
+    contribute_health,
+    handle_gateway_http,
+    start_gateway_from_env,
 )
 from device_auth import (
     ENTRANCE_PUBLIC,
@@ -164,6 +167,7 @@ last_assistant_silent: Optional[dict[str, Any]] = None
 _finished_call_entrances: dict[str, tuple[str, float]] = {}
 _finished_call_order: list[str] = []
 _active_entrances: list[Entrance] = []
+_gateway_runtime: Optional[Any] = None
 _current_entrance: contextvars.ContextVar[Optional[Entrance]] = contextvars.ContextVar(
     "gsm_entrance", default=None
 )
@@ -3019,6 +3023,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     body["call"] = live_call.snapshot()
                 except Exception as exc:
                     body["talk"] = {"error": str(exc)}
+            contribute_health(body, _gateway_runtime)
             writer.write(json_response(200, body))
         elif method == "POST" and path_only == "/token":
             expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
@@ -3063,26 +3068,9 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 # This does not parse MODE or STATUS for the switchboard.
                 # Those commands run only on the Tailscale entrance, below.
                 try:
-                    from portal_sms import format_ops_sms_alert, inbound_sms_routes
-                    sender = str(log_entry.get("from") or "")
-                    body_text = str(log_entry.get("body") or "")
-                    received_at = str(log_entry.get("receivedAt") or "")
-                    to_sms, to_ops = inbound_sms_routes(
-                        sender,
-                        body_text,
-                        sms_webhook=sms_webhook_configured(),
-                    )
-                    if to_sms or to_ops:
-                        text = format_ops_sms_alert(sender, body_text, received_at)
-                        if to_sms:
-                            post_sms_event(
-                                text,
-                                sender=sender,
-                                body=body_text,
-                                received_at=received_at,
-                            )
-                        if to_ops:
-                            post_system_alert(text)
+                    from portal_sms import fanout_inbound_sms
+
+                    fanout_inbound_sms(log_entry)
                 except Exception:
                     LOG.warning("inbound SMS webhook failed", exc_info=True)
                 if command and entrance.name != ENTRANCE_PUBLIC:
@@ -3157,6 +3145,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         },
                     )
                 )
+        elif path_only in ("/gateway/admit", "/gateway/dial", "/gateway/health"):
+            # Off by default. A disabled gateway is the same 404 as any other
+            # unknown route, so the Moto client sees no new surface.
+            if _gateway_runtime is None:
+                writer.write(json_response(404, {"ok": False, "error": "not found"}))
+            else:
+                writer.write(await handle_gateway_http(_gateway_runtime, method, path_only, query, body))
         else:
             writer.write(json_response(404, {"ok": False, "error": "not found"}))
     except Exception:
@@ -3217,6 +3212,7 @@ async def _reap_stuck_call_slot() -> None:
 
 
 async def main() -> None:
+    global _gateway_runtime
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s.%(msecs)03dZ %(levelname)s %(name)s: %(message)s",
@@ -3257,6 +3253,11 @@ async def main() -> None:
         CALL_WATCHDOG.max_s,
         CALL_WATCHDOG.relink_grace_s,
     )
+    try:
+        _gateway_runtime = await start_gateway_from_env(busy=lambda: live_call.busy)
+    except Exception:
+        LOG.error("asterisk gateway did not start; phone path unchanged", exc_info=True)
+        _gateway_runtime = None
     try:
         await asyncio.gather(*(server.serve_forever() for server in servers))
     finally:
@@ -3353,8 +3354,15 @@ _server: Optional[asyncio.AbstractServer] = None
 
 
 async def shutdown() -> None:
-    global active_bridge, active_openclaw, active_ws_writer
+    global active_bridge, active_openclaw, active_ws_writer, _gateway_runtime
     LOG.info("shutting down")
+    runtime = _gateway_runtime
+    _gateway_runtime = None
+    if runtime is not None:
+        try:
+            await asyncio.wait_for(runtime.stop(), timeout=3)
+        except Exception:
+            LOG.warning("asterisk gateway stop failed", exc_info=True)
     live_call.abort_call("hub shutdown")
     writer = active_ws_writer
     active_ws_writer = None
